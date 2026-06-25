@@ -3,7 +3,7 @@ ENTRY(main)
 
 MEMORY
 {
-  APP (rwx) : ORIGIN = 0, LENGTH = 24K
+  APP (rwx) : ORIGIN = 0, LENGTH = 96K  /* raised for full Weather app port */
 }
 
 SECTIONS

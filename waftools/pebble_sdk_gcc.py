@@ -137,6 +137,7 @@ def gen_inject_metadata_rule(
     timestamp,
     has_pkjs,
     has_worker,
+    max_app_binary_size=None,
 ):
     """
     Copy from src_bin_file to dst_bin_file and inject the correct meta-data into the
@@ -175,6 +176,7 @@ def gen_inject_metadata_rule(
             timestamp,
             allow_js=has_pkjs,
             has_worker=has_worker,
+            max_app_binary_size=max_app_binary_size,
         )
 
     sources = [src_bin_file, elf_file]
