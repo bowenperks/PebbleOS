@@ -61,9 +61,8 @@ static bool prv_weather_db_for_each_cb(SettingsFile *file, SettingsRecordInfo *i
 
   WeatherDBEntry *entry = task_zalloc_check(info->val_len);
   info->get_val(file, entry, info->val_len);
-  if (entry->version != WEATHER_DB_CURRENT_VERSION) {
-    PBL_LOG_WRN("Version mismatch! Entry version: %" PRIu8 ", WeatherDB version: %u",
-            entry->version, WEATHER_DB_CURRENT_VERSION);
+  if (!weather_db_version_is_supported(entry->version)) {
+    PBL_LOG_WRN("Unsupported weather entry version: %" PRIu8, entry->version);
     goto cleanup;
   }
 
@@ -138,9 +137,14 @@ status_t weather_db_insert(const uint8_t *key, int key_len, const uint8_t *val, 
   }
 
   const WeatherDBEntry *entry = (WeatherDBEntry *)val;
-  if (entry->version != WEATHER_DB_CURRENT_VERSION) {
-    PBL_LOG_WRN("Version mismatch on insert! Entry version: %" PRIu8 ", WeatherDB version: %u",
-            entry->version, WEATHER_DB_CURRENT_VERSION);
+  if (!weather_db_version_is_supported(entry->version)) {
+    PBL_LOG_WRN("Unsupported weather entry version on insert: %" PRIu8, entry->version);
+    return E_INVALID_ARGUMENT;
+  }
+  // A v4 record must be large enough to hold all v4 fixed fields; its trailing
+  // strings come after WEATHER_DB_V4_FIXED_SIZE.
+  if (entry->version == WEATHER_DB_CURRENT_VERSION && val_len < (int)WEATHER_DB_V4_FIXED_SIZE) {
+    PBL_LOG_WRN("v4 weather record too short: %d < %d", val_len, (int)WEATHER_DB_V4_FIXED_SIZE);
     return E_INVALID_ARGUMENT;
   }
 
@@ -178,9 +182,9 @@ status_t weather_db_read(const uint8_t *key, int key_len, uint8_t *val_out, int 
   PBL_ASSERTN(key_len == sizeof(WeatherDBKey));
 
   rv = settings_file_get(&s_weather_db.settings_file, key, key_len, val_out, val_out_len);
-  if (((WeatherDBEntry*)val_out)->version != WEATHER_DB_CURRENT_VERSION) {
-    // We might as well clear out the stale entry
-    PBL_LOG_WRN("Read an old weather DB entry");
+  if (!weather_db_version_is_supported(((WeatherDBEntry*)val_out)->version)) {
+    // We might as well clear out the unparseable entry
+    PBL_LOG_WRN("Read an unsupported weather DB entry");
     settings_file_delete(&s_weather_db.settings_file, key, key_len);
     rv = E_DOES_NOT_EXIST;
   }
