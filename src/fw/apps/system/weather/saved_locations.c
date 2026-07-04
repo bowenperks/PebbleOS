@@ -5,6 +5,8 @@
 
 #include "city_presets.h"
 #include "resource_ids.pin.h"
+#include "weather_data_source.h"
+#include "weather_types.h"
 
 #define SAVED_LOCATIONS_PERSIST_COUNT_KEY 6100
 #define SAVED_LOCATIONS_PERSIST_LABEL_KEY_BASE 6110
@@ -22,6 +24,7 @@
 #define SAVED_LOCATIONS_ROW_HEIGHT 44
 #define SAVED_LOCATIONS_TOUCH_AXIS_THRESHOLD_PX 5
 #define SAVED_LOCATIONS_TOUCH_TAP_THRESHOLD_PX 10
+#define SAVED_LOCATIONS_TOUCH_SWIPE_BACK_PX 20  // horizontal right-swipe = BACK to the globe
 #define SAVED_LOCATIONS_FLING_PROJECT_MS 340    // how far a flick coasts (ms of velocity)
 #define SAVED_LOCATIONS_FLING_MIN_VELOCITY 120  // px/s; below this a release just stops
 #define SAVED_LOCATIONS_DEFAULT_PRESET_MASK \
@@ -74,6 +77,98 @@ static int s_custom_count;
 static uint16_t s_deleted_preset_mask;
 static bool s_current_visible;
 static bool s_custom_loaded;
+
+// ---- At-a-glance weather for the list rows ---------------------------------
+// Snapshot of the weather-service locations, refreshed when the list opens.
+// Rows are matched to snapshots by name prefix (the service stores
+// "New York, United States"; the preset row is "New York"), so cities without
+// synced weather just fall back to the plain two-line row.
+#define GLANCE_MAX_LOCATIONS 12
+#define GLANCE_WEATHER_TYPES 9  // WeatherType_PartlyCloudy(0) .. WeatherType_RainAndSnow(8)
+typedef struct {
+  char name[64];
+  int16_t temp;
+  uint8_t type;
+  bool is_current;
+} GlanceEntry;
+
+// Heap-allocated while the saved-locations window is open (freed at unload): as firmware
+// statics these were ~850 B of ALWAYS-resident .bss even when the Weather app never ran.
+static GlanceEntry *s_glance;
+static int s_glance_count;
+static GBitmap *s_glance_icons[GLANCE_WEATHER_TYPES];
+
+static void prv_glance_refresh(void) {
+  s_glance_count = 0;
+  if (!weather_ds_supported()) return;
+  if (!s_glance) {
+    s_glance = malloc_try(sizeof(GlanceEntry) * GLANCE_MAX_LOCATIONS);
+    if (!s_glance) return;   // out of heap: rows fall back to the plain two-line layout
+  }
+  WxDsForecast *scratch = malloc_try(sizeof(*scratch));  // ~400 B; keep off the task stack
+  if (!scratch) return;
+  int count = weather_ds_location_count();
+  if (count > GLANCE_MAX_LOCATIONS) count = GLANCE_MAX_LOCATIONS;
+  for (int i = 0; i < count; i++) {
+    if (!weather_ds_read_index(i, scratch)) continue;
+    if (scratch->current_temp == WX_DS_UNKNOWN_TEMP) continue;
+    GlanceEntry *entry = &s_glance[s_glance_count++];
+    strncpy(entry->name, scratch->location_name, sizeof(entry->name) - 1);
+    entry->name[sizeof(entry->name) - 1] = '\0';
+    entry->temp = (int16_t)scratch->current_temp;
+    entry->type = scratch->current_weather_type;
+    entry->is_current = scratch->is_current_location;
+  }
+  free(scratch);
+}
+
+static void prv_glance_free(void) {
+  s_glance_count = 0;
+  if (s_glance) {
+    free(s_glance);
+    s_glance = NULL;
+  }
+}
+
+static void prv_glance_destroy_icons(void) {
+  for (int i = 0; i < GLANCE_WEATHER_TYPES; i++) {
+    if (s_glance_icons[i]) {
+      gbitmap_destroy(s_glance_icons[i]);
+      s_glance_icons[i] = NULL;
+    }
+  }
+}
+
+static GBitmap *prv_glance_icon(uint8_t type) {
+  if (type >= GLANCE_WEATHER_TYPES) return NULL;
+  if (!s_glance_icons[type]) {
+    s_glance_icons[type] =
+        gbitmap_create_with_resource(weather_type_icon_tiny_resource(type));
+  }
+  return s_glance_icons[type];
+}
+
+static bool prv_glance_name_prefix(const char *name, const char *prefix) {
+  if (!prefix || !prefix[0]) return false;
+  for (size_t i = 0; prefix[i]; i++) {
+    char a = name[i];
+    char b = prefix[i];
+    if (a >= 'A' && a <= 'Z') a += 'a' - 'A';
+    if (b >= 'A' && b <= 'Z') b += 'a' - 'A';
+    if (a != b) return false;
+  }
+  return true;
+}
+
+static const GlanceEntry *prv_glance_find(const char *label, bool want_current) {
+  for (int i = 0; i < s_glance_count; i++) {
+    if (want_current ? s_glance[i].is_current
+                     : prv_glance_name_prefix(s_glance[i].name, label)) {
+      return &s_glance[i];
+    }
+  }
+  return NULL;
+}
 
 static bool prv_is_default_saved_preset(int preset_index) {
   return preset_index >= 0 && preset_index < CITY_PRESET_COUNT &&
@@ -217,7 +312,10 @@ static int prv_find_custom_by_query(const char *query) {
   return -1;
 }
 
-void saved_locations_add_custom_location(const char *query, const char *label) {
+static void saved_locations_dismiss(bool animated);  // defined below; used by the dictation flow
+
+// In-file only: called from the dictation flow below.
+static void saved_locations_add_custom_location(const char *query, const char *label) {
   if (!query || !query[0]) return;
   prv_load_custom_locations();
   if (!prv_ensure_custom_locations()) return;
@@ -249,50 +347,6 @@ void saved_locations_add_custom_location(const char *query, const char *label) {
   }
 }
 
-void saved_locations_update_custom_label(const char *query, const char *label) {
-  if (!label || !label[0]) return;
-  prv_load_custom_locations();
-
-  int index = prv_find_custom_by_query(query);
-  if (index < 0 && s_custom_count > 0) {
-    index = s_custom_count - 1;
-  }
-  if (index < 0) return;
-
-  strncpy(s_custom_locations[index].label, label,
-          sizeof(s_custom_locations[index].label) - 1);
-  s_custom_locations[index].label[sizeof(s_custom_locations[index].label) - 1] = '\0';
-  prv_save_custom_locations();
-  if (s_view && s_view->menu_layer) {
-    menu_layer_reload_data(s_view->menu_layer);
-  }
-}
-
-void saved_locations_update_custom_details(const char *query,
-                                           const char *label,
-                                           int16_t latitude_e2,
-                                           int16_t longitude_e2) {
-  if (!query || !query[0]) return;
-  saved_locations_add_custom_location(query, (label && label[0]) ? label : query);
-  prv_load_custom_locations();
-
-  int index = prv_find_custom_by_query(query);
-  if (index < 0) return;
-
-  if (label && label[0]) {
-    strncpy(s_custom_locations[index].label, label,
-            sizeof(s_custom_locations[index].label) - 1);
-    s_custom_locations[index].label[
-        sizeof(s_custom_locations[index].label) - 1] = '\0';
-  }
-  s_custom_locations[index].latitude_e2 = latitude_e2;
-  s_custom_locations[index].longitude_e2 = longitude_e2;
-  s_custom_locations[index].has_coordinates = true;
-  prv_save_custom_locations();
-  if (s_view && s_view->menu_layer) {
-    menu_layer_reload_data(s_view->menu_layer);
-  }
-}
 
 int saved_locations_get_entries(SavedLocationEntry *entries,
                                 int max_entries,
@@ -475,6 +529,48 @@ static int16_t prv_get_cell_height(MenuLayer *menu_layer, MenuIndex *cell_index,
   return SAVED_LOCATIONS_ROW_HEIGHT;
 }
 
+// Dense "at a glance" row: [condition icon] City name          21°
+// Falls back to the classic two-line menu cell when the city has no synced
+// weather snapshot.
+static void prv_draw_glance_row(GContext *ctx, const Layer *cell_layer,
+                                const char *title, const char *subtitle,
+                                const GlanceEntry *glance) {
+  if (!glance) {
+    menu_cell_basic_draw(ctx, cell_layer, title, subtitle, NULL);
+    return;
+  }
+
+  GRect bounds = layer_get_bounds(cell_layer);
+  const bool highlighted = menu_cell_layer_is_highlighted(cell_layer);
+  GFont font = fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD);
+  graphics_context_set_text_color(ctx,
+                                  highlighted ? GColorWhite : GColorBlack);
+
+  char temp_text[12];
+  snprintf(temp_text, sizeof(temp_text), "%d°", (int)glance->temp);
+  const int temp_w = 48;
+  const int text_y = (bounds.size.h - 28) / 2 - 3;
+  graphics_draw_text(ctx, temp_text, font,
+                     GRect(bounds.size.w - temp_w - 4, text_y, temp_w, 30),
+                     GTextOverflowModeTrailingEllipsis, GTextAlignmentRight,
+                     NULL);
+
+  int title_x = 8;
+  GBitmap *icon = prv_glance_icon(glance->type);
+  if (icon) {
+    graphics_context_set_compositing_mode(ctx, GCompOpSet);
+    graphics_draw_bitmap_in_rect(
+        ctx, icon, GRect(5, (bounds.size.h - 25) / 2, 25, 25));
+    title_x = 5 + 25 + 5;
+  }
+
+  graphics_draw_text(ctx, title, font,
+                     GRect(title_x, text_y,
+                           bounds.size.w - title_x - temp_w - 8, 30),
+                     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft,
+                     NULL);
+}
+
 static void prv_draw_row(GContext *ctx, const Layer *cell_layer,
                          MenuIndex *cell_index, void *context) {
   SavedLocationsView *view = (SavedLocationsView *)context;
@@ -489,7 +585,8 @@ static void prv_draw_row(GContext *ctx, const Layer *cell_layer,
     const char *title = view->current_location_label[0]
                             ? view->current_location_label
                             : "Current Location";
-    menu_cell_basic_draw(ctx, cell_layer, title, "Current Location", NULL);
+    prv_draw_glance_row(ctx, cell_layer, title, "Current Location",
+                        prv_glance_find(NULL, true));
     return;
   }
 
@@ -497,16 +594,19 @@ static void prv_draw_row(GContext *ctx, const Layer *cell_layer,
   if (preset_index >= 0) {
     const CityPreset *preset = city_presets_get(preset_index);
     if (preset) {
-      menu_cell_basic_draw(ctx, cell_layer, preset->city, preset->country, NULL);
+      prv_draw_glance_row(ctx, cell_layer, preset->city, preset->country,
+                          prv_glance_find(preset->city, false));
     }
     return;
   }
 
   if (prv_row_is_custom(row)) {
     int custom_index = prv_custom_index_for_row(row);
-    menu_cell_basic_draw(ctx, cell_layer,
-                         s_custom_locations[custom_index].label,
-                         "Saved Location", NULL);
+    prv_draw_glance_row(ctx, cell_layer,
+                        s_custom_locations[custom_index].label,
+                        "Saved Location",
+                        prv_glance_find(s_custom_locations[custom_index].label,
+                                        false));
   }
 }
 
@@ -685,6 +785,12 @@ static void prv_touch_handler(const TouchEvent *event, void *context) {
         prv_touch_select_row(view, row);
         prv_activate_saved_row(view, row);
       }
+      return;
+    }
+
+    if (view->drag_axis_set && !view->drag_is_vertical &&
+        dx > SAVED_LOCATIONS_TOUCH_SWIPE_BACK_PX) {
+      window_stack_pop(true);   // swipe right = BACK to the globe cradle
       return;
     }
 
@@ -1075,6 +1181,8 @@ static void prv_window_unload(Window *window) {
     menu_layer_destroy(view->menu_layer);
     view->menu_layer = NULL;
   }
+  prv_glance_destroy_icons();
+  prv_glance_free();
 #if WEATHER_PLATFORM_TOUCH_COLOR
   touch_service_unsubscribe();
 #endif
@@ -1083,11 +1191,18 @@ static void prv_window_unload(Window *window) {
   free(view);
 }
 
-bool saved_locations_is_showing(void) {
-  return s_view && s_view->window;
+#if WEATHER_PLATFORM_TOUCH_COLOR
+// Subscribe on APPEAR (not before the push): the covered window's disappear handler fires
+// during the push transition and releases the single touch slot — a pre-push subscribe
+// would be clobbered by it. Appear runs after every disappear/unload in the transition.
+static void prv_window_appear(Window *window) {
+  SavedLocationsView *view = (SavedLocationsView *)window_get_user_data(window);
+  if (view) touch_service_subscribe(prv_touch_handler, view);
 }
+#endif
 
-void saved_locations_dismiss(bool animated) {
+// In-file only: called from the dictation flow.
+static void saved_locations_dismiss(bool animated) {
   if (!s_view || !s_view->window) return;
   window_stack_remove(s_view->window, animated);
 }
@@ -1113,10 +1228,7 @@ void saved_locations_push(const SavedLocationsConfig *config) {
     s_view->touch_start_x = 0;
     s_view->touch_start_y = 0;
     menu_layer_reload_data(s_view->menu_layer);
-#if WEATHER_PLATFORM_TOUCH_COLOR
-    touch_service_subscribe(prv_touch_handler, s_view);
-#endif
-    window_stack_push(s_view->window, true);
+    window_stack_push(s_view->window, true);   // touch subscribe happens in .appear
     return;
   }
 
@@ -1124,6 +1236,7 @@ void saved_locations_push(const SavedLocationsConfig *config) {
   if (!view) return;
   s_view = view;
   prv_load_custom_locations();
+  prv_glance_refresh();
 
   view->active_city_index = config ? config->active_city_index : -1;
   view->pending_delete_custom_index = -1;
@@ -1149,6 +1262,9 @@ void saved_locations_push(const SavedLocationsConfig *config) {
   window_set_user_data(view->window, view);
   window_set_background_color(view->window, GColorWhite);
   window_set_window_handlers(view->window, (WindowHandlers) {
+#if WEATHER_PLATFORM_TOUCH_COLOR
+    .appear = prv_window_appear,
+#endif
     .unload = prv_window_unload,
   });
 
@@ -1175,9 +1291,6 @@ void saved_locations_push(const SavedLocationsConfig *config) {
                                   GColorWhite);
   menu_layer_set_click_config_onto_window(view->menu_layer, view->window);
   layer_add_child(root, menu_layer_get_layer(view->menu_layer));
-#if WEATHER_PLATFORM_TOUCH_COLOR
-  touch_service_subscribe(prv_touch_handler, view);
-#endif
 
   int selected_row = s_current_visible ? prv_current_row() : SAVED_LOCATIONS_ROW_ADD;
   if (view->active_city_index >= 0) {

@@ -18,10 +18,7 @@ typedef void (*GlobeLocationSelectCallback)(SavedLocationKind kind,
                                             const char *query,
                                             bool force,
                                             void *context);
-typedef void (*GlobeDictationCallback)(const char *query, void *context);
-typedef void (*GlobeWrapCallback)(void *context);
 typedef void (*GlobeSavedLocationsCallback)(void *context);
-typedef void (*GlobeForecastListCallback)(void *context);
 typedef void (*GlobeMainCallback)(void *context);
 
 typedef struct {
@@ -78,16 +75,12 @@ typedef struct {
     char city_label_text[48];
     GlobeLocationSelectCallback location_select_callback;
     void *location_select_context;
-    GlobeDictationCallback dictation_callback;
-    void *dictation_context;
-    GlobeWrapCallback wrap_callback;
-    void *wrap_context;
     GlobeSavedLocationsCallback saved_locations_callback;
     void *saved_locations_context;
-    GlobeForecastListCallback forecast_list_callback;
-    void *forecast_list_context;
     GlobeMainCallback main_callback;
     void *main_context;
+    GlobeMainCallback back_callback;   // cradle BACK -> weather card (reverse of the SELECT entrance)
+    void *back_context;
     AppTimer *animation_timer;
     AppTimer *idle_timer;
 #if WEATHER_PLATFORM_TOUCH_COLOR
@@ -123,6 +116,8 @@ typedef struct {
     bool coast_active;
     bool hover_lock_active;
 #endif
+    // UP-from-forecast entrance: Pebble-Health drop-from-above + bounce (rect only).
+    Animation *entry_drop_anim;
 } GlobeView;
 
 /**
@@ -135,23 +130,18 @@ void globe_view_set_location_select_callback(GlobeView *view,
                                              GlobeLocationSelectCallback callback,
                                              void *context);
 
-void globe_view_set_dictation_callback(GlobeView *view,
-                                       GlobeDictationCallback callback,
-                                       void *context);
-
-void globe_view_set_wrap_callback(GlobeView *view,
-                                  GlobeWrapCallback callback,
-                                  void *context);
-
 void globe_view_set_saved_locations_callback(GlobeView *view,
                                              GlobeSavedLocationsCallback callback,
                                              void *context);
 
-void globe_view_set_forecast_list_callback(GlobeView *view,
-                                           GlobeForecastListCallback callback,
-                                           void *context);
-
 void globe_view_set_main_callback(GlobeView *view,
+                                  GlobeMainCallback callback,
+                                  void *context);
+
+// Set the callback fired when BACK is pressed on the intro cradle: the globe slides out to the
+// RIGHT, then this fires so weather.c can bring the weather card back in from the LEFT. When unset,
+// cradle BACK keeps its default (exit the app).
+void globe_view_set_back_callback(GlobeView *view,
                                   GlobeMainCallback callback,
                                   void *context);
 
@@ -159,16 +149,6 @@ void globe_view_set_current_location(GlobeView *view,
                                      const char *label,
                                      int16_t latitude_e2,
                                      int16_t longitude_e2);
-
-void globe_view_set_custom_location(GlobeView *view,
-                                    const char *label,
-                                    int16_t latitude_e2,
-                                    int16_t longitude_e2,
-                                    bool select);
-
-void globe_view_set_selected_city(GlobeView *view, int city_index);
-
-void globe_view_reload_saved_locations(GlobeView *view);
 
 /**
  * Destroy the globe view and free all resources
@@ -188,13 +168,16 @@ void globe_view_start_animation(GlobeView *view);
  */
 void globe_view_stop_animation(GlobeView *view);
 
-/**
- * Push the globe view to the window stack
- * @param view Pointer to GlobeView
- */
-void globe_view_push(GlobeView *view);
-
 void globe_view_push_animated(GlobeView *view, bool animated);
+
+// Push with the intro cradle sliding in from one screen-width to the RIGHT (same moook bounce;
+// rect only, falls back to a plain push on round). Pairs with the card's slide-out-left on
+// SELECT-from-expanded-card.
+void globe_view_push_slide_in_right(GlobeView *view);
+
+// Reverse of the slide-in-from-right: slide the intro cradle out to the RIGHT (same moook bounce),
+// then fire back_callback so weather.c can bring the card back in from the LEFT. Cradle BACK.
+void globe_view_slide_out_right(GlobeView *view);
 
 /**
  * Pop the globe view from the window stack

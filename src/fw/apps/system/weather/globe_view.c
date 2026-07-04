@@ -14,8 +14,11 @@
 #include "weather_math.h"
 #include "weather.h"
 #include "applib/ui/app_window_stack.h"
+#include "applib/applib_malloc.auto.h"
+#include "applib/vendor/tinflate/tinflate.h"
 
 #include <limits.h>
+#include <string.h>
 
 #define GLOBE_FRAME_INTERVAL_MS 35  // ~28.6 FPS, matching Pebble's shredder PDC cadence
 #define GLOBE_IDLE_TIMEOUT_MS 5000
@@ -95,14 +98,34 @@
 #define GLOBE_Q8_ONE 256
 #define GLOBE_STARFIELD_WIDTH 400
 #define GLOBE_STARFIELD_HEIGHT 228
-#define GLOBE_ATMOSPHERE_GLOW_PX 6
+#define GLOBE_ATMOSPHERE_GLOW_PX 10
 #define GLOBE_ATMOSPHERE_LAYER_MARGIN_PX 2
-#define GLOBE_OUTLINE_PX 5
+#define GLOBE_OUTLINE_PX 0
 #define GLOBE_PIN_EDGE_FRONT_Q10 (GLOBE_ROT_SCALE / 5)
 #define GLOBE_SPACE_FADE_DITHER_SIZE 4
 #define GLOBE_SPACE_FADE_FULL_PERCENT 86
 #define GLOBE_SPACE_STAR_REVEAL_START_PERCENT 72
 #define GLOBE_CRUMPLE_MAX_POINTS 96
+// Fixed view-space light for the revealed globe: upper-left, toward the
+// viewer (Q10 unit vector). The screen-space normal (sx, sy, sz) is already
+// computed per pixel, so the lambert term costs two multiplies per mirrored
+// pixel pair.
+#define GLOBE_LIGHT_X_Q10 (-358)
+#define GLOBE_LIGHT_Y_Q10 563
+#define GLOBE_LIGHT_Z_Q10 768
+// Posterized shading bands (thresholds on the Q10 lambert dot product),
+// softened by the 4x4 ordered dither so the terminator doesn't band harshly.
+// Tuned bright per user preference: full daylight across roughly half the
+// disc, shadow reserved for the far limb.
+#define GLOBE_SHADE_LIT_MIN_Q10 320
+#define GLOBE_SHADE_MID_MIN_Q10 (-64)
+// Wii-Forecast-Channel style atmosphere: the limb itself glows. Pixels whose
+// view depth (sz) falls below RIM render as solid Celeste — a luminous band
+// straddling the planet edge that merges with the halo outside — and pixels
+// below BLEND dither toward PictonBlue, the bluish haze of atmosphere washing
+// over terrain near the horizon.
+#define GLOBE_HAZE_RIM_SZ_Q10 230
+#define GLOBE_HAZE_BLEND_SZ_Q10 450
 
 static const uint8_t GLOBE_SPACE_FADE_DITHER[GLOBE_SPACE_FADE_DITHER_SIZE]
                                            [GLOBE_SPACE_FADE_DITHER_SIZE] = {
@@ -112,22 +135,20 @@ static const uint8_t GLOBE_SPACE_FADE_DITHER[GLOBE_SPACE_FADE_DITHER_SIZE]
     { 15, 7, 13,  5 },
 };
 
-static const uint8_t GLOBE_CUBEMAP_PALETTE[GLOBE_CUBEMAP_PALETTE_SIZE] = {
-    0xC2,  // GColorDukeBlue       #0000AA
-    0xC7,  // GColorBlueMoon       #0055FF
-    0xCB,  // GColorVividCerulean  #00AAFF
-    0xDB,  // GColorPictonBlue     #55AAFF
-    0xEF,  // GColorCeleste        #AAFFFF
-    0xFF,  // GColorWhite          #FFFFFF
-    0xD9,  // GColorMayGreen       #55AA55
-    0xC4,  // GColorDarkGreen      #005500
-    0xC9,  // GColorJaegerGreen    #00AA55
-    0xEC,  // GColorSpringBud      #AAFF00
-    0xDD,  // GColorScreaminGreen  #55FF55
-    0xEE,  // GColorMintGreen      #AAFFAA
+// Cubemap palette by lighting band: [0] daylight (the original colors),
+// [1] terminator, [2] night side. Column order matches the packed cubemap's
+// palette indices: DukeBlue, BlueMoon, VividCerulean, PictonBlue, Celeste,
+// White, MayGreen, DarkGreen, JaegerGreen, SpringBud, ScreaminGreen, Mint.
+static const uint8_t GLOBE_SHADE_PALETTE[3][GLOBE_CUBEMAP_PALETTE_SIZE] = {
+    { 0xC2, 0xC7, 0xCB, 0xDB, 0xEF, 0xFF, 0xD9, 0xC4, 0xC9, 0xEC, 0xDD, 0xEE },
+    { 0xC2, 0xC2, 0xC7, 0xCB, 0xDB, 0xEF, 0xC8, 0xC4, 0xC8, 0xD8, 0xC9, 0xD9 },
+    // Shadow ocean floors at DukeBlue so the dark limb stays visibly blue
+    // against space; OxfordBlue appears only for the rare deep-trench texels.
+    { 0xC1, 0xC2, 0xC6, 0xC7, 0xCB, 0xDB, 0xC4, 0xC4, 0xC4, 0xC8, 0xC8, 0xC8 },
 };
 
 static void animation_timer_handler(void *context);
+static void schedule_frame_timer(GlobeView *view);
 static void start_globe_idle_timer(GlobeView *view);
 static GRect clip_rect_to_bounds(GRect rect, GRect bounds);
 static void update_city_label_layer(GlobeView *view);
@@ -197,7 +218,7 @@ static int bw_frame_for_longitude_e2(int16_t longitude_e2) {
     return positive_modulo(rounded_divide(-longitude_e2, 600), NUM_BW_FRAMES);
 }
 
-static int32_t longitude_e2_for_bw_frame(int bw_frame) {
+__attribute__((noinline)) static int32_t longitude_e2_for_bw_frame(int bw_frame) {
     int frame = ((bw_frame * NUM_COLOR_LON_FRAMES) + (NUM_BW_FRAMES / 2)) /
         NUM_BW_FRAMES % NUM_COLOR_LON_FRAMES;
     return -frame * 1500;
@@ -265,42 +286,14 @@ static int find_saved_entry_index(GlobeView *view,
     return -1;
 }
 
-static int find_preset_saved_entry_index(GlobeView *view, int preset_index) {
-    if (!view) return -1;
-    for (int i = 0; i < view->saved_entry_count; i++) {
-        SavedLocationEntry *entry = &view->saved_entries[i];
-        if (entry->kind == SavedLocationKindPreset &&
-            entry->preset_index == preset_index) {
-            return i;
-        }
-    }
-    return -1;
-}
-
-static int find_custom_saved_entry_index(GlobeView *view,
-                                         const char *label,
-                                         int16_t latitude_e2,
-                                         int16_t longitude_e2) {
-    if (!view) return -1;
-    for (int i = 0; i < view->saved_entry_count; i++) {
-        SavedLocationEntry *entry = &view->saved_entries[i];
-        if (entry->kind != SavedLocationKindCustom) continue;
-        if (label && label[0] && strcmp(entry->label, label) == 0) {
-            return i;
-        }
-        if (entry->latitude_e2 == latitude_e2 &&
-            entry->longitude_e2 == longitude_e2) {
-            return i;
-        }
-    }
-    return -1;
-}
-
 static void update_selected_transition_target(GlobeView *view) {
     if (!view) return;
     view->transition_color_target_latitude_e2 = selected_city_latitude_e2(view);
     view->transition_color_target_longitude_e2 = selected_city_longitude_e2(view);
 }
+
+// In-file only (defined below with the other saved-locations plumbing).
+static void globe_view_reload_saved_locations(GlobeView *view);
 
 static bool selected_city_is_current_location(GlobeView *view) {
     SavedLocationEntry *entry = selected_saved_entry(view);
@@ -354,6 +347,23 @@ static int16_t saved_entry_longitude_e2(GlobeView *view,
     return entry ? entry->longitude_e2 : 0;
 }
 
+// Merged has-coordinates + coordinate fetch: one call per entry instead of
+// three, false when the entry has no usable globe position.
+static bool saved_entry_globe_coords(GlobeView *view, SavedLocationEntry *entry,
+                                     int32_t *latitude_e2_out,
+                                     int32_t *longitude_e2_out) {
+    if (!saved_entry_has_globe_coordinates(view, entry)) return false;
+    if (entry->kind == SavedLocationKindCurrent &&
+        view && view->has_current_location) {
+        *latitude_e2_out = (int16_t)view->current_location_latitude_e2;
+        *longitude_e2_out = (int16_t)view->current_location_longitude_e2;
+    } else {
+        *latitude_e2_out = entry->latitude_e2;
+        *longitude_e2_out = entry->longitude_e2;
+    }
+    return true;
+}
+
 static int nearest_city_index_for_orientation(GlobeView *view) {
     if (!view) return 0;
 
@@ -363,12 +373,12 @@ static int nearest_city_index_for_orientation(GlobeView *view) {
     for (int i = 0; i <= max_index; i++) {
         if (!selected_city_is_valid(view, i)) continue;
         SavedLocationEntry *entry = saved_entry_for_index(view, i);
-        if (!saved_entry_has_globe_coordinates(view, entry)) continue;
-
-        int32_t candidate_latitude_e2 =
-            saved_entry_latitude_e2(view, entry);
-        int32_t candidate_longitude_e2 =
-            saved_entry_longitude_e2(view, entry);
+        int32_t candidate_latitude_e2;
+        int32_t candidate_longitude_e2;
+        if (!saved_entry_globe_coords(view, entry, &candidate_latitude_e2,
+                                      &candidate_longitude_e2)) {
+            continue;
+        }
 
         int32_t lat_delta = candidate_latitude_e2 - view->color_latitude_e2;
         int32_t lon_delta = shortest_longitude_delta_e2(
@@ -603,17 +613,13 @@ static bool draw_bw_crumple_frame(GContext *ctx, GlobeView *view, GPoint origin,
 static bool color_highlight_bw_command(GDrawCommand *command,
                                        uint32_t index,
                                        void *context) {
-    (void)index;
     (void)context;
 
-    GDrawCommandType type = gdraw_command_get_type(command);
+    // Command 0 of every frame is the (low-poly) ocean disc; the land
+    // polygons follow it, so recolor by position rather than command type.
     gdraw_command_set_stroke_color(command, GColorBlack);
-    if (type == GDrawCommandTypeCircle) {
-        gdraw_command_set_fill_color(command, GColorVividCerulean);
-    } else if (type == GDrawCommandTypePath ||
-               type == GDrawCommandTypePrecisePath) {
-        gdraw_command_set_fill_color(command, GColorScreaminGreen);
-    }
+    gdraw_command_set_fill_color(command, index == 0 ? GColorVividCerulean
+                                                     : GColorScreaminGreen);
     return true;
 }
 
@@ -696,7 +702,7 @@ static int32_t normalize_longitude_e2(int32_t longitude_e2) {
     return longitude_e2;
 }
 
-static int32_t clamp_latitude_e2(int32_t latitude_e2) {
+__attribute__((noinline)) static int32_t clamp_latitude_e2(int32_t latitude_e2) {
     if (latitude_e2 > 8900) return 8900;
     if (latitude_e2 < -8900) return -8900;
     return latitude_e2;
@@ -709,7 +715,7 @@ static int32_t shortest_longitude_delta_e2(int32_t from_e2, int32_t to_e2) {
     return delta;
 }
 
-static int trigangle_from_degrees_e2(int32_t degrees_e2) {
+__attribute__((noinline)) static int trigangle_from_degrees_e2(int32_t degrees_e2) {
     return (int)weather_scale_i32(degrees_e2, TRIG_MAX_ANGLE, 36000);
 }
 
@@ -739,6 +745,22 @@ static int32_t globe_isqrt(int32_t value) {
         bit >>= 2;
     }
     return (int32_t)result;
+}
+
+// floor(sqrt(value)) via integer Newton iteration from a seed known to be
+// >= the true root (the previous pixel's depth in a row scan). From such a
+// seed the iteration is strictly decreasing and lands exactly on the floor,
+// so results match globe_isqrt() bit-for-bit at a fraction of the cost.
+static inline int32_t floor_sqrt_seeded(int32_t value, int32_t seed) {
+    if (value <= 0) return 0;
+    if (seed <= 0) return globe_isqrt(value);
+    int32_t s = seed;
+    for (;;) {
+        int32_t next = (s + (value / s)) >> 1;
+        if (next >= s) break;
+        s = next;
+    }
+    return s;
 }
 
 static void matrix_identity(int32_t matrix[9]) {
@@ -897,12 +919,47 @@ static void set_color_orientation(GlobeView *view,
     sync_bw_elapsed_to_current_frame(view);
     matrix_from_lat_lon(view->globe_rotation, latitude_e2, longitude_e2);
 #if WEATHER_PLATFORM_TOUCH_COLOR
+    // 64-bit product: pm(lon) * width * 256 overflows int32 for most
+    // western longitudes (pm >= 20972), which used to scatter the starfield.
     view->starfield_offset_x_q8 =
-        (positive_modulo(longitude_e2, 36000) *
-         GLOBE_STARFIELD_WIDTH * GLOBE_Q8_ONE) / 36000;
+        (int32_t)(((int64_t)positive_modulo(longitude_e2, 36000) *
+                   GLOBE_STARFIELD_WIDTH * GLOBE_Q8_ONE) / 36000);
     view->starfield_offset_y_q8 =
         (latitude_e2 * GLOBE_STARFIELD_HEIGHT * GLOBE_Q8_ONE) / 36000;
 #endif
+}
+
+// The globe blobs are stored raw-deflate compressed in the pack ([u32 LE
+// inflated_size][raw DEFLATE stream], tools/deflate_resource.py) and inflated
+// here via the firmware's tinflate (the same raw-deflate decoder uPNG uses).
+// Buffers come from applib_malloc — the same app-task heap as malloc_try/free,
+// and the allocator gdraw_command_sequence_destroy's munmap-or-free path pairs
+// with, so the inflated BW sequence can be handed to the normal destroy path.
+// Returns NULL on any failure; *out_size gets the inflated size.
+static void *prv_load_inflated(uint32_t res_id, uint32_t *out_size) {
+    ResHandle handle = resource_get_handle(res_id);
+    size_t csize = resource_size(handle);
+    if (csize <= sizeof(uint32_t)) return NULL;
+    uint8_t *cbuf = malloc_try(csize);
+    if (!cbuf) return NULL;
+    void *out = NULL;
+    uint32_t inflated_size = 0;
+    if (resource_load(handle, cbuf, csize) == csize) {
+        memcpy(&inflated_size, cbuf, sizeof(inflated_size));   // LE prefix
+        out = applib_malloc(inflated_size);
+        if (out) {
+            unsigned int dlen = inflated_size;
+            if (tinflate_uncompress(out, &dlen, cbuf + sizeof(uint32_t),
+                                    (unsigned int)(csize - sizeof(uint32_t))) != TINF_OK ||
+                dlen != inflated_size) {
+                applib_free(out);
+                out = NULL;
+            }
+        }
+    }
+    free(cbuf);
+    if (out && out_size) *out_size = inflated_size;
+    return out;
 }
 
 static bool load_cubemap_resource(GlobeView *view) {
@@ -911,20 +968,11 @@ static bool load_cubemap_resource(GlobeView *view) {
         return true;
     }
 
-    ResHandle handle = resource_get_handle(RESOURCE_ID_GLOBE_CUBEMAP);
-    size_t size = resource_size(handle);
+    uint32_t size = 0;
+    uint8_t *data = prv_load_inflated(RESOURCE_ID_GLOBE_CUBEMAP, &size);
+    if (!data) return false;
     if (size < GLOBE_CUBEMAP_DATA_SIZE) {
-        return false;
-    }
-
-    uint8_t *data = malloc(size);
-    if (!data) {
-        return false;
-    }
-
-    size_t loaded = resource_load(handle, data, size);
-    if (loaded < GLOBE_CUBEMAP_DATA_SIZE) {
-        free(data);
+        applib_free(data);
         return false;
     }
 
@@ -932,7 +980,7 @@ static bool load_cubemap_resource(GlobeView *view) {
         free(view->cubemap_data);
     }
     view->cubemap_data = data;
-    view->cubemap_size = loaded;
+    view->cubemap_size = size;
     return true;
 }
 
@@ -948,22 +996,17 @@ static bool load_starfield_resource(GlobeView *view) {
     if (!view) return false;
     if (view->starfield_data && view->starfield_size > 2) return true;
 
-    ResHandle handle = resource_get_handle(RESOURCE_ID_GLOBE_STARFIELD);
-    size_t size = resource_size(handle);
-    if (size <= 2) return false;
-
-    uint8_t *data = malloc(size);
+    uint32_t size = 0;
+    uint8_t *data = prv_load_inflated(RESOURCE_ID_GLOBE_STARFIELD, &size);
     if (!data) return false;
-
-    size_t loaded = resource_load(handle, data, size);
-    if (loaded != size) {
-        free(data);
+    if (size <= 2) {
+        applib_free(data);
         return false;
     }
 
     if (view->starfield_data) free(view->starfield_data);
     view->starfield_data = data;
-    view->starfield_size = loaded;
+    view->starfield_size = size;
     return true;
 }
 
@@ -979,8 +1022,18 @@ static void ensure_visual_resources(GlobeView *view) {
     if (!view) return;
 
     if (!view->bw_sequence) {
-        view->bw_sequence = gdraw_command_sequence_create_with_resource(
-            RESOURCE_ID_GLOBE_BW_SEQUENCE);
+        // Stored payload-deflated: inflate into an applib_malloc buffer and
+        // validate with the exact gate create_with_resource uses. Ownership
+        // passes to the sequence — gdraw_command_sequence_destroy applib_free()s
+        // heap pointers (applib_resource_munmap_or_free address-range check).
+        uint32_t seq_size = 0;
+        GDrawCommandSequence *seq =
+            prv_load_inflated(RESOURCE_ID_GLOBE_BW_SEQUENCE, &seq_size);
+        if (seq && !gdraw_command_sequence_validate(seq, seq_size)) {
+            applib_free(seq);
+            seq = NULL;
+        }
+        view->bw_sequence = seq;
         if (view->bw_sequence) {
             view->bw_frame_count =
                 gdraw_command_sequence_get_num_frames(view->bw_sequence);
@@ -1022,50 +1075,40 @@ static void release_visual_resources(GlobeView *view) {
     }
 }
 
-static uint8_t cubemap_sample(GlobeView *view, int32_t x, int32_t y, int32_t z) {
-    if (!view || !view->cubemap_data) {
-        return GColorBlueMoonARGB8;
-    }
-
+// Returns the packed cubemap PALETTE INDEX (0..11); the caller picks the
+// final color through GLOBE_SHADE_PALETTE using its lighting band.
+static inline uint8_t cubemap_sample(const uint8_t *cubemap_data,
+                                     int32_t x, int32_t y, int32_t z) {
     int32_t ax = x < 0 ? -x : x;
     int32_t ay = y < 0 ? -y : y;
     int32_t az = z < 0 ? -z : z;
-    int face = 4;
-    int32_t u = 0;
-    int32_t v = 0;
-    int32_t major = az;
+    int face;
+    int32_t major;
+    int32_t uc;
+    int32_t vc;
 
+    // C division truncates toward zero, so folding the sign into the
+    // numerator gives the same result as negating the quotient — one shared
+    // division pair replaces the per-face copies.
     if (ax >= ay && ax >= az) {
         major = ax;
-        if (x >= 0) {
-            face = 0;
-            u = (int32_t)(-(z * GLOBE_ROT_SCALE / major));
-            v = (int32_t)(-(y * GLOBE_ROT_SCALE / major));
-        } else {
-            face = 1;
-            u = (int32_t)(z * GLOBE_ROT_SCALE / major);
-            v = (int32_t)(-(y * GLOBE_ROT_SCALE / major));
-        }
+        face = x >= 0 ? 0 : 1;
+        uc = x >= 0 ? -z : z;
+        vc = -y;
     } else if (ay >= ax && ay >= az) {
         major = ay;
-        if (y >= 0) {
-            face = 2;
-            u = (int32_t)(x * GLOBE_ROT_SCALE / major);
-            v = (int32_t)(z * GLOBE_ROT_SCALE / major);
-        } else {
-            face = 3;
-            u = (int32_t)(x * GLOBE_ROT_SCALE / major);
-            v = (int32_t)(-(z * GLOBE_ROT_SCALE / major));
-        }
-    } else if (z >= 0) {
-        face = 4;
-        u = (int32_t)(x * GLOBE_ROT_SCALE / major);
-        v = (int32_t)(-(y * GLOBE_ROT_SCALE / major));
+        face = y >= 0 ? 2 : 3;
+        uc = x;
+        vc = y >= 0 ? z : -z;
     } else {
-        face = 5;
-        u = (int32_t)(-(x * GLOBE_ROT_SCALE / major));
-        v = (int32_t)(-(y * GLOBE_ROT_SCALE / major));
+        major = az;
+        face = z >= 0 ? 4 : 5;
+        uc = z >= 0 ? x : -x;
+        vc = -y;
     }
+
+    int32_t u = uc * GLOBE_ROT_SCALE / major;
+    int32_t v = vc * GLOBE_ROT_SCALE / major;
 
     int sx = ((u + GLOBE_ROT_SCALE) * GLOBE_CUBEMAP_FACE_SIZE) /
              (GLOBE_ROT_SCALE * 2);
@@ -1078,12 +1121,12 @@ static uint8_t cubemap_sample(GlobeView *view, int32_t x, int32_t y, int32_t z) 
 
     int face_area = GLOBE_CUBEMAP_FACE_SIZE * GLOBE_CUBEMAP_FACE_SIZE;
     int pixel_index = (face * face_area) + (sy * GLOBE_CUBEMAP_FACE_SIZE) + sx;
-    uint8_t packed = view->cubemap_data[pixel_index >> 1];
+    uint8_t packed = cubemap_data[pixel_index >> 1];
     uint8_t palette_index = (pixel_index & 1) ? (packed & 0x0F) : (packed >> 4);
     if (palette_index >= GLOBE_CUBEMAP_PALETTE_SIZE) {
-        return GColorBlueMoonARGB8;
+        return 1;  // BlueMoon slot — same fallback color as before
     }
-    return GLOBE_CUBEMAP_PALETTE[palette_index];
+    return palette_index;
 }
 
 static uint8_t starfield_color_from_flags(uint8_t flags) {
@@ -1164,7 +1207,7 @@ static int revealed_globe_radius(void) {
             100) / 2;
 }
 
-static GPoint revealed_globe_center_for_bounds(GRect bounds, int offset) {
+__attribute__((noinline)) static GPoint revealed_globe_center_for_bounds(GRect bounds, int offset) {
     return GPoint(bounds.origin.x + (bounds.size.w / 2),
                   bounds.origin.y + (bounds.size.h / 2) +
                       GLOBE_REVEALED_CENTER_Y_OFFSET + offset);
@@ -1210,8 +1253,9 @@ static void clear_framebuffer_rect(GBitmap *fb, GRect rect) {
         GBitmapDataRowInfo ri = gbitmap_get_data_row_info(fb, (uint16_t)ay);
         int row_left = left < (int)ri.min_x ? (int)ri.min_x : left;
         int row_right = right > (int)ri.max_x ? (int)ri.max_x : right;
-        for (int ax = row_left; ax <= row_right; ax++) {
-            ri.data[ax] = GColorBlackARGB8;
+        if (row_right >= row_left) {
+            memset(&ri.data[row_left], GColorBlackARGB8,
+                   (size_t)(row_right - row_left + 1));
         }
     }
 }
@@ -1244,9 +1288,16 @@ static void framebuffer_draw_starfield(GBitmap *fb, GlobeView *view,
         uint8_t flags = records[(i * 3) + 2];
         int source_x = records[i * 3] + ((flags & 0x80) ? 256 : 0);
         int source_y = records[(i * 3) + 1];
-        int first_x = positive_modulo(source_x - offset_x,
+        // Parallax: bright (near) stars sweep at 2x, the rest at 1x. The
+        // factor must be an INTEGER: the offset derives from a longitude
+        // that wraps by exactly one field width per revolution, and only
+        // whole multiples of the width vanish under the modulo — a
+        // fractional factor would make stars jump when a spin crosses
+        // longitude zero.
+        int mult = ((flags & 0x03) == 3) ? 2 : 1;
+        int first_x = positive_modulo(source_x - (offset_x * mult),
                                       GLOBE_STARFIELD_WIDTH);
-        int first_y = positive_modulo(source_y - offset_y,
+        int first_y = positive_modulo(source_y - (offset_y * mult),
                                       GLOBE_STARFIELD_HEIGHT);
         for (int local_y = first_y; local_y < bounds.size.h;
              local_y += GLOBE_STARFIELD_HEIGHT) {
@@ -1383,7 +1434,7 @@ static bool project_lat_lon_to_globe_point_with_depth(GlobeView *view,
     return true;
 }
 
-static bool project_lat_lon_to_globe_point(GlobeView *view,
+__attribute__((noinline)) static bool project_lat_lon_to_globe_point(GlobeView *view,
                                            int32_t latitude_e2,
                                            int32_t longitude_e2,
                                            GPoint center,
@@ -1412,12 +1463,17 @@ static int nearest_centered_city_index(GlobeView *view, int radius_px) {
     int max_index = globe_max_selector_index(view);
     for (int i = 0; i <= max_index; i++) {
         SavedLocationEntry *entry = saved_entry_for_index(view, i);
-        if (!saved_entry_has_globe_coordinates(view, entry)) continue;
+        int32_t entry_latitude_e2;
+        int32_t entry_longitude_e2;
+        if (!saved_entry_globe_coords(view, entry, &entry_latitude_e2,
+                                      &entry_longitude_e2)) {
+            continue;
+        }
 
         GPoint point;
         if (!project_lat_lon_to_globe_point(view,
-                                            saved_entry_latitude_e2(view, entry),
-                                            saved_entry_longitude_e2(view, entry),
+                                            entry_latitude_e2,
+                                            entry_longitude_e2,
                                             center,
                                             globe_radius,
                                             &point)) {
@@ -1443,7 +1499,12 @@ static bool city_pin_offset_from_center(GlobeView *view,
     if (!view || !view->window || !dx_out || !dy_out) return false;
 
     SavedLocationEntry *entry = saved_entry_for_index(view, city_index);
-    if (!saved_entry_has_globe_coordinates(view, entry)) return false;
+    int32_t entry_latitude_e2;
+    int32_t entry_longitude_e2;
+    if (!saved_entry_globe_coords(view, entry, &entry_latitude_e2,
+                                  &entry_longitude_e2)) {
+        return false;
+    }
 
     Layer *root_layer = window_get_root_layer(view->window);
     if (!root_layer) return false;
@@ -1454,8 +1515,8 @@ static bool city_pin_offset_from_center(GlobeView *view,
     if (globe_radius <= 0) return false;
     GPoint point;
     if (!project_lat_lon_to_globe_point(view,
-                                        saved_entry_latitude_e2(view, entry),
-                                        saved_entry_longitude_e2(view, entry),
+                                        entry_latitude_e2,
+                                        entry_longitude_e2,
                                         center,
                                         globe_radius,
                                         &point)) {
@@ -1531,6 +1592,47 @@ static void draw_saved_location_pins(GBitmap *fb, GlobeView *view,
     }
 }
 
+static void fill_row_span(uint8_t *row_data, int x0, int x1,
+                          int lo, int hi, uint8_t color) {
+    if (x0 < lo) x0 = lo;
+    if (x1 > hi) x1 = hi;
+    if (x1 >= x0) {
+        memset(&row_data[x0], color, (size_t)(x1 - x0 + 1));
+    }
+}
+
+// Draws the non-textured rings of one globe row (the 4-step atmosphere
+// gradient + the black outline) as memset spans and returns the half-width
+// of the textured segment (-1 when the row has none). radii_sq holds,
+// outermost first, the squared radii of the ring boundaries; the innermost
+// entry is offset by -1 because the textured test is a strict inequality
+// (dist^2 < inner^2).
+#define GLOBE_RING_COUNT 5
+static int fill_globe_ring_row(uint8_t *row_data, int cx, int dy_sq,
+                               const int32_t *radii_sq, int lo, int hi) {
+    // Atmosphere halo: a luminous Celeste band on the rim itself (no hard
+    // outline — it merges with the on-planet rim glow), fading into space.
+    static const uint8_t ring_colors[GLOBE_RING_COUNT] = {
+        GColorDukeBlueARGB8,       // outermost wisp
+        GColorBlueMoonARGB8,
+        GColorVividCeruleanARGB8,
+        GColorPictonBlueARGB8,
+        GColorCelesteARGB8,        // brightest, straddling the limb
+    };
+    int spans[GLOBE_RING_COUNT + 1];
+    for (int r = 0; r <= GLOBE_RING_COUNT; r++) {
+        int32_t rem = radii_sq[r] - dy_sq;
+        spans[r] = rem >= 0 ? (int)globe_isqrt(rem) : -1;
+    }
+    for (int r = 0; r < GLOBE_RING_COUNT; r++) {
+        fill_row_span(row_data, cx - spans[r], cx - spans[r + 1] - 1,
+                      lo, hi, ring_colors[r]);
+        fill_row_span(row_data, cx + spans[r + 1] + 1, cx + spans[r],
+                      lo, hi, ring_colors[r]);
+    }
+    return spans[GLOBE_RING_COUNT];
+}
+
 static void draw_cubemap_globe_at_center(GContext *ctx, GlobeView *view,
                                          GPoint center, int scale_percent,
                                          GRect clip_rect,
@@ -1541,14 +1643,18 @@ static void draw_cubemap_globe_at_center(GContext *ctx, GlobeView *view,
     if (diameter < 4) return;
 
     int radius = diameter / 2;
-    int radius_sq = radius * radius;
     int outline_inner_radius = radius - GLOBE_OUTLINE_PX;
     if (outline_inner_radius < 0) outline_inner_radius = 0;
     int outline_inner_radius_sq = outline_inner_radius * outline_inner_radius;
-    int glow_mid_radius = radius + 3;
     int glow_outer_radius = radius + GLOBE_ATMOSPHERE_GLOW_PX;
-    int glow_mid_radius_sq = glow_mid_radius * glow_mid_radius;
-    int glow_outer_radius_sq = glow_outer_radius * glow_outer_radius;
+    const int32_t ring_radii_sq[GLOBE_RING_COUNT + 1] = {
+        glow_outer_radius * glow_outer_radius,     // deep-space wisp
+        (radius + 8) * (radius + 8),
+        (radius + 6) * (radius + 6),
+        (radius + 4) * (radius + 4),
+        (radius + 2) * (radius + 2),               // Celeste rim band
+        outline_inner_radius_sq - 1,               // textured face (strict <)
+    };
 
     GBitmap *fb = graphics_capture_frame_buffer(ctx);
     if (!fb) return;
@@ -1565,57 +1671,103 @@ static void draw_cubemap_globe_at_center(GContext *ctx, GlobeView *view,
     int clip_right = clipped.origin.x + clipped.size.w - 1;
     int clip_bottom = clipped.origin.y + clipped.size.h - 1;
 
+    // Hoist the rotation matrix and texture pointer into locals: the
+    // framebuffer byte writes below would otherwise force the compiler to
+    // reload them from the view struct on every pixel.
+    int32_t m[9];
+    memcpy(m, view->globe_rotation, sizeof(m));
+    const uint8_t *cubemap = view->cubemap_data;
+
+    const int cx = center.x;
     for (int dy = -glow_outer_radius; dy <= glow_outer_radius; dy++) {
         int ay = center.y + dy;
         if (ay < clip_top || ay > clip_bottom) continue;
 
-        int span_sq = glow_outer_radius_sq - (dy * dy);
-        if (span_sq < 0) continue;
-        int span = globe_isqrt(span_sq);
         GBitmapDataRowInfo ri = gbitmap_get_data_row_info(fb, (uint16_t)ay);
 
-        for (int dx = -span; dx <= span; dx++) {
-            int ax = center.x + dx;
-            if (ax < clip_left || ax > clip_right ||
-                ax < (int)ri.min_x || ax > (int)ri.max_x) {
-                continue;
+        int row_left = clip_left < (int)ri.min_x ? (int)ri.min_x : clip_left;
+        int row_right = clip_right > (int)ri.max_x ? (int)ri.max_x : clip_right;
+        if (row_left > row_right) continue;
+
+        int t_span = fill_globe_ring_row(ri.data, cx, dy * dy, ring_radii_sq,
+                                         row_left, row_right);
+        if (t_span < 0) continue;
+        int lo = cx - t_span < row_left ? row_left : cx - t_span;
+        int hi = cx + t_span > row_right ? row_right : cx + t_span;
+        if (lo > hi) continue;
+
+        int32_t sy = ((int32_t)-dy * GLOBE_ROT_SCALE) / radius;
+        int32_t plane_sq = (GLOBE_ROT_SCALE * GLOBE_ROT_SCALE) - (sy * sy);
+        int32_t row_x = m[1] * sy;
+        int32_t row_y = m[4] * sy;
+        int32_t row_z = m[7] * sy;
+        int32_t light_row = GLOBE_LIGHT_Y_Q10 * sy;
+        const uint8_t *dither_row =
+            GLOBE_SPACE_FADE_DITHER[ay % GLOBE_SPACE_FADE_DITHER_SIZE];
+
+        int d_max = cx - lo > hi - cx ? cx - lo : hi - cx;
+
+        // The two halves of the row mirror in sx, so one depth (sz) and one
+        // sz/sy matrix contribution serve both pixels. sz shrinks
+        // monotonically as d grows, so the seeded Newton sqrt can reuse the
+        // previous pixel's depth as its starting point; the row seed below
+        // is the depth at d = 0, an upper bound for the whole row.
+        int32_t sz = globe_isqrt(plane_sq);
+        for (int d = 0; d <= d_max; d++) {
+            int32_t sx = ((int32_t)d * GLOBE_ROT_SCALE) / radius;
+            sz = floor_sqrt_seeded(plane_sq - (sx * sx), sz);
+
+            int32_t base_x = row_x + (m[2] * sz);
+            int32_t base_y = row_y + (m[5] * sz);
+            int32_t base_z = row_z + (m[8] * sz);
+            int32_t col_x = m[0] * sx;
+            int32_t col_y = m[3] * sx;
+            int32_t col_z = m[6] * sx;
+            int32_t light_base = light_row + (GLOBE_LIGHT_Z_Q10 * sz);
+            int32_t light_col = GLOBE_LIGHT_X_Q10 * sx;
+
+            for (int side = 0; side < 2; side++) {
+                if (side) {
+                    if (d == 0) break;
+                    col_x = -col_x;
+                    col_y = -col_y;
+                    col_z = -col_z;
+                    light_col = -light_col;
+                }
+                int ax = side ? cx - d : cx + d;
+                if (ax < lo || ax > hi) continue;
+                if (sz < GLOBE_HAZE_RIM_SZ_Q10) {
+                    // Luminous rim: the atmosphere outshines the terrain at
+                    // the very edge of the disc (merges with the halo ring).
+                    ri.data[ax] = GColorCelesteARGB8;
+                    continue;
+                }
+                uint8_t tex = cubemap_sample(
+                    cubemap,
+                    (base_x + col_x) >> GLOBE_ROT_SHIFT,
+                    (base_y + col_y) >> GLOBE_ROT_SHIFT,
+                    (base_z + col_z) >> GLOBE_ROT_SHIFT);
+                // Posterized lambert shading, dithered at the band edges.
+                int32_t dith =
+                    (int32_t)dither_row[ax % GLOBE_SPACE_FADE_DITHER_SIZE];
+                int32_t light = (light_base + light_col) >> GLOBE_ROT_SHIFT;
+                light += (dith - 8) << 4;
+                int band = light >= GLOBE_SHADE_LIT_MIN_Q10
+                               ? 0
+                               : (light >= GLOBE_SHADE_MID_MIN_Q10 ? 1 : 2);
+                uint8_t color = GLOBE_SHADE_PALETTE[band][tex];
+                if (sz < GLOBE_HAZE_BLEND_SZ_Q10) {
+                    // Bluish atmospheric wash over terrain near the horizon,
+                    // dithered denser toward the rim.
+                    int32_t haze_span =
+                        GLOBE_HAZE_BLEND_SZ_Q10 - GLOBE_HAZE_RIM_SZ_Q10;
+                    if (((dith * haze_span) >> 4) >=
+                        (sz - GLOBE_HAZE_RIM_SZ_Q10)) {
+                        color = GColorPictonBlueARGB8;
+                    }
+                }
+                ri.data[ax] = color;
             }
-
-            int dist_sq = (dx * dx) + (dy * dy);
-            if (dist_sq > radius_sq) {
-                ri.data[ax] = dist_sq > glow_mid_radius_sq
-                                  ? GColorDukeBlueARGB8
-                                  : GColorVividCeruleanARGB8;
-                continue;
-            }
-            if (dist_sq >= outline_inner_radius_sq) {
-                ri.data[ax] = GColorBlackARGB8;
-                continue;
-            }
-
-            int32_t sx = ((int32_t)dx * GLOBE_ROT_SCALE) / radius;
-            int32_t sy = ((int32_t)-dy * GLOBE_ROT_SCALE) / radius;
-            int32_t sz_sq = (GLOBE_ROT_SCALE * GLOBE_ROT_SCALE) -
-                            (sx * sx) - (sy * sy);
-            int32_t sz = globe_isqrt(sz_sq);
-
-            int32_t wx =
-                (int32_t)(((int64_t)view->globe_rotation[0] * sx +
-                           (int64_t)view->globe_rotation[1] * sy +
-                           (int64_t)view->globe_rotation[2] * sz) >>
-                          GLOBE_ROT_SHIFT);
-            int32_t wy =
-                (int32_t)(((int64_t)view->globe_rotation[3] * sx +
-                           (int64_t)view->globe_rotation[4] * sy +
-                           (int64_t)view->globe_rotation[5] * sz) >>
-                          GLOBE_ROT_SHIFT);
-            int32_t wz =
-                (int32_t)(((int64_t)view->globe_rotation[6] * sx +
-                           (int64_t)view->globe_rotation[7] * sy +
-                           (int64_t)view->globe_rotation[8] * sz) >>
-                          GLOBE_ROT_SHIFT);
-
-            ri.data[ax] = cubemap_sample(view, wx, wy, wz);
         }
     }
 
@@ -1648,13 +1800,8 @@ static void reload_current_frame(GlobeView *view) {
     mark_dynamic_globe_dirty(view);
 }
 
-static void reload_color_frame(GlobeView *view) {
-    if (!view) return;
-    if (view->is_revealed && !view->is_revealing) {
-        update_city_label_layer(view);
-    }
-    mark_dynamic_globe_dirty(view);
-}
+// Identical to reload_current_frame; keep one body.
+#define reload_color_frame reload_current_frame
 
 static void mark_dynamic_globe_dirty(GlobeView *view) {
     if (!view) return;
@@ -1731,32 +1878,36 @@ static int bounce_offset(GlobeView *view) {
            ANIMATION_NORMALIZED_MAX;
 }
 
-static void cancel_city_animation(GlobeView *view) {
-    if (!view || !view->city_anim) return;
-
-    Animation *anim = view->city_anim;
-    view->city_anim = NULL;
+// One canceller for all Animation-slot fields: clears the slot first (the
+// stopped handler checks ownership), then unschedules + destroys.
+static void cancel_animation_slot(Animation **slot) {
+    Animation *anim = *slot;
+    if (!anim) return;
+    *slot = NULL;
     animation_unschedule(anim);
     animation_destroy(anim);
 }
 
-static void cancel_bounce_animation(GlobeView *view) {
-    if (!view || !view->bounce_anim) return;
+static void cancel_timer_slot(AppTimer **slot) {
+    if (*slot) {
+        app_timer_cancel(*slot);
+        *slot = NULL;
+    }
+}
 
-    Animation *anim = view->bounce_anim;
-    view->bounce_anim = NULL;
-    animation_unschedule(anim);
-    animation_destroy(anim);
+static void cancel_city_animation(GlobeView *view) {
+    if (view) cancel_animation_slot(&view->city_anim);
+}
+
+static void cancel_bounce_animation(GlobeView *view) {
+    if (view) cancel_animation_slot(&view->bounce_anim);
 }
 
 #if WEATHER_PLATFORM_TOUCH_COLOR
 static void stop_globe_coast(GlobeView *view, bool mark_dirty) {
     if (!view) return;
 
-    if (view->coast_timer) {
-        app_timer_cancel(view->coast_timer);
-        view->coast_timer = NULL;
-    }
+    cancel_timer_slot(&view->coast_timer);
     view->coast_active = false;
     view->coast_velocity_x_q8 = 0;
     view->coast_velocity_y_q8 = 0;
@@ -1812,13 +1963,6 @@ static bool commit_hovered_location(GlobeView *view) {
     update_city_label_layer(view);
     notify_city_selected(view, true);
     return true;
-}
-
-// Dictation (dictate-a-city search) is cut in the system app: the transcription
-// would need the phone's geocoder (an AppMessage round-trip) which the firmware
-// weather service does not provide. The dictate gesture is now inert.
-static void start_city_dictation(GlobeView *view) {
-    (void)view;
 }
 
 static void format_selected_label(GlobeView *view, char *buffer, size_t buffer_size) {
@@ -2062,20 +2206,35 @@ static const AnimationImplementation s_bounce_anim_impl = {
     .update = bounce_anim_update
 };
 
+// Shared boilerplate for the view's stopped-handler animations: create,
+// configure, schedule. Returns the animation (NULL if creation failed) so
+// callers can store it in their slot; behavior matches the previous inline
+// sequences (applib animation_* functions tolerate NULL).
+static Animation *start_view_animation(GlobeView *view, uint32_t duration_ms,
+                                       AnimationCurve curve,
+                                       const AnimationImplementation *impl,
+                                       AnimationStoppedHandler stopped) {
+    Animation *anim = animation_create();
+    animation_set_duration(anim, duration_ms);
+    animation_set_curve(anim, curve);
+    animation_set_implementation(anim, impl);
+    animation_set_handlers(anim, (AnimationHandlers){ .stopped = stopped },
+                           view);
+    animation_schedule(anim);
+    return anim;
+}
+
 static void start_city_bounce(GlobeView *view, bool is_down) {
     if (!view) return;
 
     cancel_bounce_animation(view);
     view->bounce_direction = is_down ? -1 : 1;
     view->bounce_progress = 0;
-    view->bounce_anim = animation_create();
-    animation_set_duration(view->bounce_anim, GLOBE_CITY_BOUNCE_DURATION_MS);
-    animation_set_curve(view->bounce_anim, AnimationCurveEaseOut);
-    animation_set_implementation(view->bounce_anim, &s_bounce_anim_impl);
-    animation_set_handlers(view->bounce_anim,
-                           (AnimationHandlers){ .stopped = bounce_anim_stopped },
-                           view);
-    animation_schedule(view->bounce_anim);
+    view->bounce_anim = start_view_animation(view,
+                                             GLOBE_CITY_BOUNCE_DURATION_MS,
+                                             AnimationCurveEaseOut,
+                                             &s_bounce_anim_impl,
+                                             bounce_anim_stopped);
 }
 
 static void start_city_rotation(GlobeView *view, int city_index) {
@@ -2111,14 +2270,11 @@ static void start_city_rotation(GlobeView *view, int city_index) {
         return;
     }
 
-    view->city_anim = animation_create();
-    animation_set_duration(view->city_anim, GLOBE_CITY_ROTATION_DURATION_MS);
-    animation_set_curve(view->city_anim, AnimationCurveEaseInOut);
-    animation_set_implementation(view->city_anim, &s_city_anim_impl);
-    animation_set_handlers(view->city_anim,
-                           (AnimationHandlers){ .stopped = city_anim_stopped },
-                           view);
-    animation_schedule(view->city_anim);
+    view->city_anim = start_view_animation(view,
+                                           GLOBE_CITY_ROTATION_DURATION_MS,
+                                           AnimationCurveEaseInOut,
+                                           &s_city_anim_impl,
+                                           city_anim_stopped);
     update_city_label_layer(view);
     mark_dynamic_globe_dirty(view);
 }
@@ -2158,20 +2314,15 @@ static bool try_start_magnetic_city_lock(GlobeView *view, int radius_px) {
     view->city_anim_longitude_delta_e2 = start_dx;
     view->city_anim_progress = 0;
 
-    view->city_anim = animation_create();
+    view->city_anim = start_view_animation(view,
+                                           GLOBE_LOCK_SWOOP_DURATION_MS,
+                                           AnimationCurveLinear,
+                                           &s_city_anim_impl,
+                                           city_anim_stopped);
     if (!view->city_anim) {
         settle_city_pin_to_center(view, city_index);
         mark_dynamic_globe_dirty(view);
-        return true;
     }
-
-    animation_set_duration(view->city_anim, GLOBE_LOCK_SWOOP_DURATION_MS);
-    animation_set_curve(view->city_anim, AnimationCurveLinear);
-    animation_set_implementation(view->city_anim, &s_city_anim_impl);
-    animation_set_handlers(view->city_anim,
-                           (AnimationHandlers){ .stopped = city_anim_stopped },
-                           view);
-    animation_schedule(view->city_anim);
     return true;
 }
 #endif
@@ -2212,7 +2363,7 @@ static void navigate_city(GlobeView *view, bool is_down) {
 }
 
 #if WEATHER_PLATFORM_TOUCH_COLOR
-static int32_t clamp_globe_velocity_q8(int32_t value) {
+__attribute__((noinline)) static int32_t clamp_globe_velocity_q8(int32_t value) {
     if (value > GLOBE_COAST_MAX_SPEED_Q8) return GLOBE_COAST_MAX_SPEED_Q8;
     if (value < -GLOBE_COAST_MAX_SPEED_Q8) return -GLOBE_COAST_MAX_SPEED_Q8;
     return value;
@@ -2436,10 +2587,7 @@ static void reveal_anim_stopped(Animation *anim, bool finished, void *context) {
             set_color_orientation(view,
                                   view->transition_color_target_latitude_e2,
                                   view->transition_color_target_longitude_e2);
-            if (view->animation_timer) {
-                app_timer_cancel(view->animation_timer);
-                view->animation_timer = NULL;
-            }
+            cancel_timer_slot(&view->animation_timer);
             show_revealed_space_layers(view);
         } else {
             view->is_free_roam = false;
@@ -2452,10 +2600,7 @@ static void reveal_anim_stopped(Animation *anim, bool finished, void *context) {
             view->bw_idle = false;
             view->bw_idle_slowdown_step = 0;
             if (view->is_animating && !view->animation_timer) {
-                view->animation_timer = app_timer_register(
-                    GLOBE_FRAME_INTERVAL_MS,
-                    animation_timer_handler,
-                    view);
+                schedule_frame_timer(view);
             }
             start_globe_idle_timer(view);
             show_intro_canvas(view);
@@ -2472,12 +2617,13 @@ static const AnimationImplementation s_reveal_impl = {
 };
 
 static void cancel_reveal_animation(GlobeView *view) {
-    if (!view || !view->reveal_anim) return;
+    if (view) cancel_animation_slot(&view->reveal_anim);
+}
 
-    Animation *anim = view->reveal_anim;
-    view->reveal_anim = NULL;
-    animation_unschedule(anim);
-    animation_destroy(anim);
+static void cancel_all_view_animations(GlobeView *view) {
+    cancel_reveal_animation(view);
+    cancel_city_animation(view);
+    cancel_bounce_animation(view);
 }
 
 static void toggle_reveal(GlobeView *view) {
@@ -2509,36 +2655,30 @@ static void toggle_reveal(GlobeView *view) {
     view->reveal_progress = 0;
     show_intro_canvas(view);
 
-    cancel_reveal_animation(view);
-    cancel_city_animation(view);
-    cancel_bounce_animation(view);
-    view->reveal_anim = animation_create();
-    animation_set_duration(view->reveal_anim,
-                           view->reveal_direction < 0
-                               ? GLOBE_REVEAL_REVERSE_DURATION_MS
-                               : GLOBE_REVEAL_DURATION_MS);
-    animation_set_curve(view->reveal_anim, AnimationCurveEaseOut);
-    animation_set_implementation(view->reveal_anim, &s_reveal_impl);
-    animation_set_handlers(view->reveal_anim,
-                           (AnimationHandlers){ .stopped = reveal_anim_stopped },
-                           view);
-    animation_schedule(view->reveal_anim);
+    cancel_all_view_animations(view);
+    view->reveal_anim = start_view_animation(view,
+                                             view->reveal_direction < 0
+                                                 ? GLOBE_REVEAL_REVERSE_DURATION_MS
+                                                 : GLOBE_REVEAL_DURATION_MS,
+                                             AnimationCurveEaseOut,
+                                             &s_reveal_impl,
+                                             reveal_anim_stopped);
+}
+
+static void schedule_frame_timer(GlobeView *view) {
+    view->animation_timer = app_timer_register(GLOBE_FRAME_INTERVAL_MS,
+                                               animation_timer_handler,
+                                               view);
 }
 
 static void note_globe_interaction(GlobeView *view) {
     if (!view) return;
-    if (view->idle_timer) {
-        app_timer_cancel(view->idle_timer);
-        view->idle_timer = NULL;
-    }
+    cancel_timer_slot(&view->idle_timer);
     view->bw_idle = false;
     view->bw_idle_slowdown_step = 0;
     if (view->is_animating && !view->is_revealed &&
         !view->animation_timer) {
-        view->animation_timer = app_timer_register(
-            GLOBE_FRAME_INTERVAL_MS,
-            animation_timer_handler,
-            view);
+        schedule_frame_timer(view);
     }
     start_globe_idle_timer(view);
 }
@@ -2553,10 +2693,7 @@ static void globe_idle_timer_handler(void *context) {
     view->bw_idle = true;
     view->bw_idle_slowdown_step = 0;
     if (!view->animation_timer) {
-        view->animation_timer = app_timer_register(
-            GLOBE_FRAME_INTERVAL_MS,
-            animation_timer_handler,
-            view);
+        schedule_frame_timer(view);
     }
 }
 
@@ -2614,10 +2751,7 @@ static void animation_timer_handler(void *context) {
             animation_timer_handler,
             view);
     } else {
-        view->animation_timer = app_timer_register(
-            GLOBE_FRAME_INTERVAL_MS,
-            animation_timer_handler,
-            view);
+        schedule_frame_timer(view);
     }
 }
 
@@ -2708,27 +2842,40 @@ static void draw_intro_title(GContext *ctx, GRect bounds, int globe_y,
                        NULL);
 }
 
+// Map-pin artwork lifted from the world cup app's location_pin.pdc (18x22 viewbox,
+// resources/svg/location/location_pin.svg): outer teardrop filled in `color`, inner
+// octagonal window in `bg_color`. Embedded as GPaths so both label states (black-on-
+// white / white-on-cerulean) recolor for free.
 static void draw_saved_locations_pin(GContext *ctx, GPoint origin,
                                      GColor color, GColor bg_color) {
-    GPoint center = GPoint(origin.x + GLOBE_SAVED_COG_SIZE / 2,
-                           origin.y + 7);
+    static const GPoint kPinBody[] = {
+        {8, 1}, {10, 1}, {11, 2}, {13, 3}, {15, 5}, {16, 7}, {16, 10},
+        {15, 11}, {15, 13}, {14, 14}, {13, 16}, {10, 19}, {10, 20}, {9, 21},
+        {8, 20}, {8, 19}, {5, 16}, {4, 14}, {3, 13}, {3, 11}, {2, 10},
+        {2, 7}, {3, 5}, {5, 3}, {7, 2},
+    };
+    static const GPoint kPinWindow[] = {
+        {10, 5}, {12, 7}, {12, 9}, {10, 11}, {8, 11}, {6, 9}, {6, 7}, {8, 5},
+    };
+    // The art is 22px tall in an 18px (GLOBE_SAVED_COG_SIZE) slot: lift 2px so it
+    // optically centres in the 34px label row.
+    const GPoint off = GPoint(origin.x, origin.y - 2);
+    GPath body = {
+        .num_points = sizeof(kPinBody) / sizeof(kPinBody[0]),
+        .points = (GPoint *)kPinBody,
+        .offset = off,
+    };
+    GPath window = {
+        .num_points = sizeof(kPinWindow) / sizeof(kPinWindow[0]),
+        .points = (GPoint *)kPinWindow,
+        .offset = off,
+    };
 
     graphics_context_set_antialiased(ctx, false);
     graphics_context_set_fill_color(ctx, color);
-
-    graphics_fill_circle(ctx, center, 6);
-
-    GPoint tail_points[] = {
-        GPoint(origin.x + 4, origin.y + 9),
-        GPoint(origin.x + 14, origin.y + 9),
-        GPoint(origin.x + 9, origin.y + 18),
-    };
-    GPath tail_path = { .points = tail_points, .num_points = 3 };
-    gpath_draw_filled(ctx, &tail_path);
-
+    gpath_draw_filled(ctx, &body);
     graphics_context_set_fill_color(ctx, bg_color);
-    graphics_fill_circle(ctx, center, 2);
-
+    gpath_draw_filled(ctx, &window);
     graphics_context_set_antialiased(ctx, true);
 }
 
@@ -2736,19 +2883,23 @@ static void draw_saved_locations_label(GContext *ctx, GlobeView *view,
                                        GRect bounds, bool selected) {
     const char *label = "saved locations";
     GFont font = fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD);
-    GSize text_size = graphics_text_layout_get_content_size(
-        label,
-        font,
-        GRect(0, 0, bounds.size.w, GLOBE_SAVED_LABEL_HEIGHT),
-        GTextOverflowModeTrailingEllipsis,
-        GTextAlignmentLeft
-    );
-    int total_w = GLOBE_SAVED_COG_SIZE + GLOBE_SAVED_LABEL_GAP + text_size.w;
-    if (total_w > bounds.size.w - 4) {
-        total_w = bounds.size.w - 4;
+    // Constant string + constant font: measure once, not per intro frame (28.6fps while the
+    // cradle animates).
+    static GSize text_size;
+    if (text_size.w == 0) {
+        text_size = graphics_text_layout_get_content_size(
+            label,
+            font,
+            GRect(0, 0, 300, GLOBE_SAVED_LABEL_HEIGHT),   // unconstrained: natural label width
+            GTextOverflowModeTrailingEllipsis,
+            GTextAlignmentLeft
+        );
     }
-
-    int x = (bounds.size.w - total_w) / 2;
+    // The TEXT centres on the screen; the pin hangs off its left (so the label reads
+    // centred rather than the pin+text group being centred, which right-shifted the text).
+    int text_x = (bounds.size.w - text_size.w) / 2;
+    int pin_x = text_x - GLOBE_SAVED_LABEL_GAP - GLOBE_SAVED_COG_SIZE;
+    if (pin_x < 2) pin_x = 2;
     int y = bounds.size.h - GLOBE_SAVED_LABEL_HEIGHT -
             GLOBE_SAVED_LABEL_ROUND_BOTTOM_INSET;
     if (selected) y += intro_selection_offset(view);
@@ -2767,17 +2918,15 @@ static void draw_saved_locations_label(GContext *ctx, GlobeView *view,
     GColor label_color = selected ? GColorWhite : GColorBlack;
     GColor bg_color = selected ? GColorVividCerulean : GColorWhite;
     draw_saved_locations_pin(ctx,
-                             GPoint(x, y + (GLOBE_SAVED_LABEL_HEIGHT -
-                                            GLOBE_SAVED_COG_SIZE) / 2),
+                             GPoint(pin_x, y + (GLOBE_SAVED_LABEL_HEIGHT -
+                                                GLOBE_SAVED_COG_SIZE) / 2),
                              label_color, bg_color);
 
     graphics_context_set_text_color(ctx, label_color);
     graphics_draw_text(ctx, label,
                        font,
-                       GRect(x + GLOBE_SAVED_COG_SIZE + GLOBE_SAVED_LABEL_GAP,
-                             y + 3,
-                             bounds.size.w - x - GLOBE_SAVED_COG_SIZE -
-                                 GLOBE_SAVED_LABEL_GAP,
+                       GRect(text_x, y + 3,
+                             bounds.size.w - text_x,
                              GLOBE_SAVED_LABEL_HEIGHT - 3),
                        GTextOverflowModeTrailingEllipsis,
                        GTextAlignmentLeft,
@@ -2873,7 +3022,11 @@ static void window_click_handler(ClickRecognizerRef recognizer, void *context) {
         if (view->is_revealed && !view->is_revealing) {
             toggle_reveal(view);  // colour earth -> animated un-reveal back to the B+W cradle
         } else if (!view->is_revealing) {
-            app_window_stack_pop_all(true);  // cradle BACK exits the app (carousel)
+            if (view->back_callback) {
+                globe_view_slide_out_right(view);  // cradle BACK -> slide out right, card slides back in
+            } else {
+                app_window_stack_pop_all(true);    // no card to return to -> exit the app (carousel)
+            }
         }
     } else if (button == BUTTON_ID_SELECT) {
         if (!view->is_revealed) {
@@ -2887,31 +3040,19 @@ static void window_click_handler(ClickRecognizerRef recognizer, void *context) {
         if (view->is_revealed && !view->is_revealing) {
             navigate_city(view, false);
         } else if (!view->is_revealing) {
-            if (view->intro_world_selected && view->forecast_list_callback) {
-                view->forecast_list_callback(view->forecast_list_context);
-            } else {
-                set_intro_world_selected(view, true);
-            }
+            set_intro_world_selected(view, true);
         }
     } else if (button == BUTTON_ID_DOWN) {
         if (view->is_revealed && !view->is_revealing) {
             navigate_city(view, true);
         } else if (!view->is_revealing) {
-            if (!view->intro_world_selected && view->wrap_callback) {
-                view->wrap_callback(view->wrap_context);
-            } else {
-                set_intro_world_selected(view, false);
+            if (view->intro_world_selected) {
+                set_intro_world_selected(view, false);   // world -> saved-locations cursor (in-screen)
             }
+            // DOWN on the saved-locations cursor no longer exits to the sunset card (removed); the
+            // way back to the card is the BACK button (globe_view_slide_out_right).
         }
     }
-}
-
-static void window_select_long_click_handler(ClickRecognizerRef recognizer,
-                                             void *context) {
-    (void)recognizer;
-    GlobeView *view = (GlobeView *)context;
-    note_globe_interaction(view);
-    start_city_dictation(view);
 }
 
 #if WEATHER_PLATFORM_TOUCH_COLOR
@@ -2930,6 +3071,15 @@ static bool point_is_on_intro_globe(GlobeView *view, int16_t x, int16_t y) {
     int dx = x - center_x;
     int dy = y - center_y;
     return (dx * dx) + (dy * dy) <= radius * radius;
+}
+
+static bool point_is_on_saved_locations_label(GlobeView *view, int16_t y) {
+    if (!view || !view->window) return false;
+    GRect bounds = layer_get_bounds(window_get_root_layer(view->window));
+    // Top of the label band — same expression as draw_saved_locations_label; everything
+    // from the rule line down (incl. the round bottom inset) counts as the touch target.
+    return y >= (bounds.size.h - GLOBE_SAVED_LABEL_HEIGHT -
+                 GLOBE_SAVED_LABEL_ROUND_BOTTOM_INSET);
 }
 
 static bool point_is_on_revealed_globe(GlobeView *view, int16_t x, int16_t y) {
@@ -3021,32 +3171,31 @@ static void touch_handler(const TouchEvent *event, void *context) {
         view->touch_down_on_globe = false;
 
         if (adx <= GLOBE_TAP_THRESHOLD && ady <= GLOBE_TAP_THRESHOLD) {
+            // B&W cradle taps route by target: tap the globe to reveal it, tap the
+            // saved-locations bar to open the list. Taps elsewhere (title/dead space) no-op.
             if (!view->is_revealed) {
                 if (point_is_on_intro_globe(view, event->x, event->y)) {
                     toggle_reveal(view);
-                } else {
-                    activate_intro_selection(view);
+                } else if (!view->is_revealing &&
+                           point_is_on_saved_locations_label(view, event->y) &&
+                           view->saved_locations_callback) {
+                    view->saved_locations_callback(view->saved_locations_context);
                 }
             }
-        } else if (view->is_revealed && !view->is_revealing &&
-                   dx < -GLOBE_TAP_THRESHOLD && adx > ady) {
-            weather_carousel_navigate(+1);   // swipe left = next ring page (main)
-        } else if (view->is_revealed && !view->is_revealing &&
-                   dx > GLOBE_TAP_THRESHOLD && adx > ady) {
-            weather_carousel_navigate(-1);   // swipe right = previous ring page (clock)
-        } else if (view->is_revealed && !view->is_revealing &&
-                   view->touch_drag_axis_set) {
-            mark_dynamic_globe_dirty(view);
-        } else if (!view->is_revealed && adx > ady &&
-                   adx > GLOBE_TAP_THRESHOLD && dx < 0) {
-            weather_carousel_navigate(+1);   // intro swipe left = next ring page (main) [fixes the globe->list bug]
-        } else if (!view->is_revealed && adx > ady &&
-                   adx > GLOBE_TAP_THRESHOLD && dx > 0) {
-            weather_carousel_navigate(-1);   // intro swipe right = previous ring page (clock)
-        } else if (!view->is_revealed && ady > adx &&
-                   ady > GLOBE_TAP_THRESHOLD && dy < 0) {
-            if (view->saved_locations_callback) {
-                view->saved_locations_callback(view->saved_locations_context);
+        } else if (!view->is_revealed && !view->is_revealing &&
+                   adx > ady && dx > 0) {
+            // Cradle swipe RIGHT backs out to the sunset card (mirrors BACK). The only
+            // cradle swipe — vertical swipes stay inert (taps handle globe/saved-list).
+            if (view->back_callback) {
+                globe_view_slide_out_right(view);
+            } else {
+                app_window_stack_pop_all(true);
+            }
+        } else if (view->is_revealed && !view->is_revealing) {
+            if (view->touch_drag_axis_set) {
+                mark_dynamic_globe_dirty(view);   // revealed-globe drag settle (in-screen)
+            } else if (adx > ady && dx > 0) {
+                toggle_reveal(view);   // off-globe swipe right = BACK (un-reveal to the cradle)
             }
         }
     }
@@ -3059,8 +3208,6 @@ static void touch_handler(const TouchEvent *event, void *context) {
 static void window_click_provider(void *context) {
     window_single_click_subscribe(BUTTON_ID_BACK, window_click_handler);
     window_single_click_subscribe(BUTTON_ID_SELECT, window_click_handler);
-    window_long_click_subscribe(BUTTON_ID_SELECT, 500,
-                                window_select_long_click_handler, NULL);
     window_single_click_subscribe(BUTTON_ID_UP, window_click_handler);
     window_single_click_subscribe(BUTTON_ID_DOWN, window_click_handler);
 }
@@ -3071,10 +3218,7 @@ static void window_appear_handler(Window *window) {
 
     ensure_visual_resources(view);
     if (!view->is_revealed && !view->animation_timer) {
-        view->animation_timer = app_timer_register(
-            GLOBE_FRAME_INTERVAL_MS,
-            animation_timer_handler,
-            view);
+        schedule_frame_timer(view);
         start_globe_idle_timer(view);
     }
 #if WEATHER_PLATFORM_TOUCH_COLOR
@@ -3085,19 +3229,19 @@ static void window_appear_handler(Window *window) {
 
 static void window_disappear_handler(Window *window) {
     GlobeView *view = (GlobeView *)window_get_user_data(window);
+#if WEATHER_PLATFORM_TOUCH_COLOR
+    // Always release the touch slot here (not in stop_animation): the globe is often
+    // DESTROYED after the next window's appear already re-subscribed (commit -> forecast,
+    // BACK -> card), and a late unsubscribe would clobber that window's subscription.
+    touch_service_unsubscribe();
+#endif
     if (!view || !view->is_animating) return;
 
 #if WEATHER_PLATFORM_TOUCH_COLOR
     stop_globe_coast(view, false);
 #endif
-    if (view->animation_timer) {
-        app_timer_cancel(view->animation_timer);
-        view->animation_timer = NULL;
-    }
-    if (view->idle_timer) {
-        app_timer_cancel(view->idle_timer);
-        view->idle_timer = NULL;
-    }
+    cancel_timer_slot(&view->animation_timer);
+    cancel_timer_slot(&view->idle_timer);
     view->bw_idle = false;
     view->bw_idle_slowdown_step = 0;
     release_visual_resources(view);
@@ -3109,7 +3253,8 @@ static void window_disappear_handler(Window *window) {
 GlobeView *globe_view_create(void) {
     GlobeView *view = malloc(sizeof(GlobeView));
     if (!view) return NULL;
-    
+    memset(view, 0, sizeof(*view));
+
     // Create window
     view->window = window_create();
     if (!view->window) {
@@ -3125,11 +3270,6 @@ GlobeView *globe_view_create(void) {
         .appear = window_appear_handler,
         .disappear = window_disappear_handler,
     });
-    view->canvas_layer = NULL;
-    view->space_layer = NULL;
-    view->globe_layer = NULL;
-    view->city_label_layer = NULL;
-    
     // Create canvas layer for animation
     Layer *root_layer = window_get_root_layer(view->window);
     GRect bounds = layer_get_bounds(root_layer);
@@ -3173,9 +3313,6 @@ GlobeView *globe_view_create(void) {
     view->city_label_layer = text_layer_create(
         city_label_frame_for_bounds(bounds));
     if (!view->city_label_layer) {
-        if (view->city_label_layer) {
-            text_layer_destroy(view->city_label_layer);
-        }
         layer_destroy(view->globe_layer);
         layer_destroy(view->space_layer);
         layer_destroy(view->canvas_layer);
@@ -3195,102 +3332,19 @@ GlobeView *globe_view_create(void) {
     text_layer_set_text(view->city_label_layer, "");
     layer_set_hidden(text_layer_get_layer(view->city_label_layer), true);
     layer_add_child(root_layer, text_layer_get_layer(view->city_label_layer));
-    
-    // Initialize animation state
-    view->current_frame = 0;
-    view->color_latitude_e2 = 0;
-    view->color_longitude_e2 = 0;
-    view->transition_color_start_latitude_e2 = 0;
-    view->transition_color_start_longitude_e2 = 0;
-    view->transition_color_target_latitude_e2 = 0;
-    view->transition_color_target_longitude_e2 = 0;
-    view->city_anim_start_latitude_e2 = 0;
-    view->city_anim_start_longitude_e2 = 0;
-    view->city_anim_target_latitude_e2 = 0;
-    view->city_anim_target_longitude_e2 = 0;
-    view->city_anim_latitude_delta_e2 = 0;
-    view->city_anim_longitude_delta_e2 = 0;
+
+    // Initialize animation state (all-zero fields come from the memset above)
     matrix_identity(view->globe_rotation);
-    view->transition_bw_frame = 0;
-    view->cubemap_data = NULL;
-    view->cubemap_size = 0;
-    view->starfield_data = NULL;
-    view->starfield_size = 0;
-    view->bw_sequence = NULL;
-    view->bw_highlight_sequence = NULL;
-    view->bw_crumple_sequence = NULL;
     view->bw_crumple_amount = -1;
     view->bw_crumple_frame = -1;
     view->bw_frame_count = NUM_BW_FRAMES;
     view->bw_sequence_duration_ms = NUM_BW_FRAMES * GLOBE_FRAME_INTERVAL_MS;
-    view->bw_elapsed_ms = 0;
-    view->cradle_pdc = NULL;
-    view->animation_timer = NULL;
-    view->idle_timer = NULL;
-    view->reveal_anim = NULL;
-    view->city_anim = NULL;
-    view->bounce_anim = NULL;
-    view->is_animating = false;
-    view->reveal_progress = 0;
-    view->city_anim_progress = 0;
-    view->bounce_progress = 0;
     view->reveal_direction = 1;
-    view->selected_city_index = 0;
-    view->saved_entry_count = 0;
-    view->current_location_latitude_e2 = 0;
-    view->current_location_longitude_e2 = 0;
-    view->custom_location_latitude_e2 = 0;
-    view->custom_location_longitude_e2 = 0;
-    view->bounce_direction = 0;
-    view->current_location_label[0] = '\0';
-    view->custom_location_label[0] = '\0';
-    view->city_label_text[0] = '\0';
-    view->location_select_callback = NULL;
-    view->location_select_context = NULL;
-    view->dictation_callback = NULL;
-    view->dictation_context = NULL;
-    view->wrap_callback = NULL;
-    view->wrap_context = NULL;
-    view->saved_locations_callback = NULL;
-    view->saved_locations_context = NULL;
-    view->forecast_list_callback = NULL;
-    view->forecast_list_context = NULL;
-    view->main_callback = NULL;
-    view->main_context = NULL;
 #if WEATHER_PLATFORM_TOUCH_COLOR
-    view->coast_timer = NULL;
-#endif
-    view->is_revealing = false;
-    view->is_revealed = false;
-    view->has_current_location = false;
-    view->has_custom_location = false;
-    view->is_free_roam = false;
-    view->intro_world_selected = false;
-    view->bw_idle = false;
-    view->bw_idle_slowdown_step = 0;
-    view->intro_selection_ms = 0;
-#if WEATHER_PLATFORM_TOUCH_COLOR
-    view->touch_start_x = 0;
-    view->touch_start_y = 0;
-    view->touch_last_x = 0;
-    view->touch_last_y = 0;
-    view->touch_velocity_x_q8 = 0;
-    view->touch_velocity_y_q8 = 0;
-    view->coast_velocity_x_q8 = 0;
-    view->coast_velocity_y_q8 = 0;
-    view->starfield_offset_x_q8 = 0;
-    view->starfield_offset_y_q8 = 0;
     view->hover_city_index = -1;
-    view->touch_active = false;
-    view->touch_drag_axis_set = false;
-    view->touch_drag_rotated = false;
-    view->touch_down_on_globe = false;
-    view->touch_controls_globe = false;
-    view->coast_active = false;
-    view->hover_lock_active = false;
 #endif
     globe_view_reload_saved_locations(view);
-    
+
     return view;
 }
 
@@ -3302,7 +3356,7 @@ void globe_view_set_location_select_callback(GlobeView *view,
     view->location_select_context = context;
 }
 
-void globe_view_reload_saved_locations(GlobeView *view) {
+static void globe_view_reload_saved_locations(GlobeView *view) {
     if (!view) return;
 
     SavedLocationEntry previous_entry;
@@ -3361,22 +3415,6 @@ void globe_view_reload_saved_locations(GlobeView *view) {
     }
 }
 
-void globe_view_set_dictation_callback(GlobeView *view,
-                                       GlobeDictationCallback callback,
-                                       void *context) {
-    if (!view) return;
-    view->dictation_callback = callback;
-    view->dictation_context = context;
-}
-
-void globe_view_set_wrap_callback(GlobeView *view,
-                                  GlobeWrapCallback callback,
-                                  void *context) {
-    if (!view) return;
-    view->wrap_callback = callback;
-    view->wrap_context = context;
-}
-
 void globe_view_set_saved_locations_callback(GlobeView *view,
                                              GlobeSavedLocationsCallback callback,
                                              void *context) {
@@ -3385,20 +3423,20 @@ void globe_view_set_saved_locations_callback(GlobeView *view,
     view->saved_locations_context = context;
 }
 
-void globe_view_set_forecast_list_callback(GlobeView *view,
-                                           GlobeForecastListCallback callback,
-                                           void *context) {
-    if (!view) return;
-    view->forecast_list_callback = callback;
-    view->forecast_list_context = context;
-}
-
 void globe_view_set_main_callback(GlobeView *view,
                                   GlobeMainCallback callback,
                                   void *context) {
     if (!view) return;
     view->main_callback = callback;
     view->main_context = context;
+}
+
+void globe_view_set_back_callback(GlobeView *view,
+                                  GlobeMainCallback callback,
+                                  void *context) {
+    if (!view) return;
+    view->back_callback = callback;
+    view->back_context = context;
 }
 
 void globe_view_set_current_location(GlobeView *view,
@@ -3438,67 +3476,6 @@ void globe_view_set_current_location(GlobeView *view,
                                   view->transition_color_target_longitude_e2);
             reload_current_frame(view);
         }
-    }
-}
-
-void globe_view_set_custom_location(GlobeView *view,
-                                    const char *label,
-                                    int16_t latitude_e2,
-                                    int16_t longitude_e2,
-                                    bool select) {
-    if (!view) return;
-
-    view->has_custom_location = true;
-    view->custom_location_latitude_e2 = latitude_e2;
-    view->custom_location_longitude_e2 = longitude_e2;
-    if (label && label[0]) {
-        strncpy(view->custom_location_label, label,
-                sizeof(view->custom_location_label) - 1);
-        view->custom_location_label[sizeof(view->custom_location_label) - 1] = '\0';
-    } else {
-        strncpy(view->custom_location_label, "Dictated Location",
-                sizeof(view->custom_location_label) - 1);
-        view->custom_location_label[sizeof(view->custom_location_label) - 1] = '\0';
-    }
-
-    globe_view_reload_saved_locations(view);
-
-    if (select) {
-        int custom_index = find_custom_saved_entry_index(view,
-                                                         view->custom_location_label,
-                                                         latitude_e2,
-                                                         longitude_e2);
-        if (custom_index >= 0) {
-            view->selected_city_index = custom_index;
-        }
-        update_selected_transition_target(view);
-        set_free_roam_enabled(view, false);
-        if (view->is_revealed && !view->is_revealing) {
-            set_color_orientation(view,
-                                  view->transition_color_target_latitude_e2,
-                                  view->transition_color_target_longitude_e2);
-            reload_current_frame(view);
-        }
-    }
-}
-
-void globe_view_set_selected_city(GlobeView *view, int city_index) {
-    if (!view || !city_presets_get(city_index)) return;
-
-    globe_view_reload_saved_locations(view);
-    int preset_entry_index = find_preset_saved_entry_index(view, city_index);
-    if (preset_entry_index < 0) {
-        preset_entry_index = find_current_saved_entry_index(view);
-    }
-    if (preset_entry_index >= 0) {
-        view->selected_city_index = preset_entry_index;
-    }
-    update_selected_transition_target(view);
-    if (view->is_revealed && !view->is_revealing && !view->is_free_roam) {
-        set_color_orientation(view,
-                              view->transition_color_target_latitude_e2,
-                              view->transition_color_target_longitude_e2);
-        reload_current_frame(view);
     }
 }
 
@@ -3564,7 +3541,7 @@ void globe_view_start_animation(GlobeView *view) {
     view->reveal_direction = 1;
     view->is_revealing = false;
     view->is_revealed = false;
-    view->intro_world_selected = false;
+    view->intro_world_selected = true;   // cursor starts on the globe (SELECT reveals it immediately)
     view->bw_idle = false;
     view->bw_idle_slowdown_step = 0;
     view->intro_selection_ms = 0;
@@ -3572,19 +3549,13 @@ void globe_view_start_animation(GlobeView *view) {
     stop_globe_coast(view, false);
     view->hover_lock_active = false;
 #endif
-    cancel_reveal_animation(view);
-    cancel_city_animation(view);
-    cancel_bounce_animation(view);
+    cancel_all_view_animations(view);
     destroy_bw_crumple_sequence(view);
     ensure_visual_resources(view);
 
     show_intro_canvas(view);
     layer_mark_dirty(view->canvas_layer);
-    view->animation_timer = app_timer_register(
-        GLOBE_FRAME_INTERVAL_MS,
-        animation_timer_handler,
-        view
-    );
+    schedule_frame_timer(view);
     start_globe_idle_timer(view);
 #if WEATHER_PLATFORM_TOUCH_COLOR
     touch_service_subscribe(touch_handler, view);
@@ -3595,29 +3566,31 @@ void globe_view_start_animation(GlobeView *view) {
  * Stop the globe animation
  */
 void globe_view_stop_animation(GlobeView *view) {
-    if (!view || !view->is_animating) return;
-    
+    if (!view) return;
+#if !PBL_ROUND
+    if (view->entry_drop_anim) {   // dismissed mid drop-in: cancel before the layer is torn down
+        Animation *a = view->entry_drop_anim;
+        view->entry_drop_anim = NULL;
+        animation_unschedule(a);
+        animation_destroy(a);
+    }
+#endif
+    if (!view->is_animating) return;
+
     view->is_animating = false;
     
     // Cancel animation timer
-    if (view->animation_timer) {
-        app_timer_cancel(view->animation_timer);
-        view->animation_timer = NULL;
-    }
-    if (view->idle_timer) {
-        app_timer_cancel(view->idle_timer);
-        view->idle_timer = NULL;
-    }
+    cancel_timer_slot(&view->animation_timer);
+    cancel_timer_slot(&view->idle_timer);
     view->bw_idle = false;
     view->bw_idle_slowdown_step = 0;
 
-    cancel_reveal_animation(view);
-    cancel_city_animation(view);
-    cancel_bounce_animation(view);
+    cancel_all_view_animations(view);
     view->is_revealing = false;
 #if WEATHER_PLATFORM_TOUCH_COLOR
     stop_globe_coast(view, false);
-    touch_service_unsubscribe();
+    // touch_service_unsubscribe lives in window_disappear_handler — stop_animation runs on
+    // destroy AFTER the next window re-subscribed and must not clobber it.
     view->touch_active = false;
     view->touch_drag_axis_set = false;
     view->touch_drag_rotated = false;
@@ -3630,16 +3603,88 @@ void globe_view_stop_animation(GlobeView *view) {
     release_visual_resources(view);
 }
 
-/**
- * Push the globe view to the window stack
- */
-void globe_view_push(GlobeView *view) {
-    globe_view_push_animated(view, true);
+#if !PBL_ROUND
+// Slide duration + interpolation are shared with expanded_view via weather_math.h
+// (WEATHER_HSLIDE_MS / weather_interpolate_moook_soft1) so the pair can't drift.
+
+static void prv_drop_stopped(Animation *anim, bool finished, void *context) {
+    (void)finished;
+    GlobeView *view = (GlobeView *)context;
+    if (view && view->entry_drop_anim == anim) {
+        view->entry_drop_anim = NULL;   // auto-destroyed after a normal stop
+    }
 }
+
+// Shared moook horizontal slide for the intro canvas: create + configure +
+// schedule; returns false when the PropertyAnimation could not be created so
+// callers can run their fallback.
+static bool start_canvas_hslide(GlobeView *view, GRect *from, GRect *to,
+                                AnimationStoppedHandler stopped) {
+    PropertyAnimation *pa =
+        property_animation_create_layer_frame(view->canvas_layer, from, to);
+    if (!pa) return false;
+    Animation *a = (Animation *)pa;
+    animation_set_duration(a, WEATHER_HSLIDE_MS);
+    animation_set_custom_interpolation(a, weather_interpolate_moook_soft1);
+    animation_set_handlers(a, (AnimationHandlers){ .stopped = stopped }, view);
+    view->entry_drop_anim = a;
+    animation_schedule(a);
+    return true;
+}
+
+// SELECT-from-card entrance: the intro canvas slides in from one screen-width to the RIGHT (with
+// the same moook bounce as the drop-in), pairing with the card's slide-out to the left.
+void globe_view_push_slide_in_right(GlobeView *view) {
+    if (!view || !view->canvas_layer) { globe_view_push_animated(view, false); return; }
+    GRect to = layer_get_frame(view->canvas_layer);
+    GRect from = to;
+    from.origin.x += to.size.w;                  // start one screen-width off the right
+    layer_set_frame(view->canvas_layer, from);   // first painted frame is already off the right
+    window_stack_push(view->window, false);
+    globe_view_start_animation(view);
+    if (!start_canvas_hslide(view, &from, &to, prv_drop_stopped)) {
+        layer_set_frame(view->canvas_layer, to);
+    }
+}
+
+// Cradle BACK exit: the intro canvas slides out to the right, then hands off via back_callback
+// (weather.c dismisses the globe and slides the card back in from the left).
+static void prv_slide_out_right_stopped(Animation *anim, bool finished, void *context) {
+    GlobeView *view = (GlobeView *)context;
+    if (!view) return;
+    if (view->entry_drop_anim == anim) view->entry_drop_anim = NULL;
+    if (finished && view->back_callback) {
+        view->back_callback(view->back_context);   // dismiss globe + slide card in from the left
+    }
+    // Restore the canvas to its on-screen home so a later push isn't left off-screen.
+    if (view->canvas_layer && view->window) {
+        layer_set_frame(view->canvas_layer,
+                        layer_get_bounds(window_get_root_layer(view->window)));
+    }
+}
+
+void globe_view_slide_out_right(GlobeView *view) {
+    if (!view || !view->canvas_layer) {
+        if (view && view->back_callback) view->back_callback(view->back_context);
+        return;
+    }
+    GRect from = layer_get_frame(view->canvas_layer);   // current, on-screen
+    GRect to = from;
+    to.origin.x += from.size.w;                          // right and off the edge
+    if (!start_canvas_hslide(view, &from, &to, prv_slide_out_right_stopped)) {
+        if (view->back_callback) view->back_callback(view->back_context);
+    }
+}
+#else
+void globe_view_push_slide_in_right(GlobeView *view) { globe_view_push_animated(view, false); }
+void globe_view_slide_out_right(GlobeView *view) {
+    if (view && view->back_callback) view->back_callback(view->back_context);
+}
+#endif
 
 void globe_view_push_animated(GlobeView *view, bool animated) {
     if (!view) return;
-    
+
     window_stack_push(view->window, animated);
     globe_view_start_animation(view);
 }

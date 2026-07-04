@@ -2,9 +2,9 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 
 #include "clock_face.h"
-#include "detail_face.h"
 #include "weather.h"
 #include "applib/ui/app_window_stack.h"
+#include "applib/ui/animation_interpolate.h"
 #include "weather_math.h"
 #include "weather_types.h"
 #include "pebble_compat.h"
@@ -67,25 +67,10 @@ typedef struct {
   int16_t    temp_text_cy;      // y pixel of the text visual centre within the bitmap
   AnimationProgress anim_progress; // intro animation progress (0 → ANIMATION_NORMALIZED_MAX)
   Animation        *intro_anim;
-  bool     bar_consumed;  // true once the HUD bar has fully slid off-screen (never shows again)
   bool     skip_intro_animation;
   AppTimer *glow_timer;
   uint32_t glow_phase;
   uint16_t glow_idle_ticks;
-  // ---- Exit animation (tap → detail screen) ----
-  AnimationProgress exit_p;       // 0 → MAX while exit is playing
-  Animation        *exit_anim;
-  bool              exit_active;  // true while exit animation is in progress
-  AppTimer         *exit_push_timer; // fires at 0ms to push detail face after exit done
-  WeatherLocationForecast exit_forecast_copy; // copy of days[0] for use in timer callback
-  char exit_location_buf[64];
-  char exit_phrase_buf[64];
-  // Return animation (clock re-appears after popping detail)
-  AnimationProgress return_p;
-  Animation        *return_anim;
-  bool              return_active;
-  bool              should_play_return_anim; // set just before pushing detail; cleared in appear
-  AppTimer         *back_pop_timer; // deferred pop back to main screen
   // ---- Temperature reveal (tap) ----
   int8_t   hourly_temps[24]; // temperature per hour 0-23
   bool     hourly_temps_valid;
@@ -99,6 +84,16 @@ typedef struct {
   int16_t  touch_start_y;
   bool     touch_active;
   bool     touch_started_during_intro;
+#endif
+#if !PBL_ROUND
+  // ---- UP → forecast: whole-screen Timeline squash-stretch exit ----
+  // The clock is captured each frame and jelly-stretched down off the bottom (two moook edges:
+  // the bottom leads, the top trails — the bitmap analogue of scale_segmented's per-point lag).
+  AnimationProgress fwd_exit_p;     // 0 → MAX
+  Animation        *fwd_exit_anim;
+  bool              fwd_exit_active;
+  AppTimer         *fwd_push_timer; // 0ms timer → hand off to the forecast once fully off-top
+  uint8_t          *fwd_scratch;    // full-screen snapshot we re-sample while overwriting the fb
 #endif
 } ClockFaceData;
 
@@ -115,22 +110,6 @@ static void *s_wrap_context;
   #define prv_icon_res weather_type_icon_tiny_resource
 #endif
 
-static void prv_ascii_uppercase(char *buf) {
-  for (char *c = buf; *c; c++) {
-    if (*c >= 'a' && *c <= 'z') {
-      *c = (char)(*c - ('a' - 'A'));
-    }
-  }
-}
-
-// Uppercase 3-letter weekday abbreviation for the day `day_index` days from now
-// (e.g. "MON"). Used as the clock-face centre label for non-today days.
-static void prv_weekday_abbrev(int day_index, char *buf, size_t sz) {
-  time_t target = time(NULL) + (time_t)day_index * 86400;
-  struct tm *lt = localtime(&target);
-  strftime(buf, sz, "%a", lt);
-  prv_ascii_uppercase(buf);
-}
 
 // Load the tiny bitmap set once; the clock reuses these during animations.
 static void prv_load_bitmaps(void) {
@@ -161,10 +140,7 @@ static void prv_clock_glow_timer_callback(void *context) {
     return;
   }
 
-  bool transition_busy =
-      s_cf->anim_progress < ANIMATION_NORMALIZED_MAX ||
-      s_cf->exit_active ||
-      s_cf->return_active;
+  bool transition_busy = s_cf->anim_progress < ANIMATION_NORMALIZED_MAX;
 
   if (!transition_busy) {
     if (s_cf->glow_idle_ticks < CLOCK_GLOW_IDLE_TICKS) {
@@ -203,13 +179,25 @@ static void prv_note_clock_interaction(void) {
 //   At 10:00: pos 11→11, pos 12→12, pos 1→13, pos 2→14 ... pos 10→22.
 // Other days: a fixed daytime window so the morning reads as AM:
 //   pos 7→07, 8→08 ... 12→12, 1→13 ... 6→18 (07:00 through 18:00).
+// Current hour, localtime()d at most once per SECOND — this helper runs per icon per frame
+// (12-24x/frame at up to 20fps via prv_type_for_pos/prv_temp_for_pos), and newlib's
+// localtime re-derives timezone/DST every call.
+static int prv_cur_hour(void) {
+  static time_t cached_now;
+  static int cached_hour = -1;
+  time_t now = time(NULL);   // rtc read — cheap, unlike localtime
+  if (now != cached_now || cached_hour < 0) {
+    cached_now = now;
+    cached_hour = localtime(&now)->tm_hour;
+  }
+  return cached_hour;
+}
+
 static int prv_abs_hour_for_pos(int pos_1_to_12) {
   if (s_cf && s_cf->day_index != 0) {
     return (pos_1_to_12 >= 7) ? pos_1_to_12 : pos_1_to_12 + 12;
   }
-  time_t now = time(NULL);
-  struct tm *t = localtime(&now);
-  int cur_h = t->tm_hour;
+  int cur_h = prv_cur_hour();
   int target_mod = pos_1_to_12 % 12;  // pos 12→0, pos 1→1, ..., pos 11→11
   for (int i = 1; i <= 12; i++) {
     int h = (cur_h + i) % 24;
@@ -267,107 +255,10 @@ static void prv_intro_update(Animation *anim, AnimationProgress progress) {
 }
 static const AnimationImplementation s_intro_impl = { .update = prv_intro_update };
 
-// ---- Exit animation (clock → detail) ----
-static void prv_exit_anim_push_callback(void *ctx);
-
-static void prv_exit_update(Animation *anim, AnimationProgress progress) {
-  if (!s_cf) return;
-  s_cf->exit_p = progress;
-  if (s_cf->canvas) layer_mark_dirty(s_cf->canvas);
-  // When animation reaches the end, schedule a 0ms timer to push the detail face.
-  // (Avoid pushing directly from the animation callback.)
-  if (progress >= ANIMATION_NORMALIZED_MAX && !s_cf->exit_push_timer) {
-    s_cf->exit_push_timer = app_timer_register(0, prv_exit_anim_push_callback, NULL);
-  }
-}
-static const AnimationImplementation s_exit_impl = { .update = prv_exit_update };
-
-// ---- Return animation (clock reappears after detail pop) ----
-static void prv_return_update(Animation *anim, AnimationProgress progress) {
-  if (!s_cf) return;
-  s_cf->return_p = progress;
-  if (progress >= ANIMATION_NORMALIZED_MAX) s_cf->return_active = false;
-  if (s_cf->canvas) layer_mark_dirty(s_cf->canvas);
-}
-static const AnimationImplementation s_return_impl = { .update = prv_return_update };
-
-static void prv_start_return_animation(void) {
-  if (!s_cf) return;
-  s_cf->return_active = true;
-  s_cf->return_p = 0;
-  if (s_cf->return_anim) {
-    animation_unschedule(s_cf->return_anim);
-    animation_destroy(s_cf->return_anim);
-  }
-  s_cf->return_anim = animation_create();
-  animation_set_implementation(s_cf->return_anim, &s_return_impl);
-  animation_set_duration(s_cf->return_anim, 150);
-  animation_set_curve(s_cf->return_anim, AnimationCurveEaseOut);
-  animation_schedule(s_cf->return_anim);
-}
-
-static void prv_exit_anim_push_callback(void *ctx) {
-  if (!s_cf) return;
-  s_cf->exit_push_timer = NULL;
-  s_cf->should_play_return_anim = true; // clock will play return anim when detail is popped
-  detail_face_push_animated(&s_cf->exit_forecast_copy);
-}
-
-static void prv_start_exit_animation(void) {
-  if (!s_cf || s_cf->exit_active) return;
-  // Snapshot the focused day's forecast so it survives a potential redraw cycle.
-  int di = (s_cf->day_index >= 0 && (size_t)s_cf->day_index < s_cf->num_days)
-           ? s_cf->day_index : 0;
-  if (s_cf->num_days > 0) {
-    s_cf->exit_forecast_copy = s_cf->days[di];
-    
-    // For non-today days, set up weekday animation
-    if (di != 0) {
-      // Get the full weekday name (e.g., "WEDNESDAY") for the centre animation.
-      time_t target = time(NULL) + (time_t)di * 86400;
-      struct tm *lt = localtime(&target);
-      char full_name[32] = {0};
-
-      strftime(full_name, sizeof(full_name), "%A", lt);
-      prv_ascii_uppercase(full_name);
-
-      // Keep the real location name for the detail screen's top label.
-      if (s_cf->days[di].location_name) {
-        strncpy(s_cf->exit_location_buf, s_cf->days[di].location_name,
-                sizeof(s_cf->exit_location_buf) - 1);
-        s_cf->exit_location_buf[sizeof(s_cf->exit_location_buf) - 1] = '\0';
-        s_cf->exit_forecast_copy.location_name = s_cf->exit_location_buf;
-      }
-
-      // Schedule the weekday animation to activate before push
-      detail_face_set_weekday_animation(full_name);
-    } else {
-      // Today: use normal location
-      if (s_cf->days[di].location_name) {
-        strncpy(s_cf->exit_location_buf, s_cf->days[di].location_name,
-                sizeof(s_cf->exit_location_buf) - 1);
-        s_cf->exit_forecast_copy.location_name = s_cf->exit_location_buf;
-      }
-    }
-    
-    if (s_cf->days[di].current_weather_phrase) {
-      strncpy(s_cf->exit_phrase_buf, s_cf->days[di].current_weather_phrase,
-              sizeof(s_cf->exit_phrase_buf) - 1);
-      s_cf->exit_forecast_copy.current_weather_phrase = s_cf->exit_phrase_buf;
-    }
-  }
-  s_cf->exit_active = true;
-  s_cf->exit_p = 0;
-  if (s_cf->exit_anim) {
-    animation_unschedule(s_cf->exit_anim);
-    animation_destroy(s_cf->exit_anim);
-  }
-  s_cf->exit_anim = animation_create();
-  animation_set_implementation(s_cf->exit_anim, &s_exit_impl);
-  animation_set_duration(s_cf->exit_anim, 250);
-  animation_set_curve(s_cf->exit_anim, AnimationCurveEaseIn);
-  animation_schedule(s_cf->exit_anim);
-}
+// ---- (Removed) clock -> detail_face exit/return animation ----
+// The full-screen weather detail view (temperature + UV/rain + location + last-updated) was made
+// redundant by the expanded weather card, so the clock's drill-in was removed. The exit_/return_
+// struct fields remain (never set now) so the draw proc's dead branches keep compiling harmlessly.
 
 // ---- Temperature reveal animation (tap) ----
 static void prv_reveal_update(Animation *anim, AnimationProgress progress) {
@@ -385,7 +276,6 @@ static const AnimationImplementation s_reveal_impl = { .update = prv_reveal_upda
 // weather bitmaps and showing the temperature bubbles.
 static void prv_toggle_temp_reveal(void) {
   if (!s_cf || !s_cf->hourly_temps_valid) return;
-  if (s_cf->exit_active || s_cf->return_active) return;
   if (s_cf->reveal_active) return; // ignore taps until the current reveal/hide cycle finishes
   if (s_cf->anim_progress < ANIMATION_NORMALIZED_MAX) return; // wait for intro to finish
   s_cf->reveal_to = !s_cf->temps_shown;
@@ -449,33 +339,66 @@ static int32_t prv_clock_intro_motion_progress(AnimationProgress progress) {
 static int32_t prv_clock_center_scale_progress(AnimationProgress progress) {
   const int32_t max = ANIMATION_NORMALIZED_MAX;
   if ((int32_t)progress >= max) return max;
-
-  const int32_t start = max * 44 / 100;
-  const int32_t min_scale = max / 4;
-  const int32_t overshoot = max / 14;
-  const int32_t rebound = max / 100;
-  const int32_t hit = max * 80 / 100;
-  const int32_t settle = max * 94 / 100;
-
-  if ((int32_t)progress <= start) return min_scale;
-
-  if ((int32_t)progress < hit) {
-    int32_t t = weather_scale_i32((int32_t)progress - start, max,
-                                  hit - start);
-    int32_t ease_out = max - weather_norm_square(max - t);
-    return min_scale +
-        weather_scale_i32(ease_out, max + overshoot - min_scale, max);
-  }
-
-  if ((int32_t)progress < settle) {
-    return max + overshoot -
-        weather_scale_i32((int32_t)progress - hit, overshoot + rebound,
-                          settle - hit);
-  }
-
-  return max - rebound +
-      weather_scale_i32((int32_t)progress - settle, rebound, max - settle);
+  const int32_t min_scale = max / 40;   // start from a point — blooms straight out of the dot
+  // Clean ease-out from the point to full size. No overshoot/settle phase (that tail wobble was
+  // dropping the centre temperature for a frame).
+  const int32_t q = max - (int32_t)progress;
+  const int32_t ease_out = max - (int32_t)((int64_t)q * q / max);
+  return min_scale + weather_scale_i32(ease_out, max - min_scale, max);
 }
+
+#if !PBL_ROUND
+// ---- UP → forecast: whole-screen Timeline squash-stretch ---------------------------------
+// The whole-screen jelly squash-stretch lives in weather_math.c (weather_render_squash),
+// shared with the forecast's squash modes. CLOCK_EXIT is the unhasted down-exit: unlike the
+// forecast's DOWN_EXIT it runs the full timeline (no me=m+m/3 compression) — hand-tuned so
+// the sunset-card staging reads right; do not switch modes.
+static void prv_render_fwd_squash(GContext *ctx) {
+  if (!s_cf || !s_cf->fwd_scratch) return;
+  weather_render_squash(ctx, s_cf->fwd_scratch, s_cf->fwd_exit_p,
+                        WEATHER_SQUASH_CLOCK_EXIT);
+}
+
+static void prv_fwd_exit_push_callback(void *ctx);
+static void prv_fwd_exit_update(Animation *anim, AnimationProgress progress) {
+  if (!s_cf) return;
+  s_cf->fwd_exit_p = progress;
+  if (s_cf->canvas) layer_mark_dirty(s_cf->canvas);
+  if (progress >= ANIMATION_NORMALIZED_MAX && !s_cf->fwd_push_timer) {
+    s_cf->fwd_push_timer = app_timer_register(0, prv_fwd_exit_push_callback, NULL);
+  }
+}
+static const AnimationImplementation s_fwd_exit_impl = { .update = prv_fwd_exit_update };
+
+static void prv_fwd_exit_push_callback(void *ctx) {
+  if (!s_cf) return;
+  s_cf->fwd_push_timer = NULL;
+  if (s_cf->fwd_scratch) { free(s_cf->fwd_scratch); s_cf->fwd_scratch = NULL; }
+  // Hand off to weather.c, which dismisses this clock and jelly-rises the forecast back in.
+  if (s_wrap_callback) s_wrap_callback(s_wrap_context);
+}
+
+static void prv_start_fwd_exit_animation(void) {
+  if (!s_cf || s_cf->fwd_exit_active || !s_cf->canvas) return;
+  GRect bounds = layer_get_bounds(s_cf->canvas);
+  s_cf->fwd_scratch = malloc_try((size_t)bounds.size.w * (size_t)bounds.size.h);
+  if (!s_cf->fwd_scratch) {                       // out of heap: fall back to an instant return
+    if (s_wrap_callback) s_wrap_callback(s_wrap_context);
+    return;
+  }
+  s_cf->fwd_exit_active = true;
+  s_cf->fwd_exit_p = 0;
+  if (s_cf->fwd_exit_anim) {
+    animation_unschedule(s_cf->fwd_exit_anim);
+    animation_destroy(s_cf->fwd_exit_anim);
+  }
+  s_cf->fwd_exit_anim = animation_create();
+  animation_set_implementation(s_cf->fwd_exit_anim, &s_fwd_exit_impl);
+  animation_set_duration(s_cf->fwd_exit_anim, interpolate_moook_soft_duration(3));
+  animation_set_curve(s_cf->fwd_exit_anim, AnimationCurveLinear);
+  animation_schedule(s_cf->fwd_exit_anim);
+}
+#endif  // !PBL_ROUND
 
 static void prv_canvas_draw(Layer *layer, GContext *ctx) {
   if (!s_cf) return;
@@ -491,20 +414,13 @@ static void prv_canvas_draw(Layer *layer, GContext *ctx) {
   int cx = W / 2;
   int cy = H / 2;
 
-  // Return animation state
-  bool return_active = s_cf->return_active;
-  AnimationProgress return_p = s_cf->return_p;
-  // Exit animation state
-  bool exit_active = s_cf->exit_active;
-  AnimationProgress exit_p = s_cf->exit_p;
   AnimationProgress p = s_cf->anim_progress;
   int32_t intro_p = prv_clock_intro_motion_progress(p);
   int32_t centre_scale_p = prv_clock_center_scale_progress(p);
   bool anim_done = (p >= ANIMATION_NORMALIZED_MAX);
   // Temperature reveal (tap) state — engaged once the intro has finished and the
-  // temperatures are showing. Stays engaged through the exit animation so the
-  // temperature bubbles fall/shrink away rather than flicking back to weather icons.
-  bool reveal_engaged = s_cf->hourly_temps_valid && anim_done && !return_active &&
+  // temperatures are showing.
+  bool reveal_engaged = s_cf->hourly_temps_valid && anim_done &&
       (s_cf->temps_shown || s_cf->reveal_active);
   AnimationProgress reveal_t = 0;
   if (reveal_engaged) {
@@ -517,106 +433,9 @@ static void prv_canvas_draw(Layer *layer, GContext *ctx) {
   int32_t angle_offset = -(int32_t)(TRIG_MAX_ANGLE / 4)
       * (int32_t)(ANIMATION_NORMALIZED_MAX - intro_p) / (int32_t)ANIMATION_NORMALIZED_MAX;
 
-  // Current wall time — used by the HUD exit bar and for highlighting the next upcoming hour.
-  time_t now_t = time(NULL);
-  struct tm *now_tm = localtime(&now_t);
-  int cur_h24 = now_tm->tm_hour;
+  // Current hour — for highlighting the next upcoming hour on the dial.
+  int cur_h24 = prv_cur_hour();
   int next_h24 = (cur_h24 + 1) % 24;  // the first upcoming hour to highlight
-
-  // ---- Blue location bar — matches weather screen HUD exactly ----
-  // Slides up off the top edge over the first 45% of the very first intro animation.
-  // bar_consumed is set to true the moment the bar exits, and is never cleared,
-  // so the bar can never appear again (no callbacks, no race conditions).
-  if (!anim_done && !s_cf->bar_consumed) {
-    const int32_t EXIT_END = ANIMATION_NORMALIZED_MAX * 45 / 100;
-    if ((int32_t)p >= EXIT_END) {
-      s_cf->bar_consumed = true;  // bar has fully exited; never draw it again
-    } else {
-      // EaseIn: t² — bar accelerates as it exits
-      int32_t t = weather_scale_i32((int32_t)p, ANIMATION_NORMALIZED_MAX,
-                                    EXIT_END);
-      int32_t t2 = weather_norm_square(t);
-      const int bar_exit_distance =
-          PBL_IF_ROUND_ELSE(ROUND_BAR_DEPTH + ROUND_BAR_Y_ADJUST,
-                            LOCATION_BAR_Y + LOCATION_BAR_H);
-      int y_off = -(int)(bar_exit_distance * t2 / ANIMATION_NORMALIZED_MAX);
-#if !PBL_ROUND
-      int bar_top = LOCATION_BAR_Y + y_off;
-#endif
-      // Text exits independently: linear ramp over first 15% of animation
-      // (faster and simpler than the bar's eased curve — no bounce possible).
-      const int32_t TEXT_EXIT_END = ANIMATION_NORMALIZED_MAX * 15 / 100;
-      int32_t text_t = (int32_t)p < TEXT_EXIT_END
-          ? (int32_t)p * ANIMATION_NORMALIZED_MAX / TEXT_EXIT_END
-          : ANIMATION_NORMALIZED_MAX;
-      int text_top = PBL_IF_ROUND_ELSE(0, LOCATION_BAR_Y) -
-          (int)(bar_exit_distance * text_t / ANIMATION_NORMALIZED_MAX);
-      // Blue fill (clip to screen — only visible rows matter)
-      graphics_context_set_fill_color(ctx, GColorVividCerulean);
-#if PBL_ROUND
-      const int cap_center_y = ROUND_BAR_DEPTH - ROUND_BAR_RADIUS +
-                               ROUND_BAR_Y_ADJUST + y_off;
-      graphics_fill_circle(ctx, GPoint(W / 2, cap_center_y), ROUND_BAR_RADIUS);
-
-      GFont hud_font = fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD);
-      const int safe = ROUND_LOCATION_BAR_TEXT_INSET;
-      graphics_context_set_text_color(ctx, GColorWhite);
-
-      char city_name[48];
-      city_name[0] = '\0';
-      if (s_cf->num_days > 0 && s_cf->days[0].location_name) {
-        const char *src = s_cf->days[0].location_name;
-        size_t city_len = 0;
-        while (src[city_len] && src[city_len] != ',' && city_len < sizeof(city_name) - 1) {
-          city_name[city_len] = src[city_len];
-          city_len++;
-        }
-        while (city_len > 0 && city_name[city_len - 1] == ' ') city_len--;
-        city_name[city_len] = '\0';
-      }
-
-      char time_str[8];
-      struct tm *t_tm = localtime(&now_t);
-      if (clock_is_24h_style()) {
-        strftime(time_str, sizeof(time_str), "%H:%M", t_tm);
-      } else {
-        strftime(time_str, sizeof(time_str), "%I:%M", t_tm);
-        if (time_str[0] == '0') memmove(time_str, time_str + 1, sizeof(time_str) - 1);
-      }
-      graphics_draw_text(ctx, time_str, hud_font,
-          GRect(safe, ROUND_TIME_TEXT_Y + text_top, W - (safe * 2), 19),
-          GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
-      if (city_name[0]) {
-        graphics_draw_text(ctx, city_name, hud_font,
-            GRect(safe, ROUND_LOCATION_TEXT_Y + text_top, W - (safe * 2), 19),
-            GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
-      }
-#else
-      graphics_fill_rect(ctx, GRect(0, bar_top, W, LOCATION_BAR_H), 0, GCornerNone);
-      // Location name left, time right — identical to weather screen
-      GFont hud_font = fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD);
-      const int safe = LOCATION_BAR_TEXT_INSET;
-      graphics_context_set_text_color(ctx, GColorWhite);
-      if (s_cf->num_days > 0 && s_cf->days[0].location_name) {
-        graphics_draw_text(ctx, s_cf->days[0].location_name, hud_font,
-            GRect(safe + 4, text_top + 1, W - (safe * 2) - 52,
-                  LOCATION_BAR_H),
-            GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
-      }
-      char time_str[8];
-      struct tm *t_tm = localtime(&now_t);
-      if (clock_is_24h_style()) {
-        strftime(time_str, sizeof(time_str), "%H:%M", t_tm);
-      } else {
-        strftime(time_str, sizeof(time_str), "%I:%M", t_tm);
-        if (time_str[0] == '0') memmove(time_str, time_str + 1, sizeof(time_str) - 1);
-      }
-      graphics_draw_text(ctx, time_str, hud_font,
-          GRect(W - safe - 50, text_top + 1, 48, LOCATION_BAR_H),
-          GTextOverflowModeTrailingEllipsis, GTextAlignmentRight, NULL);
-#endif
-    }
-  }
 
   // ---- 12 weather icons at hour positions (oval orbit on Emery) ----
   // During exit animation the icons fall downward and shrink away.
@@ -633,34 +452,12 @@ static void prv_canvas_draw(Layer *layer, GContext *ctx) {
     int ix = cx + (int)((int32_t)sin_lookup(angle) * orbit_rx / TRIG_MAX_RATIO);
     int iy = cy - (int)((int32_t)cos_lookup(angle) * orbit_ry / TRIG_MAX_RATIO);
 
-    // Exit: fall down and shrink. Return: rise from below.
-    if (exit_active) {
-      int fall = weather_scale_i32(40, exit_p, ANIMATION_NORMALIZED_MAX);
-      iy += fall;
-    } else if (return_active) {
-      // Icons start 20px below, rise to final position
-      int rise = weather_scale_i32(20,
-                                   ANIMATION_NORMALIZED_MAX -
-                                       (int32_t)return_p,
-                                   ANIMATION_NORMALIZED_MAX);
-      iy += rise;
-    }
-
     WeatherType wt = prv_type_for_pos(pos);
     int idx = (wt <= WeatherType_RainAndSnow) ? (int)wt : (int)WeatherType_Generic;
 
     int full_r = CLOCK_ICON_SIZE * 7 / 10;
-    int circle_r;
-    if (exit_active) {
-      // Shrink from full to 0
-      circle_r = weather_scale_i32(full_r,
-                                   ANIMATION_NORMALIZED_MAX -
-                                       (int32_t)exit_p,
-                                   ANIMATION_NORMALIZED_MAX);
-    } else {
-      circle_r = anim_done ? full_r
-          : 2 + (int)((full_r - 2) * (int)intro_p / (int)ANIMATION_NORMALIZED_MAX);
-    }
+    int circle_r = anim_done ? full_r
+        : 2 + (int)((full_r - 2) * (int)intro_p / (int)ANIMATION_NORMALIZED_MAX);
     
     icon_xs[pos-1] = ix;
     icon_ys[pos-1] = iy;
@@ -683,18 +480,6 @@ static void prv_canvas_draw(Layer *layer, GContext *ctx) {
       bool show_temp_side = (rp >= ANIMATION_NORMALIZED_MAX / 2);
       bool show_temp_text = (rp >= ANIMATION_NORMALIZED_MAX * 76 / 100);
       bool show_icon      = (rp <= ANIMATION_NORMALIZED_MAX * 24 / 100);
-
-      // During the exit transition the temperature bubbles shrink to nothing
-      // (matching the weather-icon exit) instead of reverting to weather bitmaps.
-      if (exit_active) {
-        rr = weather_scale_i32(full_r,
-                               ANIMATION_NORMALIZED_MAX - (int32_t)exit_p,
-                               ANIMATION_NORMALIZED_MAX);
-        show_temp_side = true;
-        show_icon = false;
-        // Hide the number once the circle has shrunk too small to contain it.
-        show_temp_text = (exit_p < ANIMATION_NORMALIZED_MAX * 35 / 100);
-      }
 
       if (rr < 1) continue; // fully shrunk — nothing to draw
 
@@ -728,7 +513,8 @@ static void prv_canvas_draw(Layer *layer, GContext *ctx) {
           // right without shifting the number's centring.
           char nbuf[6];
           snprintf(nbuf, sizeof(nbuf), "%d", temp);
-          GFont tfont = fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD);
+          static GFont tfont;   // stable system handle — don't re-look-up per icon per frame
+          if (!tfont) tfont = fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD);
           GSize nsz = graphics_text_layout_get_content_size(
               nbuf, tfont, GRect(0, 0, 40, 18),
               GTextOverflowModeFill, GTextAlignmentCenter);
@@ -753,115 +539,13 @@ static void prv_canvas_draw(Layer *layer, GContext *ctx) {
 
   // Draw icon bitmaps — doing this in a separate pass minimizes framebuffer captures
   if (!reveal_engaged && (anim_done || p > ANIMATION_NORMALIZED_MAX / 2)) {
-    if (return_active) {
-      int32_t t = return_p;
-      int32_t mt = ANIMATION_NORMALIZED_MAX - t;
-      int squash = (int)(4 * t / ANIMATION_NORMALIZED_MAX * mt /
-                         ANIMATION_NORMALIZED_MAX * 4); // max ~4px
-      int dst_w = CLOCK_ICON_SIZE + squash;
-      int dst_h = CLOCK_ICON_SIZE - squash;
-      if (dst_w < 1) dst_w = 1;
-      if (dst_h < 1) dst_h = 1;
-      
-      AnimationProgress dp = ANIMATION_NORMALIZED_MAX - (int32_t)return_p;
-      int phase = 0;
-      if      (dp > ANIMATION_NORMALIZED_MAX * 3 / 5) phase = 2;
-      else if (dp > ANIMATION_NORMALIZED_MAX * 1 / 5) phase = 1;
-      
-      GBitmap *fb = graphics_capture_frame_buffer(ctx);
-      if (fb) {
-        GRect fbb = gbitmap_get_bounds(fb);
-        int fb_h = fbb.size.h;
-        int32_t sx_step = ((int32_t)CLOCK_ICON_SIZE << 16) / dst_w;
-        int32_t sy_step = ((int32_t)CLOCK_ICON_SIZE << 16) / dst_h;
-        
-        for (int i = 0; i < 12; i++) {
-          GBitmap *bmp = icon_bmps[i];
-          if (!bmp) continue;
-          int ix = icon_xs[i];
-          int iy = icon_ys[i];
-          int bx = ix - dst_w / 2;
-          int by = iy - dst_h / 2;
-          
-          GBitmapFormat sfmt = gbitmap_get_format(bmp);
-          GColor *spalette   = gbitmap_get_palette(bmp);
-          uint8_t *sdata     = gbitmap_get_data(bmp);
-          uint16_t sbpr      = gbitmap_get_bytes_per_row(bmp);
-          
-          int32_t sy_fp = sy_step >> 1;
-          for (int dy = 0; dy < dst_h; dy++, sy_fp += sy_step) {
-            int sy = sy_fp >> 16;
-            if (sy >= CLOCK_ICON_SIZE) sy = CLOCK_ICON_SIZE - 1;
-            int ay = by + dy;
-            if (ay < 0 || ay >= fb_h) continue;
-            GBitmapDataRowInfo ri = gbitmap_get_data_row_info(fb, (uint16_t)ay);
-            uint8_t *srow = sdata + (uint32_t)sy * sbpr;
-            
-            int32_t sx_fp2 = sx_step >> 1;
-            for (int dx = 0; dx < dst_w; dx++, sx_fp2 += sx_step) {
-              if (phase > 0) {
-                bool erase = (phase == 1) ? (((dx ^ dy) & 1) != 0) : ((dx & 1) || (dy & 1));
-                if (erase) continue;
-              }
-              int ax = bx + dx;
-              if (ax < (int)ri.min_x || ax > (int)ri.max_x) continue;
-              int sx = sx_fp2 >> 16;
-              if (sx >= CLOCK_ICON_SIZE) sx = CLOCK_ICON_SIZE - 1;
-              
-              uint8_t pixel;
-              if (sfmt == GBitmapFormat8Bit || sfmt == GBitmapFormat8BitCircular) pixel = srow[sx];
-              else if (sfmt == GBitmapFormat4BitPalette) pixel = spalette ? spalette[(sx & 1) ? (srow[sx >> 1] & 0xF) : (srow[sx >> 1] >> 4)].argb : 0;
-              else if (sfmt == GBitmapFormat2BitPalette) pixel = spalette ? spalette[(srow[sx >> 2] >> (6 - ((sx & 3) << 1))) & 0x3].argb : 0;
-              else if (sfmt == GBitmapFormat1BitPalette) pixel = spalette ? spalette[(srow[sx >> 3] >> (7 - (sx & 7))) & 0x1].argb : 0;
-              else pixel = ((srow[sx >> 3] >> (7 - (sx & 7))) & 0x1) ? 0xFF : 0x00;
-
-              if ((pixel >> 6) != 0) {
-                ri.data[ax] = pixel;
-              }
-            }
-          }
-        }
-        graphics_release_frame_buffer(ctx, fb);
-      }
-    } else {
-      graphics_context_set_compositing_mode(ctx, GCompOpSet);
-      for (int i = 0; i < 12; i++) {
-        if (!icon_bmps[i]) continue;
-        int bx = icon_xs[i] - CLOCK_ICON_SIZE / 2;
-        int by = icon_ys[i] - CLOCK_ICON_SIZE / 2;
-        graphics_draw_bitmap_in_rect(ctx, icon_bmps[i],
-            GRect(bx, by, CLOCK_ICON_SIZE, CLOCK_ICON_SIZE));
-      }
-      if (exit_active) {
-        AnimationProgress dp = exit_p;
-        int phase = 0;
-        if      (dp > ANIMATION_NORMALIZED_MAX * 3 / 5) phase = 2;
-        else if (dp > ANIMATION_NORMALIZED_MAX * 1 / 5) phase = 1;
-        if (phase > 0) {
-          GBitmap *fb = graphics_capture_frame_buffer(ctx);
-          if (fb) {
-            GRect fbb = gbitmap_get_bounds(fb);
-            int fb_h = fbb.size.h;
-            for (int i = 0; i < 12; i++) {
-              int bx = icon_xs[i] - CLOCK_ICON_SIZE / 2;
-              int by = icon_ys[i] - CLOCK_ICON_SIZE / 2;
-              for (int dy = 0; dy < CLOCK_ICON_SIZE; dy++) {
-                int ay = by + dy;
-                if (ay < 0 || ay >= fb_h) continue;
-                GBitmapDataRowInfo ri = gbitmap_get_data_row_info(fb, (uint16_t)ay);
-                for (int dx = 0; dx < CLOCK_ICON_SIZE; dx++) {
-                  bool erase = (phase == 1) ? (((dx ^ dy) & 1) != 0) : ((dx & 1) || (dy & 1));
-                  if (!erase) continue;
-                  int ax = bx + dx;
-                  if (ax < (int)ri.min_x || ax > (int)ri.max_x) continue;
-                  ri.data[ax] = 0xFF;
-                }
-              }
-            }
-            graphics_release_frame_buffer(ctx, fb);
-          }
-        }
-      }
+    graphics_context_set_compositing_mode(ctx, GCompOpSet);
+    for (int i = 0; i < 12; i++) {
+      if (!icon_bmps[i]) continue;
+      int bx = icon_xs[i] - CLOCK_ICON_SIZE / 2;
+      int by = icon_ys[i] - CLOCK_ICON_SIZE / 2;
+      graphics_draw_bitmap_in_rect(ctx, icon_bmps[i],
+          GRect(bx, by, CLOCK_ICON_SIZE, CLOCK_ICON_SIZE));
     }
   }
 
@@ -878,31 +562,25 @@ static void prv_canvas_draw(Layer *layer, GContext *ctx) {
     // On the very first draw call after a new animation starts, render the text at full size
     // into an off-screen corner of the framebuffer, copy those pixels into a GBitmap, and
     // erase the staging area.  Every subsequent frame just scales that bitmap.
-    if (!s_cf->temp_text_bmp && s_cf->bar_consumed) {
+    if (!s_cf->temp_text_bmp) {
       // Render the centre text at full size into a staging rect.
       // The text is centered at (stg_cx, stg_cy) within the staging area so we
       // know exactly where the visual centre is and can use it as the scale pivot.
       char stg_buf[8];
       GFont centre_font;
-      bool draw_degree;
       if (centre_is_temp) {
         snprintf(stg_buf, sizeof(stg_buf), "%d", s_cf->days[0].current_temp);
         centre_font = s_cf->temp_font;
-        draw_degree = false;
       } else {
-        prv_weekday_abbrev(s_cf->day_index, stg_buf, sizeof(stg_buf));
+        weather_fill_weekday_abbrev(s_cf->day_index, NULL, stg_buf, sizeof(stg_buf));
         centre_font = fonts_get_system_font(FONT_KEY_BITHAM_30_BLACK);
-        draw_degree = false;
       }
       GSize nsz = graphics_text_layout_get_content_size(
           stg_buf, centre_font, GRect(0, 0, 100, 50),
           GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft);
       const int left_pad = 4;
-      const int degree_w = 12;
-      const int degree_gap = 1;
       const int right_pad = 4;
-      const int stg_w  = left_pad + nsz.w +
-          (draw_degree ? degree_gap + degree_w + right_pad : right_pad);
+      const int stg_w  = left_pad + nsz.w + right_pad;
       const int stg_h  = nsz.h + 8;   // vertical padding
       const int stg_x  = PBL_IF_ROUND_ELSE((W - stg_w) / 2, 0);
       const int stg_y  = PBL_IF_ROUND_ELSE((H - stg_h) / 2, 0);
@@ -910,7 +588,7 @@ static void prv_canvas_draw(Layer *layer, GContext *ctx) {
       const int stg_cy = stg_h / 2;
       const int font_top_pad = -4;
       int ty_s = stg_cy - nsz.h / 2 + font_top_pad;
-      // Clear staging area so no icon or HUD pixels bleed into the capture.
+      // Clear staging area so no icon pixels bleed into the capture.
       graphics_context_set_fill_color(ctx, GColorWhite);
       graphics_fill_rect(ctx, GRect(stg_x, stg_y, stg_w, stg_h), 0, GCornerNone);
       graphics_context_set_text_color(ctx, GColorBlack);
@@ -918,14 +596,6 @@ static void prv_canvas_draw(Layer *layer, GContext *ctx) {
       graphics_draw_text(ctx, stg_buf, centre_font,
           GRect(stg_x + left_pad, stg_y + ty_s, nsz.w + 2, nsz.h),
           GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
-      // Degree symbol: immediately right of number (today only)
-      if (draw_degree) {
-        GFont dg = fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD);
-        graphics_draw_text(ctx, "\xC2\xB0", dg,
-            GRect(stg_x + left_pad + nsz.w + degree_gap,
-                  stg_y + ty_s + 2, degree_w, 18),
-            GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
-      }
       // Capture those pixels into a GBitmap
       GBitmap *fb = graphics_capture_frame_buffer(ctx);
       if (fb) {
@@ -945,12 +615,7 @@ static void prv_canvas_draw(Layer *layer, GContext *ctx) {
       int src_w = s_cf->temp_text_full_sz.w;
       int src_h = s_cf->temp_text_full_sz.h;
       int dst_w, dst_h;
-      if (exit_active) {
-        // Grow from 100% → 200% over the exit animation (EaseIn)
-        int32_t scale_num = ANIMATION_NORMALIZED_MAX + (int32_t)exit_p;
-        dst_w = src_w * scale_num / ANIMATION_NORMALIZED_MAX;
-        dst_h = src_h * scale_num / ANIMATION_NORMALIZED_MAX;
-      } else if (anim_done) {
+      if (anim_done) {
         dst_w = src_w; dst_h = src_h;
       } else {
         dst_w = src_w * centre_scale_p / ANIMATION_NORMALIZED_MAX;
@@ -977,14 +642,6 @@ static void prv_canvas_draw(Layer *layer, GContext *ctx) {
       // so the text remains centred on (cx, cy) at all sizes.
       int cx_scaled = s_cf->temp_text_cx * dst_w / src_w;
       int cy_scaled = s_cf->temp_text_cy * dst_h / src_h;
-      // Swoop: arc the temperature down then back up as it grows.
-      // Parabola peaks at midpoint: offset = 20 * 4 * t * (1-t)
-      int swoop_y = 0;
-      if (exit_active) {
-        int32_t t  = (int32_t)exit_p;
-        swoop_y = weather_scale_i32(20, weather_norm_bell(t),
-                                    ANIMATION_NORMALIZED_MAX);
-      }
       WeatherType centre_weather_type = WeatherType_Unknown;
       if (s_cf->num_days > 0) {
         int di = s_cf->day_index >= 0 && (size_t)s_cf->day_index < s_cf->num_days
@@ -992,20 +649,19 @@ static void prv_canvas_draw(Layer *layer, GContext *ctx) {
                      : 0;
         centre_weather_type = s_cf->days[di].current_weather_type;
       }
-      bool steady_glow = anim_done && !exit_active && !return_active;
-      if (steady_glow) {
+      if (anim_done) {
         GColor glow_color = prv_bg_color_for_type(centre_weather_type);
         uint8_t idle_progress = s_cf->glow_idle_ticks >= CLOCK_GLOW_IDLE_TICKS
             ? (uint8_t)(s_cf->glow_idle_ticks - CLOCK_GLOW_IDLE_TICKS) : 0;
         int glow_outer_r = centre_is_temp ? CLOCK_GLOW_OUTER_R_TODAY
                                           : CLOCK_GLOW_OUTER_R;
-        weather_draw_lava_ring(ctx, GPoint(cx, cy + swoop_y), glow_outer_r,
+        weather_draw_lava_ring(ctx, GPoint(cx, cy), glow_outer_r,
                                glow_color, s_cf->glow_phase, idle_progress);
         prv_start_clock_glow();
       }
 
       int abs_x = cx - cx_scaled;
-      int abs_y = cy - cy_scaled + swoop_y;
+      int abs_y = cy - cy_scaled;
 
       GBitmap *fb = graphics_capture_frame_buffer(ctx);
       if (fb) {
@@ -1041,8 +697,6 @@ static void prv_canvas_draw(Layer *layer, GContext *ctx) {
   }
 
   // ---- Hour number labels — fade in during final third of animation ----
-  // Skip labels entirely during exit animation.
-  if (exit_active) return;
   // Pebble has no alpha; simulate fade: invisible (white) → light gray → dark gray
   // Start appearing at 60% progress, reach full color at 100%.
   AnimationProgress fade_start = (AnimationProgress)(ANIMATION_NORMALIZED_MAX * 6 / 10);
@@ -1169,6 +823,11 @@ static void prv_canvas_draw(Layer *layer, GContext *ctx) {
     graphics_draw_text(ctx, lbuf, label_font, label_rect,
         GTextOverflowModeTrailingEllipsis, label_align, NULL);
   }
+
+#if !PBL_ROUND
+  // UP-to-forecast: wrap the fully-drawn clock in the whole-screen squash-stretch.
+  if (s_cf->fwd_exit_active) prv_render_fwd_squash(ctx);
+#endif
 }
 
 // ---- Tick handler — redraws every minute to keep hands + time current ----
@@ -1176,32 +835,8 @@ static void prv_tick_handler(struct tm *tick_time, TimeUnits units_changed) {
   if (s_cf && s_cf->canvas) layer_mark_dirty(s_cf->canvas);
 }
 
-// The deferred back-pop machinery was removed with the carousel rewrite: BACK now exits the
-// app and ring hops go through weather_carousel_navigate(). The back_pop_timer field stays
-// (harmlessly NULL) so the unused unload cleanup keeps compiling.
-
 // ---- Touch input (touch colour platforms) ----
 #if WEATHER_PLATFORM_TOUCH_COLOR
-static bool prv_handle_clock_swipe(int16_t dx, int16_t dy) {
-  int16_t adx = dx < 0 ? -dx : dx;
-  int16_t ady = dy < 0 ? -dy : dy;
-  if (dy < -SWIPE_THRESHOLD && ady > adx) {
-    if (s_cf->num_days > 0 && !s_cf->exit_active) {
-      prv_start_exit_animation();
-    }
-    return true;
-  }
-  if (dx < -SWIPE_THRESHOLD && adx > ady) {
-    weather_carousel_navigate(+1);   // swipe left = next ring page (globe)
-    return true;
-  }
-  if (dx > SWIPE_THRESHOLD && adx > ady) {
-    weather_carousel_navigate(-1);   // swipe right = previous ring page (7-day list)
-    return true;
-  }
-  return false;
-}
-
 static void prv_touch_handler(const TouchEvent *event, void *context) {
   (void)context;
   if (!s_cf) return;
@@ -1222,12 +857,21 @@ static void prv_touch_handler(const TouchEvent *event, void *context) {
 
     int16_t dx = event->x - s_cf->touch_start_x;
     int16_t dy = event->y - s_cf->touch_start_y;
-    if (prv_handle_clock_swipe(dx, dy)) return;
-
     int16_t adx = dx < 0 ? -dx : dx;
     int16_t ady = dy < 0 ? -dy : dy;
     if (adx <= SWIPE_THRESHOLD && ady <= SWIPE_THRESHOLD) {
+      // Tap — reveal the per-hour temperatures (mirrors SELECT).
       prv_toggle_temp_reveal();
+    } else if (ady >= adx && dy > 0) {
+      // Swipe down — return to the forecast main screen (mirrors the UP button).
+#if !PBL_ROUND
+      if (!s_cf->fwd_exit_active && !s_cf->reveal_active &&
+          s_cf->anim_progress >= ANIMATION_NORMALIZED_MAX) {
+        prv_start_fwd_exit_animation();
+      }
+#else
+      if (s_wrap_callback) s_wrap_callback(s_wrap_context);
+#endif
     }
     prv_note_clock_interaction();
   }
@@ -1245,13 +889,23 @@ static void prv_click_select(ClickRecognizerRef r, void *ctx) {
   prv_toggle_temp_reveal();
 }
 static void prv_click_down(ClickRecognizerRef r, void *ctx) {
-  // Down — go to the UV/detail screen (mirrors the touch swipe-up).
+  // The clock is the bottom of the vertical stack now that the detail drill-in is gone, so DOWN
+  // has nothing below it — just keep the clock awake.
   prv_note_clock_interaction();
-  if (s_cf && s_cf->num_days > 0 && !s_cf->exit_active)
-    prv_start_exit_animation();
 }
 static void prv_click_up(ClickRecognizerRef r, void *ctx) {
-  prv_note_clock_interaction();  // no ring hop on a button — swipes drive the carousel
+  prv_note_clock_interaction();
+#if !PBL_ROUND
+  // UP returns to the forecast main screen: the clock jelly-stretches down off the bottom, then
+  // the forecast jelly-drops in from above (handoff fires from prv_fwd_exit_push_callback). Ignore
+  // while the intro or any other transition is still in flight.
+  if (s_cf && !s_cf->fwd_exit_active &&
+      !s_cf->reveal_active && s_cf->anim_progress >= ANIMATION_NORMALIZED_MAX) {
+    prv_start_fwd_exit_animation();
+  }
+#else
+  if (s_wrap_callback) s_wrap_callback(s_wrap_context);   // round: plain return to main
+#endif
 }
 static void prv_click_provider(void *ctx) {
   window_single_click_subscribe(BUTTON_ID_BACK,   prv_click_back);
@@ -1280,28 +934,15 @@ static void prv_window_load(Window *window) {
 
   if (s_cf->skip_intro_animation) {
     s_cf->anim_progress = ANIMATION_NORMALIZED_MAX;
-    s_cf->bar_consumed = true;
     if (s_cf->canvas) layer_mark_dirty(s_cf->canvas);
   } else {
-    // Schedule intro animation: bloom + clockwise spin into position
+    // Schedule intro animation: bloom + clockwise spin into position (no HUD bar)
     prv_play_animation();
   }
 }
 
 static void prv_window_appear(Window *window) {
   if (!s_cf) return;
-  // Reset exit state so the clock renders normally when returning from detail_face.
-  s_cf->exit_active = false;
-  s_cf->exit_p = 0;
-  if (s_cf->exit_anim) {
-    animation_unschedule(s_cf->exit_anim);
-    animation_destroy(s_cf->exit_anim);
-    s_cf->exit_anim = NULL;
-  }
-  if (s_cf->exit_push_timer) {
-    app_timer_cancel(s_cf->exit_push_timer);
-    s_cf->exit_push_timer = NULL;
-  }
   // Reset the temperature reveal so the clock shows weather icons on return.
   s_cf->reveal_active = false;
   s_cf->temps_shown = false;
@@ -1316,12 +957,6 @@ static void prv_window_appear(Window *window) {
   touch_service_subscribe(prv_touch_handler, s_cf);
 #endif
   prv_note_clock_interaction();
-  // Only play the return (rise-from-below) animation when genuinely returning from detail_face.
-  // On first push the intro animation handles the entrance; don't clobber it.
-  if (s_cf->should_play_return_anim) {
-    s_cf->should_play_return_anim = false;
-    prv_start_return_animation();
-  }
 }
 
 static void prv_window_unload(Window *window) {
@@ -1334,29 +969,26 @@ static void prv_window_unload(Window *window) {
     animation_destroy(s_cf->intro_anim);
     s_cf->intro_anim = NULL;
   }
-  if (s_cf->exit_anim) {
-    animation_unschedule(s_cf->exit_anim);
-    animation_destroy(s_cf->exit_anim);
-    s_cf->exit_anim = NULL;
-  }
-  if (s_cf->return_anim) {
-    animation_unschedule(s_cf->return_anim);
-    animation_destroy(s_cf->return_anim);
-    s_cf->return_anim = NULL;
-  }
   if (s_cf->reveal_anim) {
     animation_unschedule(s_cf->reveal_anim);
     animation_destroy(s_cf->reveal_anim);
     s_cf->reveal_anim = NULL;
   }
-  if (s_cf->back_pop_timer) {
-    app_timer_cancel(s_cf->back_pop_timer);
-    s_cf->back_pop_timer = NULL;
+#if !PBL_ROUND
+  if (s_cf->fwd_exit_anim) {
+    animation_unschedule(s_cf->fwd_exit_anim);
+    animation_destroy(s_cf->fwd_exit_anim);
+    s_cf->fwd_exit_anim = NULL;
   }
-  if (s_cf->exit_push_timer) {
-    app_timer_cancel(s_cf->exit_push_timer);
-    s_cf->exit_push_timer = NULL;
+  if (s_cf->fwd_push_timer) {
+    app_timer_cancel(s_cf->fwd_push_timer);
+    s_cf->fwd_push_timer = NULL;
   }
+  if (s_cf->fwd_scratch) {
+    free(s_cf->fwd_scratch);
+    s_cf->fwd_scratch = NULL;
+  }
+#endif
   if (s_cf->temp_text_bmp) {
     gbitmap_destroy(s_cf->temp_text_bmp);
     s_cf->temp_text_bmp = NULL;
@@ -1440,28 +1072,6 @@ void clock_face_push_static(const WeatherLocationForecast *days, size_t num_days
 void clock_face_dismiss(bool animated) {
   if (!s_cf || !s_cf->window) return;
   window_stack_remove(s_cf->window, animated);
-}
-
-void clock_face_update_data(const WeatherLocationForecast *days, size_t num_days) {
-  if (!s_cf) return;
-  size_t n = num_days < MAX_DAYS ? num_days : MAX_DAYS;
-  s_cf->num_days = n;
-  for (size_t i = 0; i < n; i++) s_cf->days[i] = days[i];
-  if (s_cf->canvas) {
-    prv_load_bitmaps();
-    layer_mark_dirty(s_cf->canvas);
-  }
-}
-
-void clock_face_update_hourly_for_day(int day_index, const uint8_t *types, size_t count) {
-  if (!s_cf || day_index != s_cf->day_index) return;
-  size_t n = count < 24 ? count : 24;
-  for (size_t i = 0; i < n; i++) s_cf->hourly_types[i] = types[i];
-  s_cf->hourly_valid = (n >= 24);
-  if (s_cf->canvas) {
-    prv_load_bitmaps();
-    layer_mark_dirty(s_cf->canvas);
-  }
 }
 
 void clock_face_update_hourly_temps_for_day(int day_index, const int8_t *temps, size_t count) {

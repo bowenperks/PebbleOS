@@ -30,6 +30,22 @@
 #define RESOURCE_ID_IMAGE_RAIN_AND_SNOW_SMALL   507
 #define RESOURCE_ID_IMAGE_GENERIC_WEATHER_SMALL 509
 
+// ---- LARGE (80x80 PDC) weather icons — the SYSTEM pack's own big weather icons
+//      (rasterised from Pebble_80x80_*.svg). These are the exact icons the Timeline
+//      weather pin card renders, so the expanded card matches it. Aliased to the
+//      generated RESOURCE_ID_*_LARGE names (resource_ids.auto.h, included via
+//      pebble_compat.h) — the numeric ids are PER-PLATFORM, so raw numbers would
+//      silently drift on gabbro. Drawn via gdraw_command_image_* (PDC vectors). ----
+#define RESOURCE_ID_IMAGE_PARTLY_CLOUDY_LARGE   RESOURCE_ID_PARTLY_CLOUDY_LARGE
+#define RESOURCE_ID_IMAGE_CLOUDY_DAY_LARGE      RESOURCE_ID_CLOUDY_DAY_LARGE
+#define RESOURCE_ID_IMAGE_LIGHT_SNOW_LARGE      RESOURCE_ID_LIGHT_SNOW_LARGE
+#define RESOURCE_ID_IMAGE_LIGHT_RAIN_LARGE      RESOURCE_ID_LIGHT_RAIN_LARGE
+#define RESOURCE_ID_IMAGE_HEAVY_RAIN_LARGE      RESOURCE_ID_HEAVY_RAIN_LARGE
+#define RESOURCE_ID_IMAGE_HEAVY_SNOW_LARGE      RESOURCE_ID_HEAVY_SNOW_LARGE
+#define RESOURCE_ID_IMAGE_RAIN_AND_SNOW_LARGE   RESOURCE_ID_RAINING_AND_SNOWING_LARGE
+#define RESOURCE_ID_IMAGE_GENERIC_WEATHER_LARGE RESOURCE_ID_GENERIC_WEATHER_LARGE
+#define RESOURCE_ID_IMAGE_SUNNY_DAY_LARGE       RESOURCE_ID_SUNNY_DAY_LARGE
+
 // ---- CLOCK icons: gabbro-only (compiled out on emery). Mapped to the TINY
 //      (25x25) ids so the source matches CLOCK_ICON_SIZE (25) — previously
 //      aliased to the 50x50 SMALL ids, which made the round clock draw a
@@ -44,10 +60,9 @@
 #define RESOURCE_ID_IMAGE_RAIN_AND_SNOW_CLOCK   506
 #define RESOURCE_ID_IMAGE_GENERIC_WEATHER_CLOCK 508
 
-// ---- Not in the system pack: pin to a valid PNG (WX_SUNNY_SMALL=493) so the app
-//      links; cosmetic/secondary paths only, null-checked at runtime. ----
-#define RESOURCE_ID_IMAGE_FIN_TIMELINE          493
-#define RESOURCE_ID_RESULT_SHREDDED_LARGE       493
+// RESULT_SHREDDED_LARGE intentionally NOT pinned: the animated shredder PDC is a
+// real pack entry on this family (resource_ids.auto.h, via pebble_compat.h) and
+// the saved-locations "Location Deleted" screen plays it.
 
 // ---- PDC sequences (round/gabbro only). The main weather-icons sequence is now
 //      shipped in the pack as WX_WEATHER_ICONS_PDC; alias the app's name to the
@@ -56,7 +71,7 @@
 #define RESOURCE_ID_WEATHER_ICONS_PDC           RESOURCE_ID_WX_WEATHER_ICONS_PDC
 #define RESOURCE_ID_WEATHER_CLOCK_ICONS_PDC     0
 
-// ---- Globe resources (type raw). Placeholder 0 until read from the build. ----
+// ---- Globe resources (type raw): pinned to the real ids from the built pack. ----
 #define RESOURCE_ID_GLOBE_CUBEMAP      510
 #define RESOURCE_ID_GLOBE_STARFIELD      511
 #define RESOURCE_ID_GLOBE_BW_SEQUENCE      512

@@ -10,6 +10,7 @@
 #include "pbl/services/blob_db/weather_db.h"
 #include "pbl/services/blob_db/watch_app_prefs_db.h"
 #include "kernel/pbl_malloc.h"  // task_zalloc_check / task_free
+#include "drivers/rtc.h"        // rtc_get_time (QEMU synth "last updated")
 
 #include <limits.h>
 #include <string.h>
@@ -42,6 +43,7 @@ static void prv_fill_from_fw(WxDsForecast *out, const WeatherLocationForecast *f
   out->today_wind = -1;
   out->latitude_e2 = INT16_MIN;
   out->longitude_e2 = INT16_MIN;
+  out->utc_offset_min = INT16_MIN;
   out->time_updated_utc = (int32_t)f->time_updated_utc;
 }
 
@@ -73,7 +75,12 @@ static void prv_overlay_v4(WxDsForecast *out, int location_id) {
   WeatherDBEntry *entry = task_zalloc_check(len);
   const status_t rv =
       weather_db_read((uint8_t *)&key, sizeof(key), (uint8_t *)entry, len);
-  if ((rv == S_SUCCESS) && (entry->version == WEATHER_DB_CURRENT_VERSION)) {
+  // Version alone isn't enough: a truncated/corrupt record can carry version==4 with a
+  // v3-sized payload (weather_db_insert validates length, insert_stale does not) — reading
+  // the v4 fields below would then run past the allocation. Gate on the minor-0 base size;
+  // minor-1 appended fields get their own length gate below.
+  if ((rv == S_SUCCESS) && (entry->version == WEATHER_DB_CURRENT_VERSION) &&
+      (len >= (int)WEATHER_DB_V4_0_FIXED_SIZE)) {
     out->is_v4 = true;
     if (entry->today_uv_index_x10 >= 0) {
       out->today_uv = entry->today_uv_index_x10 / 10;  // schema stores UV*10
@@ -96,12 +103,26 @@ static void prv_overlay_v4(WxDsForecast *out, int location_id) {
       out->daily[i].high = entry->daily[i].high_temp;
       out->daily[i].low = entry->daily[i].low_temp;
       out->daily[i].type = entry->daily[i].weather_type;
-      out->daily[i].precip = -1;  // v4 schema has no per-day precip yet
+      out->daily[i].precip = -1;  // minor-0 records carry no per-day metrics
+      out->daily[i].wind = -1;
+      out->daily[i].uv = -1;
     }
     if (entry->today_hourly_count == WEATHER_DB_HOURLY_COUNT) {
       out->hourly_count = WX_DS_HOURLY;
       memcpy(out->hourly_type, entry->today_hourly_weather_type, WX_DS_HOURLY);
       memcpy(out->hourly_temp, entry->today_hourly_temp, WX_DS_HOURLY);
+    }
+    // v4.1 appended block (utc offset + per-day metrics): only present when the
+    // phone stamped minor >= 1 AND the record is long enough to carry it all
+    // (defensive against insert_stale).
+    if (entry->minor_version >= 1 && len >= (int)WEATHER_DB_V4_FIXED_SIZE) {
+      out->utc_offset_min = entry->location_utc_offset_min;
+      for (uint8_t i = 0; i < nd; i++) {
+        const WeatherDBDailyMetrics *m = &entry->daily_metrics[i];
+        if (m->precip_probability != 255) out->daily[i].precip = m->precip_probability;
+        if (m->wind_speed != 255)         out->daily[i].wind = m->wind_speed;
+        if (m->uv_index_x10 != 255)       out->daily[i].uv = m->uv_index_x10 / 10;
+      }
     }
   }
   task_free(entry);
@@ -146,19 +167,25 @@ static void prv_seed_v4_test(WxDsForecast *out) {
   // High-contrast spread (test only): fan days = 25/13, 30/16, 20/10, 28/15, 23/12.
   static const int kHiDelta[WX_DS_DAYS] = { 0, -3,  2, -8,  0, -5, -1 };
   static const int kLoDelta[WX_DS_DAYS] = { 0, -5, -2, -8, -3, -6, -1 };
-  // Per-day precip % — test seed only (real v4 is today-only → future days = -1).
+  // Per-day precip % + wind mph + UV index — test seed only (real v4 is today-only → future = -1).
   static const int kPrecip[WX_DS_DAYS] = { 20, 10, 15, 55, 80, 25, 5 };
+  static const int kWind[WX_DS_DAYS]   = { 12,  8, 14, 20, 25, 10, 6 };
+  static const int kUv[WX_DS_DAYS]     = {  5,  6,  3,  2,  1,  5, 7 };  // sunnier days -> higher UV
 
   out->num_daily = WX_DS_DAYS;
   out->daily[0].high = hi;
   out->daily[0].low = lo;
   out->daily[0].type = t0;
   out->daily[0].precip = out->today_precip;  // today's value (set above)
+  out->daily[0].wind   = out->today_wind;
+  out->daily[0].uv     = out->today_uv;
   for (int i = 1; i < WX_DS_DAYS; i++) {
     out->daily[i].high = hi + kHiDelta[i];
     out->daily[i].low = lo + kLoDelta[i];
     out->daily[i].type = kTypes[i];
     out->daily[i].precip = kPrecip[i];
+    out->daily[i].wind   = kWind[i];
+    out->daily[i].uv     = kUv[i];
   }
   // Don't synthesize today/tomorrow: daily[0] already used the real current conditions above, and
   // daily[1] uses the real next-day forecast from the blobDB when present. Only days 2+ stay
@@ -168,51 +195,81 @@ static void prv_seed_v4_test(WxDsForecast *out) {
     out->daily[1].low    = out->tomorrow_low;
     out->daily[1].type   = (out->tomorrow_weather_type <= WeatherType_RainAndSnow)
                            ? out->tomorrow_weather_type : t0;
-    out->daily[1].precip = -1;  // v3 carries no tomorrow precip
+    out->daily[1].precip = kPrecip[1];  // keep the seeded chance for the demo (v3 has no real one)
   }
 
-  // Diurnal hourly curve (0..100): cool overnight, peak mid-afternoon.
-  static const uint8_t kDiurnal[WX_DS_HOURLY] = {
-     10,  6,  3,  0,  0,  3,  8, 16, 28, 42, 56, 70,
-     82, 92, 98, 100, 96, 88, 76, 62, 48, 36, 26, 17,
-  };
+  // Shared diurnal hourly curve. Declared here rather than via weather_math.h:
+  // this TU must not include the app headers (firmware weather-type collisions).
+  extern const uint8_t weather_diurnal_curve[24];
   out->hourly_count = WX_DS_HOURLY;
   const int span = hi - lo;
   for (int h = 0; h < WX_DS_HOURLY; h++) {
     out->hourly_type[h] = t0;
-    out->hourly_temp[h] = (int8_t)(lo + (span * kDiurnal[h]) / 100);
+    out->hourly_temp[h] = (int8_t)(lo + (span * weather_diurnal_curve[h]) / 100);
   }
 }
 #endif  // WEATHER_V4_TEST_SEED
 
 #if defined(CONFIG_SOC_QEMU)
 // QEMU has no phone → no weather_db records, so the weather app would be empty.
-// Synthesize one location (current conditions + the v4 test seed) so the whole UI
+// Synthesize locations (current conditions + the v4 test seed) so the whole UI
 // incl. the round 5-day screen is reachable for visual testing in the emulator.
+// Index 0 is the "current location"; the rest match the default saved-city
+// presets so the at-a-glance saved-locations list lights up with weather.
 // Auto-disabled on real hardware (CONFIG_SOC_QEMU is unset there).
-static void prv_qemu_synth(WxDsForecast *out) {
+typedef struct {
+  const char *name;
+  const char *phrase;
+  uint8_t type;
+  int8_t temp;
+  int8_t high;
+  int8_t low;
+  int16_t lat_e2;
+  int16_t lon_e2;
+  int16_t utc_off_min;   // minutes east of UTC (summer offsets — synth only)
+} QemuSynthCity;
+
+static const QemuSynthCity s_qemu_cities[] = {
+  { "Dursley, Gloucestershire, UK", "Light Snow", WeatherType_LightSnow,
+    23, 28, 18, 5168, -235, 60 },
+  { "New York, United States", "Sunny", WeatherType_Sun,
+    31, 33, 24, 4071, -7401, -240 },
+  { "London, United Kingdom", "Heavy Rain", WeatherType_HeavyRain,
+    14, 16, 9, 5151, -13, 60 },
+  { "Paris, France", "Partly Cloudy", WeatherType_PartlyCloudy,
+    19, 21, 12, 4886, 235, 120 },
+  { "Tokyo, Japan", "Cloudy", WeatherType_CloudyDay,
+    26, 27, 20, 3568, 13969, 540 },
+  { "Sydney, Australia", "Light Rain", WeatherType_LightRain,
+    11, 13, 7, -3387, 15121, 600 },
+};
+#define QEMU_SYNTH_CITY_COUNT ((int)(sizeof(s_qemu_cities) / sizeof(s_qemu_cities[0])))
+
+static void prv_qemu_synth(int index, WxDsForecast *out) {
+  const QemuSynthCity *city = &s_qemu_cities[index];
   *out = (WxDsForecast){0};
-  const char *loc = "Mexico City, Mexico";
-  for (size_t li = 0; loc[li] && li < sizeof(out->location_name) - 1; li++) {
-    out->location_name[li] = loc[li];  // struct is zeroed → already null-terminated
+  for (size_t li = 0; city->name[li] && li < sizeof(out->location_name) - 1; li++) {
+    out->location_name[li] = city->name[li];  // struct is zeroed → null-terminated
   }
-  const char *ph = "Heavy Snow";  // day-0 condition uses the record's short_phrase
-  for (size_t pi = 0; ph[pi] && pi < sizeof(out->short_phrase) - 1; pi++) {
-    out->short_phrase[pi] = ph[pi];
+  // day-0 condition uses the record's short_phrase
+  for (size_t pi = 0; city->phrase[pi] && pi < sizeof(out->short_phrase) - 1; pi++) {
+    out->short_phrase[pi] = city->phrase[pi];
   }
-  out->is_current_location = true;
-  out->current_temp = 23;
-  out->current_weather_type = WeatherType_HeavySnow;  // QEMU: test heavy-snow anim
-  out->today_high = 28;
-  out->today_low = 18;
-  out->tomorrow_high = 24;          // QEMU has no phone/blobDB → stand-in "real" tomorrow
-  out->tomorrow_low = 14;
+  out->is_current_location = (index == 0);
+  out->current_temp = city->temp;
+  out->current_weather_type = city->type;
+  out->today_high = city->high;
+  out->today_low = city->low;
+  out->tomorrow_high = city->high - 4;   // QEMU has no phone/blobDB → stand-in tomorrow
+  out->tomorrow_low = city->low - 4;
   out->tomorrow_weather_type = WeatherType_CloudyDay;
   out->today_uv = -1;
   out->today_precip = -1;
   out->today_wind = -1;
-  out->latitude_e2 = INT16_MIN;
-  out->longitude_e2 = INT16_MIN;
+  out->latitude_e2 = city->lat_e2;
+  out->longitude_e2 = city->lon_e2;
+  out->utc_offset_min = city->utc_off_min;
+  out->time_updated_utc = (int32_t)(rtc_get_time() - 240);   // "last updated" ~4 min ago
   out->is_v4 = false;
 #if WEATHER_V4_TEST_SEED
   prv_seed_v4_test(out);
@@ -230,7 +287,7 @@ bool weather_ds_supported(void) {
 
 int weather_ds_location_count(void) {
 #if defined(CONFIG_SOC_QEMU)
-  return 1;  // synthesized QEMU location
+  return QEMU_SYNTH_CITY_COUNT;  // synthesized QEMU locations
 #else
   if (!weather_service_supported_by_phone()) {
     return 0;
@@ -263,8 +320,8 @@ bool weather_ds_read_index(int index, WxDsForecast *out) {
   }
   weather_service_locations_list_destroy(head);
 #if defined(CONFIG_SOC_QEMU)
-  if (index == 0) {
-    prv_qemu_synth(out);  // no phone in QEMU → synthesize so the UI is reachable
+  if (index < QEMU_SYNTH_CITY_COUNT) {
+    prv_qemu_synth(index, out);  // no phone in QEMU → synthesize so the UI is reachable
     return true;
   }
 #endif

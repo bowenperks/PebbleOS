@@ -2,7 +2,95 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 
 #include "weather_math.h"
+#include "applib/ui/animation_interpolate.h"
 #include <string.h>
+#include <time.h>
+
+int64_t weather_interpolate_moook_soft1(int32_t n, int64_t from, int64_t to) {
+  return interpolate_moook_soft(n, from, to, 1);
+}
+
+const uint8_t weather_diurnal_curve[24] = {
+   10,  6,  3,  0,  0,  3,  8, 16, 28, 42, 56, 70,
+   82, 92, 98, 100, 96, 88, 76, 62, 48, 36, 26, 17,
+};
+
+#if !PBL_ROUND
+// One jelly edge — leading edge delay 0, trailing edge delay 1/6 over a 5/6 point-duration, on
+// the exact interpolate_moook_soft curve Timeline feeds its scale_segmented transform.
+static int prv_jelly_edge(AnimationProgress m, int delay_num, int from, int to) {
+  const int32_t MAX = ANIMATION_NORMALIZED_MAX;
+  int32_t local = (int32_t)m - MAX * delay_num / 6;
+  if (local < 0) local = 0;
+  local = (int32_t)((int64_t)local * 6 / 5);
+  if (local > MAX) local = MAX;
+  return (int)interpolate_moook_soft(local, from, to, 3);
+}
+
+// Capture the fully-drawn screen from `ctx` and re-blit it vertically squash-stretched.
+// Reads the one-shot `scratch` snapshot so re-sampling never hits already-overwritten
+// framebuffer rows. Rect (emery/obelix) only — assumes contiguous full-width rows.
+void weather_render_squash(GContext *ctx, uint8_t *scratch, AnimationProgress m, int mode) {
+  GBitmap *fb = graphics_capture_frame_buffer(ctx);
+  if (!fb) return;
+  GRect b = gbitmap_get_bounds(fb);
+  const int W = b.size.w, H = b.size.h;
+  for (int y = 0; y < H; y++) {
+    GBitmapDataRowInfo ri = gbitmap_get_data_row_info(fb, (uint16_t)y);
+    memcpy(scratch + (uint32_t)y * W, ri.data + ri.min_x, W);
+  }
+  int top_edge, bot_edge;
+  if (mode == WEATHER_SQUASH_DOWN_EXIT) {   // down exit: bottom leads off the bottom
+    // Compress the exit into the first ~75% of the animation so the screen has fully
+    // cleared before the card's glance text sweeps across (see prv_draw_flying_content).
+    AnimationProgress me = m + m / 3;
+    if (me > ANIMATION_NORMALIZED_MAX) me = ANIMATION_NORMALIZED_MAX;
+    top_edge = prv_jelly_edge(me, 1, 0, H);
+    bot_edge = prv_jelly_edge(me, 0, H, 2 * H);
+  } else if (mode == WEATHER_SQUASH_CLOCK_EXIT) {   // clock exit: same geometry, full timeline
+    top_edge = prv_jelly_edge(m, 1, 0, H);
+    bot_edge = prv_jelly_edge(m, 0, H, 2 * H);
+  } else if (mode == WEATHER_SQUASH_RISE_IN) {   // rise from below: top leads up into place
+    top_edge = prv_jelly_edge(m, 0, H,     0);
+    bot_edge = prv_jelly_edge(m, 1, 2 * H, H);
+  } else {                                       // drop-in: bottom leads down into place
+    top_edge = prv_jelly_edge(m, 1, -H, 0);
+    bot_edge = prv_jelly_edge(m, 0,  0, H);
+  }
+  int dst_h = bot_edge - top_edge;
+  if (dst_h < 1) dst_h = 1;
+  const int32_t sy_step = ((int32_t)H << 16) / dst_h;
+  const uint8_t white = GColorWhite.argb;
+  for (int ay = 0; ay < H; ay++) {
+    GBitmapDataRowInfo ri = gbitmap_get_data_row_info(fb, (uint16_t)ay);
+    if (ay >= top_edge && ay < bot_edge) {
+      int sy = (int)((((int32_t)(ay - top_edge)) * sy_step) >> 16);
+      if (sy < 0) sy = 0; else if (sy >= H) sy = H - 1;
+      memcpy(ri.data + ri.min_x, scratch + (uint32_t)sy * W, W);
+    } else {
+      memset(ri.data + ri.min_x, white, W);
+    }
+  }
+  graphics_release_frame_buffer(ctx, fb);
+}
+#endif  // !PBL_ROUND
+
+void weather_fill_weekday_abbrev(int day_offset, const char *fallback,
+                                 char *buffer, size_t buffer_size) {
+  if (!buffer || buffer_size == 0) return;
+  time_t target = time(NULL) + (time_t)day_offset * 86400;
+  struct tm *lt = localtime(&target);
+  if (!lt || strftime(buffer, buffer_size, "%a", lt) == 0) {
+    if (fallback && fallback[0]) {
+      snprintf(buffer, buffer_size, "%.3s", fallback);
+    } else {
+      snprintf(buffer, buffer_size, "---");
+    }
+  }
+  for (char *c = buffer; *c; c++) {
+    if (*c >= 'a' && *c <= 'z') *c = (char)(*c - 'a' + 'A');
+  }
+}
 
 uint32_t weather_scale_u32(uint32_t value, uint32_t numerator,
                            uint32_t denominator) {

@@ -24,6 +24,8 @@ typedef struct {
   int low;         // WX_DS_UNKNOWN_TEMP if unknown
   uint8_t type;    // WeatherType (app + fw enum values are identical)
   int precip;      // % rain chance, -1 if unknown (real v4 schema is today-only)
+  int wind;        // mph, -1 if unknown (real v4 schema is today-only)
+  int uv;          // UV index 0-11, -1 if unknown (real v4 schema is today-only)
 } WxDsDaily;
 
 typedef struct {
@@ -51,6 +53,7 @@ typedef struct {
   int8_t  hourly_temp[WX_DS_HOURLY];  // temperature per hour 0-23
   int16_t latitude_e2;     // latitude * 100 (for the globe), INT16_MIN unknown
   int16_t longitude_e2;    // longitude * 100 (for the globe), INT16_MIN unknown
+  int16_t utc_offset_min;  // location's tz, minutes east of UTC (v4.1), INT16_MIN unknown
 } WxDsForecast;
 
 //! @return true if the phone supports/provides weather (gates app visibility).

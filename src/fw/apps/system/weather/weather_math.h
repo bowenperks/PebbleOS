@@ -20,6 +20,38 @@ void weather_capture_framebuffer_rect(GBitmap *fb, GBitmap *dst,
 #define WEATHER_GLOW_WRAP_TICKS \
   (WEATHER_GLOW_WRAP_SPIN_TICKS + WEATHER_GLOW_WRAP_CLOSE_TICKS)
 
+// Card<->globe horizontal slide duration (SELECT out-left / BACK in-left): a snappy fraction
+// of the moook default so the two-phase transition feels quick. Shared by expanded_view.c and
+// globe_view.c so the pair can't drift apart.
+#define WEATHER_HSLIDE_MS 110
+
+// One-mid-frame moook-soft: the shared slide/drop interpolation for the card<->globe
+// transitions. Its built-in 4px overshoot is the "bounce".
+int64_t weather_interpolate_moook_soft1(int32_t n, int64_t from, int64_t to);
+
+// Uppercase 3-letter weekday abbreviation for the day `day_offset` days from now ("MON").
+// Falls back to (up to 3 chars of) `fallback`, or "---", if localtime/strftime fail.
+void weather_fill_weekday_abbrev(int day_offset, const char *fallback,
+                                 char *buffer, size_t buffer_size);
+
+// Diurnal curve (0..100): cool overnight, peak mid-afternoon. Shared by the hourly
+// synth in weather.c and the v4 test seed in weather_data_source.c.
+extern const uint8_t weather_diurnal_curve[24];
+
 void weather_draw_lava_ring(GContext *ctx, GPoint center, int outer_r,
                             GColor glow_color, uint32_t phase,
                             uint8_t idle_progress);
+
+#if !PBL_ROUND
+// Whole-screen Timeline jelly squash-stretch blit, shared by forecast_list and clock_face.
+// `scratch` = W*H one-shot framebuffer snapshot. Modes 1-3 match forecast_list's
+// SQUASH_DROP_IN/_DOWN_EXIT/_RISE_IN. Mode 4 is the clock's forward exit: geometrically the
+// down-exit, WITHOUT the me=m+m/3 haste — the forecast's exit is deliberately compressed into
+// its first ~75% (sunset-card text staging) while the clock's hand-tuned exit runs the full
+// timeline. Do not merge the two.
+#define WEATHER_SQUASH_DROP_IN    1
+#define WEATHER_SQUASH_DOWN_EXIT  2
+#define WEATHER_SQUASH_RISE_IN    3
+#define WEATHER_SQUASH_CLOCK_EXIT 4
+void weather_render_squash(GContext *ctx, uint8_t *scratch, AnimationProgress m, int mode);
+#endif

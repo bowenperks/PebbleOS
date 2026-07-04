@@ -29,13 +29,6 @@ void clock_face_push_static(const WeatherLocationForecast *days, size_t num_days
 
 void clock_face_dismiss(bool animated);
 
-// Update forecast data while the clock face is showing.
-void clock_face_update_data(const WeatherLocationForecast *days, size_t num_days);
-
-// Update hourly weather types for a given day (24 values, 0=midnight .. 23=11pm).
-// The update is applied only if the clock is currently showing that day.
-void clock_face_update_hourly_for_day(int day_index, const uint8_t *types, size_t count);
-
 // Update hourly temperatures for a given day (24 signed values).
 // The update is applied only if the clock is currently showing that day.
 void clock_face_update_hourly_temps_for_day(int day_index, const int8_t *temps, size_t count);

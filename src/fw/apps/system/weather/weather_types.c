@@ -4,7 +4,7 @@
 #include "weather_types.h"
 #include "resource_ids.pin.h"
 
-int weather_type_slot_index(WeatherType weather_type) {
+static int weather_type_slot_index(WeatherType weather_type) {
   int value = (int)weather_type;
   return (value >= 0 && value <= WeatherType_RainAndSnow) ? value : 9;
 }
@@ -59,6 +59,22 @@ uint32_t weather_type_icon_small_resource(WeatherType weather_type) {
 #else
   return weather_type_icon_tiny_resource(weather_type);
 #endif
+}
+
+uint32_t weather_type_icon_large_resource(WeatherType weather_type) {
+  static const uint32_t s_resources[] = {
+    RESOURCE_ID_IMAGE_PARTLY_CLOUDY_LARGE,    // 0 PartlyCloudy
+    RESOURCE_ID_IMAGE_CLOUDY_DAY_LARGE,       // 1 CloudyDay
+    RESOURCE_ID_IMAGE_LIGHT_SNOW_LARGE,       // 2 LightSnow
+    RESOURCE_ID_IMAGE_LIGHT_RAIN_LARGE,       // 3 LightRain
+    RESOURCE_ID_IMAGE_HEAVY_RAIN_LARGE,       // 4 HeavyRain
+    RESOURCE_ID_IMAGE_HEAVY_SNOW_LARGE,       // 5 HeavySnow
+    RESOURCE_ID_IMAGE_GENERIC_WEATHER_LARGE,  // 6 Generic
+    RESOURCE_ID_IMAGE_SUNNY_DAY_LARGE,        // 7 Sun
+    RESOURCE_ID_IMAGE_RAIN_AND_SNOW_LARGE,    // 8 RainAndSnow
+    RESOURCE_ID_IMAGE_GENERIC_WEATHER_LARGE,  // 9 Unknown
+  };
+  return s_resources[weather_type_slot_index(weather_type)];
 }
 
 #if defined(PBL_PLATFORM_GABBRO)

@@ -36,22 +36,13 @@ typedef void (*SavedLocationsSelectCallback)(SavedLocationKind kind,
 
 typedef struct {
   const char *current_location_label;
-  int active_city_index;
+  int active_city_index;           // CityPreset index (NOT a weather-ds location index); -1 = none
   const char *active_custom_query;
   SavedLocationsSelectCallback select_callback;
   void *select_context;
 } SavedLocationsConfig;
 
 void saved_locations_push(const SavedLocationsConfig *config);
-void saved_locations_dismiss(bool animated);
-bool saved_locations_is_showing(void);
-
-void saved_locations_add_custom_location(const char *query, const char *label);
-void saved_locations_update_custom_label(const char *query, const char *label);
-void saved_locations_update_custom_details(const char *query,
-                                           const char *label,
-                                           int16_t latitude_e2,
-                                           int16_t longitude_e2);
 int saved_locations_get_entries(SavedLocationEntry *entries,
                                 int max_entries,
                                 const char *current_location_label,

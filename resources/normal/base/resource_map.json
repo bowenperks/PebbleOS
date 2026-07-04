@@ -2657,17 +2657,21 @@
     {
       "type": "raw",
       "name": "GLOBE_CUBEMAP",
-      "file": "normal/base/raw/globe_cubemap_packed.bin"
+      "file": "normal/base/raw/globe_cubemap_packed.deflate",
+      "_comment": ["raw-deflate + u32 size prefix (tools/deflate_resource.py);",
+                   "inflated at load by globe_view.c prv_load_inflated"]
     },
     {
       "type": "raw",
       "name": "GLOBE_STARFIELD",
-      "file": "normal/base/raw/globe_starfield.bin"
+      "file": "normal/base/raw/globe_starfield.deflate"
     },
     {
       "type": "raw",
       "name": "GLOBE_BW_SEQUENCE",
-      "file": "normal/base/raw/globe_bw_sequence.pdc"
+      "file": "normal/base/raw/globe_bw_sequence.deflate",
+      "_comment": ["PDC PAYLOAD (8-byte file header stripped) deflated; the loader",
+                   "inflates + gdraw_command_sequence_validate()s it"]
     },
     {
       "type": "raw",

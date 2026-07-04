@@ -31,8 +31,12 @@
 // `weather_db_v4_support` (see session_remote_version.h / system_versions.c);
 // otherwise it keeps writing v3. The firmware parses BOTH during rollout.
 // ---------------------------------------------------------------------------
+// Minor history: 0 = base v4. 1 = appends location_utc_offset_min after the hourly
+// arrays (before the trailing pstrings). Minor-0 records remain fully parseable —
+// readers gate the appended fields on minor_version + record length, and the
+// trailing-strings offset is resolved per minor (see weather_db_entry_get_strings).
 #define WEATHER_DB_CURRENT_VERSION (4)
-#define WEATHER_DB_CURRENT_MINOR_VERSION (0)
+#define WEATHER_DB_CURRENT_MINOR_VERSION (1)
 #define WEATHER_DB_LEGACY_VERSION (3)
 
 // Days of daily forecast a v4 record carries (today + 6).
@@ -71,6 +75,18 @@ typedef struct PACKED {
 } WeatherDBDailyForecast;
 
 // ---------------------------------------------------------------------------
+// Per-day extended metrics (v4 minor 1+), parallel to daily[] (index 0 = today).
+// The watch shows per-day precipitation on the scrolled forecast and per-day
+// precip/wind/UV as the user pages through days — without these, future days
+// render "--". 255 = unknown for every field.
+// ---------------------------------------------------------------------------
+typedef struct PACKED {
+  uint8_t precip_probability;  // 0..100 (%), 255 if unknown
+  uint8_t wind_speed;          // whole units, same unit as today_wind_speed; 255 if unknown
+  uint8_t uv_index_x10;        // UV index * 10 (0..110), 255 if unknown
+} WeatherDBDailyMetrics;
+
+// ---------------------------------------------------------------------------
 // v4 record. Layout: [ v3 fixed prefix, unchanged offsets ] + [ v4 fixed
 // fields ] + [ trailing pstring16s ]. The trailing pstring array MUST be last.
 // ---------------------------------------------------------------------------
@@ -102,6 +118,13 @@ typedef struct PACKED {
   uint8_t today_hourly_weather_type[WEATHER_DB_HOURLY_COUNT]; // WeatherType per hour 0-23
   int8_t today_hourly_temp[WEATHER_DB_HOURLY_COUNT];          // temp per hour 0-23
 
+  // --- v4 minor 1 additions (appended; present only when minor_version >= 1) ---
+  int16_t location_utc_offset_min;  // location's timezone, minutes EAST of UTC (e.g. Tokyo
+                                    // +540, New York DST -240); INT16_MIN if unknown. Lets the
+                                    // watch show the LOCATION's local sunset/hourly times for
+                                    // saved cities instead of watch-local ones.
+  WeatherDBDailyMetrics daily_metrics[WEATHER_DB_MAX_FORECAST_DAYS]; // parallel to daily[]
+
   // --- variable-length trailing strings (MUST stay last) ---
   SerializedArray pstring16s;
 } WeatherDBEntry;
@@ -112,8 +135,11 @@ typedef enum WeatherDbStringIndex {
   WeatherDbStringIndexCount,
 } WeatherDbStringIndex;
 
-// Fixed portion of a v4 record up to and including the hourly arrays, i.e.
-// everything except the trailing pstring16s SerializedArray header/payload.
+// Fixed portion of a v4.0 record (through the hourly arrays) — the minimum any
+// v4 record must carry, and where a minor-0 record's trailing strings start.
+#define WEATHER_DB_V4_0_FIXED_SIZE (offsetof(WeatherDBEntry, location_utc_offset_min))
+// Fixed portion of a current (v4.1) record, i.e. everything except the trailing
+// pstring16s SerializedArray header/payload.
 #define WEATHER_DB_V4_FIXED_SIZE (offsetof(WeatherDBEntry, pstring16s))
 
 // Smallest acceptable record is a legacy v3 record (smaller fixed prefix).
@@ -128,17 +154,23 @@ static inline bool weather_db_version_is_supported(uint8_t version) {
 }
 
 //! @return the byte offset of the trailing pstring16s array for a record of the
-//! given version. v3 and v4 place it differently; the version byte decides.
-static inline size_t weather_db_entry_strings_offset(uint8_t version) {
-  return (version >= WEATHER_DB_CURRENT_VERSION) ? offsetof(WeatherDBEntry, pstring16s)
-                                                 : offsetof(WeatherDBEntryV3, pstring16s);
+//! given version + minor. v3, v4.0 and v4.1 place it differently.
+static inline size_t weather_db_entry_strings_offset(uint8_t version, uint8_t minor_version) {
+  if (version < WEATHER_DB_CURRENT_VERSION) {
+    return offsetof(WeatherDBEntryV3, pstring16s);
+  }
+  return (minor_version >= 1) ? offsetof(WeatherDBEntry, pstring16s)
+                              : WEATHER_DB_V4_0_FIXED_SIZE;
 }
 
 //! @return a pointer to the trailing pstring16s array, located correctly for the
-//! record's version. Use this instead of &entry->pstring16s so v3 records still
-//! resolve their strings after the v4 fields were inserted before the array.
+//! record's version + minor. Use this instead of &entry->pstring16s so v3 and
+//! minor-0 records still resolve their strings after fields were appended.
 static inline SerializedArray *weather_db_entry_get_strings(WeatherDBEntry *entry) {
-  return (SerializedArray *)((uint8_t *)entry + weather_db_entry_strings_offset(entry->version));
+  const uint8_t minor =
+      (entry->version >= WEATHER_DB_CURRENT_VERSION) ? entry->minor_version : 0;
+  return (SerializedArray *)((uint8_t *)entry +
+                             weather_db_entry_strings_offset(entry->version, minor));
 }
 
 // Memory ownership: pointer to key and entry must not be saved, as they become invalid after
