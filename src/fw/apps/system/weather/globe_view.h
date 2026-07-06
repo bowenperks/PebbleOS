@@ -58,9 +58,11 @@ typedef struct {
     Animation *reveal_anim;
     Animation *city_anim;
     Animation *bounce_anim;
+    Animation *lock_pulse_anim;    // expanding Celeste ring on lock/nav arrival
     AnimationProgress reveal_progress;
     AnimationProgress city_anim_progress;
     AnimationProgress bounce_progress;
+    AnimationProgress lock_pulse_progress;
     int reveal_direction;
     int selected_city_index;
     SavedLocationEntry saved_entries[SAVED_LOCATIONS_MAX_ENTRIES];

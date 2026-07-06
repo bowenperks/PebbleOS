@@ -58,6 +58,11 @@ typedef struct WeatherLocationForecast {
   int today_uv;        // UV index 0-11, or -1 if unknown
   int today_precip_mm; // rain chance percent, or -1 if unknown
   int today_wind_mph;  // max wind speed in mph, or -1 if unknown
+  int today_feels;     // feels-like temp, UNKNOWN_TEMP if unknown (today only)
+  int today_wmo;       // WMO weather code, -1 if unknown (v4.2, today only)
+  int today_humidity;  // relative humidity %, -1 if unknown (v4.2, today only)
+  int today_visibility_m;   // minimum visibility in meters, -1 if unknown (v4.2, today only)
+  int today_precip_sum_mm;  // total precipitation in mm, -1 if unknown (v4.2, today only)
   WeatherType current_weather_type;
   char *current_weather_phrase;
   char *label;

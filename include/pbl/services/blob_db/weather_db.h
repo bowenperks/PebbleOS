@@ -31,12 +31,15 @@
 // `weather_db_v4_support` (see session_remote_version.h / system_versions.c);
 // otherwise it keeps writing v3. The firmware parses BOTH during rollout.
 // ---------------------------------------------------------------------------
-// Minor history: 0 = base v4. 1 = appends location_utc_offset_min after the hourly
-// arrays (before the trailing pstrings). Minor-0 records remain fully parseable —
-// readers gate the appended fields on minor_version + record length, and the
-// trailing-strings offset is resolved per minor (see weather_db_entry_get_strings).
+// Minor history: 0 = base v4. 1 = appends location_utc_offset_min + daily_metrics[]
+// after the hourly arrays (before the trailing pstrings). 2 = appends today's raw
+// warning readings (WMO code, humidity, min visibility, precipitation sum) after
+// daily_metrics — they feed the weather report's warning line. Older-minor records
+// remain fully parseable — readers gate the appended fields on minor_version +
+// record length, and the trailing-strings offset is resolved per minor
+// (see weather_db_entry_get_strings).
 #define WEATHER_DB_CURRENT_VERSION (4)
-#define WEATHER_DB_CURRENT_MINOR_VERSION (1)
+#define WEATHER_DB_CURRENT_MINOR_VERSION (2)
 #define WEATHER_DB_LEGACY_VERSION (3)
 
 // Days of daily forecast a v4 record carries (today + 6).
@@ -125,6 +128,19 @@ typedef struct PACKED {
                                     // saved cities instead of watch-local ones.
   WeatherDBDailyMetrics daily_metrics[WEATHER_DB_MAX_FORECAST_DAYS]; // parallel to daily[]
 
+  // --- v4 minor 2 additions (appended; present only when minor_version >= 2) ---
+  // Today's raw warning readings for the weather report's alert line. Open-Meteo
+  // sources (see the app's DESIGN_NOTES.md): daily weather_code; hourly
+  // relative_humidity_2m (daily mean); hourly visibility (daily MINIMUM, meters);
+  // daily precipitation_sum (whole mm).
+  uint8_t today_wmo_code;         // WMO weather code; 0xFF if unknown
+  uint8_t today_humidity_pct;     // relative humidity 0..100 %; 0xFF if unknown
+  uint16_t today_visibility_m;    // minimum visibility, meters (clamp 65534); 0xFFFF if unknown
+  uint16_t today_precip_sum_mm;   // total precipitation, whole mm (clamp 65534); 0xFFFF if unknown
+  // Per-day feels-like, parallel to daily[] (Open-Meteo daily apparent_temperature_max);
+  // WEATHER_SERVICE_LOCATION_FORECAST_UNKNOWN_TEMP if unknown.
+  int16_t daily_feels_like[WEATHER_DB_MAX_FORECAST_DAYS];
+
   // --- variable-length trailing strings (MUST stay last) ---
   SerializedArray pstring16s;
 } WeatherDBEntry;
@@ -138,7 +154,9 @@ typedef enum WeatherDbStringIndex {
 // Fixed portion of a v4.0 record (through the hourly arrays) — the minimum any
 // v4 record must carry, and where a minor-0 record's trailing strings start.
 #define WEATHER_DB_V4_0_FIXED_SIZE (offsetof(WeatherDBEntry, location_utc_offset_min))
-// Fixed portion of a current (v4.1) record, i.e. everything except the trailing
+// Fixed portion of a v4.1 record — where a minor-1 record's trailing strings start.
+#define WEATHER_DB_V4_1_FIXED_SIZE (offsetof(WeatherDBEntry, today_wmo_code))
+// Fixed portion of a current (v4.2) record, i.e. everything except the trailing
 // pstring16s SerializedArray header/payload.
 #define WEATHER_DB_V4_FIXED_SIZE (offsetof(WeatherDBEntry, pstring16s))
 
@@ -154,13 +172,14 @@ static inline bool weather_db_version_is_supported(uint8_t version) {
 }
 
 //! @return the byte offset of the trailing pstring16s array for a record of the
-//! given version + minor. v3, v4.0 and v4.1 place it differently.
+//! given version + minor. v3, v4.0, v4.1 and v4.2 place it differently.
 static inline size_t weather_db_entry_strings_offset(uint8_t version, uint8_t minor_version) {
   if (version < WEATHER_DB_CURRENT_VERSION) {
     return offsetof(WeatherDBEntryV3, pstring16s);
   }
-  return (minor_version >= 1) ? offsetof(WeatherDBEntry, pstring16s)
-                              : WEATHER_DB_V4_0_FIXED_SIZE;
+  if (minor_version >= 2) return offsetof(WeatherDBEntry, pstring16s);
+  if (minor_version >= 1) return WEATHER_DB_V4_1_FIXED_SIZE;
+  return WEATHER_DB_V4_0_FIXED_SIZE;
 }
 
 //! @return a pointer to the trailing pstring16s array, located correctly for the

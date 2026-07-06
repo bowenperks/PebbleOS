@@ -218,8 +218,20 @@ static void prv_set_from_forecast(const WeatherLocationForecast *f,
 #define EV_GAUGE_ARC_SPAN   EV_GAUGE_DEG_TO_ANGLE(270)
 #define EV_GAUGE_RING_W     7
 
+// WHO UV-index severity color — the SAME ramp as the condensed screen's UV
+// tally squares (weather_app_layout.c), so the dial and the squares always
+// tell the same story: 0-2 green, 3-5 yellow, 6-7 orange, 8-10 red, 11+ violet.
+static GColor prv_uv_severity_color(int uv) {
+  return (uv <= 2)  ? GColorIslamicGreen
+       : (uv <= 5)  ? GColorChromeYellow
+       : (uv <= 7)  ? GColorOrange
+       : (uv <= 10) ? GColorRed
+                    : GColorVividViolet;
+}
+
 static void prv_draw_gauge(GContext *ctx, int cx, int cy, int r, const char *label,
-                           int value, int max_val, const char *unit, bool unknown) {
+                           int value, int max_val, const char *unit, bool unknown,
+                           GColor fill) {
   GRect ring = GRect(cx - r, cy - r, 2 * r, 2 * r);
   graphics_context_set_fill_color(ctx, GColorLightGray);
   graphics_fill_radial(ctx, ring, GOvalScaleModeFitCircle, EV_GAUGE_RING_W,
@@ -228,7 +240,7 @@ static void prv_draw_gauge(GContext *ctx, int cx, int cy, int r, const char *lab
     int v = value < 0 ? 0 : (value > max_val ? max_val : value);
     int32_t filled = weather_scale_i32(EV_GAUGE_ARC_SPAN, v, max_val);
     if (filled > 0) {
-      graphics_context_set_fill_color(ctx, GColorVividCerulean);
+      graphics_context_set_fill_color(ctx, PBL_IF_COLOR_ELSE(fill, GColorBlack));
       graphics_fill_radial(ctx, ring, GOvalScaleModeFitCircle, EV_GAUGE_RING_W,
                            EV_GAUGE_ARC_START, EV_GAUGE_ARC_START + filled);
     }
@@ -283,9 +295,12 @@ void expanded_view_draw_glance_content(GContext *ctx, int W, int tdx, const char
                        GRect(tdx + (W - bsz.w) / 2, 114, W, 46),
                        GTextOverflowModeFill, GTextAlignmentLeft, NULL);
   }
-  // UV + precipitation meters at the bottom.
-  prv_draw_gauge(ctx, W / 4 + tdx,     200, 25, "UV",   uv,     11,  "",  uv < 0);
-  prv_draw_gauge(ctx, 3 * W / 4 + tdx, 200, 25, "RAIN", precip, 100, "%", precip < 0);
+  // UV + precipitation meters at the bottom. The UV dial takes the WHO
+  // severity color for its value; rain stays water-blue.
+  prv_draw_gauge(ctx, W / 4 + tdx,     200, 25, "UV",   uv,     11,  "",  uv < 0,
+                 prv_uv_severity_color(uv));
+  prv_draw_gauge(ctx, 3 * W / 4 + tdx, 200, 25, "RAIN", precip, 100, "%", precip < 0,
+                 GColorVividCerulean);
 }
 
 static void prv_canvas_draw(Layer *layer, GContext *ctx) {

@@ -74,6 +74,8 @@ typedef struct WeatherAppLayout {
   struct {
     // Pre-formatted strings snapshot of the OUTGOING text (captured before forecast pointer updates)
     char top_label[16];
+    char top_phrase[20];   // condition text (rect right column)
+    char top_feels[16];    // "FEELS 21°" (rect left column; empty = hidden)
     char top_temp[15];
     char top_highlow[15];
     char top_rain[12];

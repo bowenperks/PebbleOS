@@ -26,6 +26,7 @@ typedef struct {
   int precip;      // % rain chance, -1 if unknown (real v4 schema is today-only)
   int wind;        // mph, -1 if unknown (real v4 schema is today-only)
   int uv;          // UV index 0-11, -1 if unknown (real v4 schema is today-only)
+  int feels;       // feels-like temp, WX_DS_UNKNOWN_TEMP if unknown (v4.2 daily_feels_like)
 } WxDsDaily;
 
 typedef struct {
@@ -42,6 +43,11 @@ typedef struct {
   int today_uv;            // UV index 0-11, -1 unknown (v4)
   int today_precip;        // % , -1 unknown (v4)
   int today_wind;          // mph, -1 unknown (v4)
+  int today_feels;         // feels-like temp, 32767 (unknown-temp) if unknown (v4)
+  int today_wmo;           // WMO weather code, -1 unknown (v4.2 — warnings)
+  int today_humidity;      // relative humidity %, -1 unknown (v4.2)
+  int32_t today_visibility_m;  // minimum visibility today in meters, -1 unknown (v4.2)
+  int today_precip_sum_mm; // total precipitation today in mm, -1 unknown (v4.2)
   int32_t time_updated_utc;
 
   // ---- v4-only extras (zeroed/unknown when the record is still v3) ----
@@ -66,3 +72,14 @@ int weather_ds_location_count(void);
 //! weather_service orders them; index 0 is treated as the current location).
 //! @return true on success, false if the index/location is unavailable.
 bool weather_ds_read_index(int index, WxDsForecast *out);
+
+//! Case-insensitive: does `name` start with `needle`? ("New York" prefixes
+//! "New York, United States".) Prefer this for canonical names (presets) — it
+//! can't cross-match containing names ("York" does NOT prefix "New York...").
+bool weather_ds_name_prefix(const char *name, const char *needle);
+
+//! Case-insensitive substring match. Needed for dictated names that geocode to
+//! a larger place name ("Jamaica" in "Kingston, Jamaica"). Greedier than
+//! weather_ds_name_prefix — use as a FALLBACK after prefix matching so a
+//! containing name ("New York") can't shadow an exact one ("York").
+bool weather_ds_name_matches(const char *name, const char *needle);

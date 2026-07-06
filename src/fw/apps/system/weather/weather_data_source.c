@@ -41,6 +41,11 @@ static void prv_fill_from_fw(WxDsForecast *out, const WeatherLocationForecast *f
   out->today_uv = -1;
   out->today_precip = -1;
   out->today_wind = -1;
+  out->today_feels = WEATHER_SERVICE_LOCATION_FORECAST_UNKNOWN_TEMP;
+  out->today_wmo = -1;
+  out->today_humidity = -1;
+  out->today_visibility_m = -1;
+  out->today_precip_sum_mm = -1;
   out->latitude_e2 = INT16_MIN;
   out->longitude_e2 = INT16_MIN;
   out->utc_offset_min = INT16_MIN;
@@ -91,6 +96,10 @@ static void prv_overlay_v4(WxDsForecast *out, int location_id) {
     if (entry->today_wind_speed > 0) {
       out->today_wind = entry->today_wind_speed;
     }
+    if (entry->today_feels_like_temp !=
+        WEATHER_SERVICE_LOCATION_FORECAST_UNKNOWN_TEMP) {
+      out->today_feels = entry->today_feels_like_temp;
+    }
     out->latitude_e2 = entry->latitude_e2;
     out->longitude_e2 = entry->longitude_e2;
 
@@ -106,6 +115,7 @@ static void prv_overlay_v4(WxDsForecast *out, int location_id) {
       out->daily[i].precip = -1;  // minor-0 records carry no per-day metrics
       out->daily[i].wind = -1;
       out->daily[i].uv = -1;
+      out->daily[i].feels = WX_DS_UNKNOWN_TEMP;   // zeroed struct would read as a KNOWN 0°
     }
     if (entry->today_hourly_count == WEATHER_DB_HOURLY_COUNT) {
       out->hourly_count = WX_DS_HOURLY;
@@ -115,13 +125,25 @@ static void prv_overlay_v4(WxDsForecast *out, int location_id) {
     // v4.1 appended block (utc offset + per-day metrics): only present when the
     // phone stamped minor >= 1 AND the record is long enough to carry it all
     // (defensive against insert_stale).
-    if (entry->minor_version >= 1 && len >= (int)WEATHER_DB_V4_FIXED_SIZE) {
+    if (entry->minor_version >= 1 && len >= (int)WEATHER_DB_V4_1_FIXED_SIZE) {
       out->utc_offset_min = entry->location_utc_offset_min;
       for (uint8_t i = 0; i < nd; i++) {
         const WeatherDBDailyMetrics *m = &entry->daily_metrics[i];
         if (m->precip_probability != 255) out->daily[i].precip = m->precip_probability;
         if (m->wind_speed != 255)         out->daily[i].wind = m->wind_speed;
         if (m->uv_index_x10 != 255)       out->daily[i].uv = m->uv_index_x10 / 10;
+      }
+    }
+    // v4.2 appended block (today's raw warning readings + per-day feels-like).
+    if (entry->minor_version >= 2 && len >= (int)WEATHER_DB_V4_FIXED_SIZE) {
+      if (entry->today_wmo_code != 0xFF)         out->today_wmo = entry->today_wmo_code;
+      if (entry->today_humidity_pct != 0xFF)     out->today_humidity = entry->today_humidity_pct;
+      if (entry->today_visibility_m != 0xFFFF)   out->today_visibility_m = entry->today_visibility_m;
+      if (entry->today_precip_sum_mm != 0xFFFF)  out->today_precip_sum_mm = entry->today_precip_sum_mm;
+      for (uint8_t i = 0; i < nd; i++) {
+        if (entry->daily_feels_like[i] != WEATHER_SERVICE_LOCATION_FORECAST_UNKNOWN_TEMP) {
+          out->daily[i].feels = entry->daily_feels_like[i];
+        }
       }
     }
   }
@@ -154,6 +176,15 @@ static void prv_seed_v4_test(WxDsForecast *out) {
   if (out->today_uv < 0)     out->today_uv = 5;
   if (out->today_precip < 0) out->today_precip = 20;
   if (out->today_wind < 0)   out->today_wind = 12;
+  // v4.2 warning readings — quiet values (no warning fires; the report's alert
+  // stays on the precip path, "Chance of snow" for the seed's LightSnow today).
+  if (out->today_wmo < 0)            out->today_wmo = 71;      // WMO light snow
+  if (out->today_humidity < 0)       out->today_humidity = 62;
+  if (out->today_visibility_m < 0)   out->today_visibility_m = 18000;
+  if (out->today_precip_sum_mm < 0)  out->today_precip_sum_mm = 3;
+  if (out->today_feels == WX_DS_UNKNOWN_TEMP && out->current_temp != WX_DS_UNKNOWN_TEMP) {
+    out->today_feels = out->current_temp - 2;   // plausible wind-chill placeholder
+  }
 
   // Coordinates so the globe has a location to reveal to (San Francisco).
   if (out->latitude_e2 == INT16_MIN)  out->latitude_e2 = 3777;    // 37.77 N
@@ -179,6 +210,7 @@ static void prv_seed_v4_test(WxDsForecast *out) {
   out->daily[0].precip = out->today_precip;  // today's value (set above)
   out->daily[0].wind   = out->today_wind;
   out->daily[0].uv     = out->today_uv;
+  out->daily[0].feels  = out->today_feels;
   for (int i = 1; i < WX_DS_DAYS; i++) {
     out->daily[i].high = hi + kHiDelta[i];
     out->daily[i].low = lo + kLoDelta[i];
@@ -186,6 +218,7 @@ static void prv_seed_v4_test(WxDsForecast *out) {
     out->daily[i].precip = kPrecip[i];
     out->daily[i].wind   = kWind[i];
     out->daily[i].uv     = kUv[i];
+    out->daily[i].feels  = out->daily[i].high - 2;   // plausible per-day apparent temp
   }
   // Don't synthesize today/tomorrow: daily[0] already used the real current conditions above, and
   // daily[1] uses the real next-day forecast from the blobDB when present. Only days 2+ stay
@@ -214,9 +247,12 @@ static void prv_seed_v4_test(WxDsForecast *out) {
 // QEMU has no phone → no weather_db records, so the weather app would be empty.
 // Synthesize locations (current conditions + the v4 test seed) so the whole UI
 // incl. the round 5-day screen is reachable for visual testing in the emulator.
-// Index 0 is the "current location"; the rest match the default saved-city
-// presets so the at-a-glance saved-locations list lights up with weather.
-// Auto-disabled on real hardware (CONFIG_SOC_QEMU is unset there).
+// Index 0 is the "current location"; the next five match the default saved-city
+// presets so the at-a-glance saved-locations list lights up with weather. The
+// last ("Kingston, Jamaica") is deliberately NOT a preset — it stands in for a
+// record the phone synced for a voice-added custom location (pairs with the
+// QEMU-seeded "Jamaica" custom in saved_locations.c to exercise coordinate
+// backfill + globe placement). Auto-disabled on real hardware.
 typedef struct {
   const char *name;
   const char *phrase;
@@ -242,6 +278,8 @@ static const QemuSynthCity s_qemu_cities[] = {
     26, 27, 20, 3568, 13969, 540 },
   { "Sydney, Australia", "Light Rain", WeatherType_LightRain,
     11, 13, 7, -3387, 15121, 600 },
+  { "Kingston, Jamaica", "Sunny", WeatherType_Sun,
+    31, 33, 25, 1797, -7679, -300 },
 };
 #define QEMU_SYNTH_CITY_COUNT ((int)(sizeof(s_qemu_cities) / sizeof(s_qemu_cities[0])))
 
@@ -266,6 +304,11 @@ static void prv_qemu_synth(int index, WxDsForecast *out) {
   out->today_uv = -1;
   out->today_precip = -1;
   out->today_wind = -1;
+  out->today_feels = WX_DS_UNKNOWN_TEMP;   // zeroed struct would read as a KNOWN 0deg
+  out->today_wmo = -1;                     // same trap: zeroed = WMO 0 "clear" / 0m visibility
+  out->today_humidity = -1;
+  out->today_visibility_m = -1;
+  out->today_precip_sum_mm = -1;
   out->latitude_e2 = city->lat_e2;
   out->longitude_e2 = city->lon_e2;
   out->utc_offset_min = city->utc_off_min;
@@ -274,8 +317,31 @@ static void prv_qemu_synth(int index, WxDsForecast *out) {
 #if WEATHER_V4_TEST_SEED
   prv_seed_v4_test(out);
 #endif
+  // Mark the fully-populated synth record as v4: its coordinates are REAL (per-city
+  // above, not the seed's placeholder), so gates that trust only v4 coords (the
+  // custom-location coordinate backfill) behave in QEMU exactly as on hardware.
+  out->is_v4 = true;
 }
 #endif
+
+bool weather_ds_name_prefix(const char *name, const char *needle) {
+  if (!name || !needle || !needle[0]) return false;
+  for (size_t i = 0; needle[i]; i++) {
+    char a = name[i], b = needle[i];
+    if (a >= 'A' && a <= 'Z') a += 'a' - 'A';
+    if (b >= 'A' && b <= 'Z') b += 'a' - 'A';
+    if (a != b) return false;
+  }
+  return true;
+}
+
+bool weather_ds_name_matches(const char *name, const char *needle) {
+  if (!name) return false;
+  for (const char *p = name; *p; p++) {
+    if (weather_ds_name_prefix(p, needle)) return true;
+  }
+  return false;
+}
 
 bool weather_ds_supported(void) {
 #if defined(CONFIG_SOC_QEMU)

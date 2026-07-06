@@ -53,5 +53,14 @@ void weather_draw_lava_ring(GContext *ctx, GPoint center, int outer_r,
 #define WEATHER_SQUASH_DOWN_EXIT  2
 #define WEATHER_SQUASH_RISE_IN    3
 #define WEATHER_SQUASH_CLOCK_EXIT 4
+// Mode 5: the forecast's clock-burst stage-1 — the whole scrolled screen jelly-stretches
+// UP off the top (top edge leads, bottom trails), full timeline like the clock exit.
+#define WEATHER_SQUASH_UP_EXIT    5
+// Mode 6: the forecast's SELECT exit — the UP_EXIT grammar rotated 90°: the whole
+// screen jelly-stretches off the LEFT (left edge leads, right trails the half-lag).
+#define WEATHER_SQUASH_LEFT_EXIT  6
+// Mode 7: the weather report's entrance — RISE_IN rotated 90°: the whole screen
+// jelly-stretches IN from the RIGHT (left edge leads into place, right trails).
+#define WEATHER_SQUASH_RIGHT_IN   7
 void weather_render_squash(GContext *ctx, uint8_t *scratch, AnimationProgress m, int mode);
 #endif

@@ -14,6 +14,7 @@
 #include "weather_math.h"
 #include "weather.h"
 #include "applib/ui/app_window_stack.h"
+#include "applib/ui/vibes.h"
 #include "applib/applib_malloc.auto.h"
 #include "applib/vendor/tinflate/tinflate.h"
 
@@ -48,7 +49,7 @@
 #define GLOBE_SAVED_LABEL_GAP 6
 #define GLOBE_INTRO_SELECTION_DURATION_MS 175
 #define GLOBE_INTRO_SELECTION_OFFSET_PX 5
-#define GLOBE_PLANET_CENTER_Y_OFFSET -13
+#define GLOBE_PLANET_CENTER_Y_OFFSET -11
 #define GLOBE_COLOR_PLANET_CENTER_Y_OFFSET \
     PBL_IF_ROUND_ELSE(-GLOBE_CRADLE_CENTER_Y_OFFSET, GLOBE_PLANET_CENTER_Y_OFFSET)
 #define GLOBE_REVEALED_CENTER_Y_OFFSET \
@@ -74,7 +75,7 @@
 #define GLOBE_CRADLE_ARM_CENTER_X 62
 #define GLOBE_CRADLE_ARM_CENTER_Y 60
 #define GLOBE_CRADLE_ARM_OUTER_RADIUS 64
-#define GLOBE_CRADLE_ARM_THICKNESS 8
+#define GLOBE_CRADLE_ARM_THICKNESS 6
 #define GLOBE_CRADLE_ARM_START_ANGLE DEG_TO_TRIGANGLE(20)
 #define GLOBE_CRADLE_ARM_END_ANGLE DEG_TO_TRIGANGLE(205)
 #define GLOBE_CRADLE_WIPE_MARGIN 8
@@ -126,6 +127,35 @@
 // over terrain near the horizon.
 #define GLOBE_HAZE_RIM_SZ_Q10 230
 #define GLOBE_HAZE_BLEND_SZ_Q10 450
+// Fresnel limb glint: the solid Celeste rim whitens where the limb faces the
+// light. The lambert term is view-space, so the glint is FIXED at the screen's
+// upper-left (like the terminator) and terrain rotates beneath it. HOT = solid
+// White arc (~33 deg half-angle at the limb), WARM = 50% Bayer-dithered skirt.
+#define GLOBE_RIM_HOT_MIN_Q10 560
+#define GLOBE_RIM_WARM_MIN_Q10 400
+// Ocean sun-glint: daylight (band-0) pixels whose lambert exceeds GLINT_MIN
+// promote to the specular palette row (water only — land stays matte), with
+// an ordered-dither density ramp reaching full at GLINT_MIN + SPAN. Max
+// lambert is |L| ~= 1017, so this is a ~15-20px pool with a wide soft fringe.
+#define GLOBE_GLINT_MIN_Q10 820
+#define GLOBE_GLINT_SPAN_Q10 192
+// Magnetic lock swoop: duration is proportional to the capture distance
+// (5px capture clamps up to the 140ms floor, 49px = 267ms) clamped to
+// [GLOBE_LOCK_SWOOP_MIN_MS, GLOBE_LOCK_SWOOP_DURATION_MS].
+#define GLOBE_LOCK_SWOOP_BASE_MS 120
+#define GLOBE_LOCK_SWOOP_MS_PER_PX 3
+#define GLOBE_LOCK_SWOOP_MIN_MS 140
+// Lock pulse: a Celeste ring that expands from the locked pin's head and
+// fades out — fired on magnetic capture and button-nav arrival.
+#define GLOBE_LOCK_PULSE_DURATION_MS 160
+#define GLOBE_LOCK_PULSE_R_MIN_PX 7
+#define GLOBE_LOCK_PULSE_R_GROW_PX 9
+#define GLOBE_LOCK_PULSE_THICKNESS_PX 2
+// Pin depth classes (post-cull depth_q8 range is 51..255): pins shrink toward
+// the limb so cities read as sitting ON a sphere. Class 2 (front) is
+// bit-identical to the original single-size pin.
+#define GLOBE_PIN_DEPTH_MID_Q8   112
+#define GLOBE_PIN_DEPTH_FRONT_Q8 192
 
 static const uint8_t GLOBE_SPACE_FADE_DITHER[GLOBE_SPACE_FADE_DITHER_SIZE]
                                            [GLOBE_SPACE_FADE_DITHER_SIZE] = {
@@ -139,13 +169,31 @@ static const uint8_t GLOBE_SPACE_FADE_DITHER[GLOBE_SPACE_FADE_DITHER_SIZE]
 // [1] terminator, [2] night side. Column order matches the packed cubemap's
 // palette indices: DukeBlue, BlueMoon, VividCerulean, PictonBlue, Celeste,
 // White, MayGreen, DarkGreen, JaegerGreen, SpringBud, ScreaminGreen, Mint.
-static const uint8_t GLOBE_SHADE_PALETTE[3][GLOBE_CUBEMAP_PALETTE_SIZE] = {
+static const uint8_t GLOBE_SHADE_PALETTE[4][GLOBE_CUBEMAP_PALETTE_SIZE] = {
     { 0xC2, 0xC7, 0xCB, 0xDB, 0xEF, 0xFF, 0xD9, 0xC4, 0xC9, 0xEC, 0xDD, 0xEE },
     { 0xC2, 0xC2, 0xC7, 0xCB, 0xDB, 0xEF, 0xC8, 0xC4, 0xC8, 0xD8, 0xC9, 0xD9 },
     // Shadow ocean floors at DukeBlue so the dark limb stays visibly blue
     // against space; OxfordBlue appears only for the rare deep-trench texels.
     { 0xC1, 0xC2, 0xC6, 0xC7, 0xCB, 0xDB, 0xC4, 0xC4, 0xC4, 0xC8, 0xC8, 0xC8 },
+    // [3] specular sun-glint: every OCEAN column promoted one step up the blue
+    // ramp (sun-on-water sheen); LAND columns identical to daylight so the
+    // glint self-limits to water. Selected only for band-0 pixels inside the
+    // GLOBE_GLINT_MIN_Q10 cap.
+    { 0xC7, 0xCB, 0xDB, 0xEF, 0xFF, 0xFF, 0xD9, 0xC4, 0xC9, 0xEC, 0xDD, 0xEE },
 };
+
+// Haze wash keyed by lighting band: the sunlit limb atmosphere catches the sun
+// (Celeste bloom decaying inward — the Wii limb); terminator/night keep the
+// original PictonBlue wash.
+static const uint8_t GLOBE_HAZE_WASH_BY_BAND[3] = {
+    GColorCelesteARGB8, GColorPictonBlueARGB8, GColorPictonBlueARGB8,
+};
+// Haze reach keyed by band: the brightening wash is withheld sooner on the
+// night side, so the atmosphere reads thick on the sun side and thin in
+// shadow — a pure differential-BRIGHTENING depth cue (nothing drops below its
+// base palette value). 220 == the full BLEND-RIM span; set [2] back to 220 to
+// restore a symmetric night limb with one byte.
+static const uint8_t GLOBE_HAZE_SPAN_BY_BAND[3] = { 220, 220, 128 };
 
 static void animation_timer_handler(void *context);
 static void schedule_frame_timer(GlobeView *view);
@@ -156,6 +204,8 @@ static void set_free_roam_enabled(GlobeView *view, bool enabled);
 static void show_intro_canvas(GlobeView *view);
 static void show_revealed_space_layers(GlobeView *view);
 static void mark_dynamic_globe_dirty(GlobeView *view);
+static int32_t ease_out_quad(AnimationProgress progress);
+static void start_lock_pulse(GlobeView *view);
 static void ensure_visual_resources(GlobeView *view);
 static void release_visual_resources(GlobeView *view);
 static int bounce_offset(GlobeView *view);
@@ -1363,22 +1413,73 @@ static void framebuffer_fill_circle(GBitmap *fb, GPoint center, int radius,
     }
 }
 
+// Ring (annulus) rasterizer for the lock pulse — framebuffer_fill_circle's
+// bbox scan with an inner-radius reject.
+static void framebuffer_draw_ring(GBitmap *fb, GPoint center, int outer_r,
+                                  int inner_r, uint8_t color, GRect clip_rect) {
+    if (!fb || outer_r <= 0) return;
+    if (inner_r < 0) inner_r = 0;
+
+    GRect fbb = gbitmap_get_bounds(fb);
+    GRect clipped = clip_rect_to_bounds(clip_rect, fbb);
+    int outer_sq = outer_r * outer_r;
+    int inner_sq = inner_r * inner_r;
+    int clip_left = clipped.origin.x;
+    int clip_top = clipped.origin.y;
+    int clip_right = clipped.origin.x + clipped.size.w - 1;
+    int clip_bottom = clipped.origin.y + clipped.size.h - 1;
+
+    for (int ay = center.y - outer_r; ay <= center.y + outer_r; ay++) {
+        if (ay < clip_top || ay > clip_bottom) continue;
+        int dy = ay - center.y;
+        GBitmapDataRowInfo ri = gbitmap_get_data_row_info(fb, (uint16_t)ay);
+        for (int ax = center.x - outer_r; ax <= center.x + outer_r; ax++) {
+            if (ax < clip_left || ax > clip_right ||
+                ax < (int)ri.min_x || ax > (int)ri.max_x) {
+                continue;
+            }
+            int dx = ax - center.x;
+            int d2 = (dx * dx) + (dy * dy);
+            if (d2 <= outer_sq && d2 >= inner_sq) {
+                ri.data[ax] = color;
+            }
+        }
+    }
+}
+
+// Depth-posterized pin styles (3 classes echoing the 3-band lit shading):
+// pins shrink toward the limb and their raise flattens, so the cities read
+// as floating on a sphere. Class 2 (front) is the original pin geometry.
+typedef struct { uint8_t outline_r, head_r, base_r, raise; } GlobePinStyle;
+static const GlobePinStyle GLOBE_PIN_STYLES[3] = {
+    { 3, 2, 1, 2 },   // limb  (depth 51..111)
+    { 4, 2, 2, 3 },   // mid   (112..191)
+    { 5, 3, 2, 4 },   // front (192..255) — original geometry
+};
+
 static void framebuffer_draw_raised_pin(GBitmap *fb, GPoint globe_center,
-                                        GPoint surface, GRect clip_rect) {
+                                        GPoint surface, int depth_q8,
+                                        bool emphasized, GRect clip_rect) {
+    int cls = depth_q8 >= GLOBE_PIN_DEPTH_FRONT_Q8
+                  ? 2
+                  : (depth_q8 >= GLOBE_PIN_DEPTH_MID_Q8 ? 1 : 0);
+    const GlobePinStyle *st = &GLOBE_PIN_STYLES[cls];
+    int g = emphasized ? 1 : 0;   // locked pin grows 1px (lands with the pulse)
+    int raise = st->raise + g;
     int dx = surface.x - globe_center.x;
     int dy = surface.y - globe_center.y;
     int distance = globe_isqrt((dx * dx) + (dy * dy));
     GPoint head = surface;
     if (distance > 0) {
-        head.x += (dx * 4) / distance;
-        head.y += (dy * 4) / distance;
+        head.x += (dx * raise) / distance;
+        head.y += (dy * raise) / distance;
     } else {
-        head.y -= 4;
+        head.y -= raise;
     }
 
-    framebuffer_fill_circle(fb, surface, 2, GColorBlackARGB8, clip_rect);
-    framebuffer_fill_circle(fb, head, 5, GColorBlackARGB8, clip_rect);
-    framebuffer_fill_circle(fb, head, 3, GColorWhiteARGB8, clip_rect);
+    framebuffer_fill_circle(fb, surface, st->base_r, GColorBlackARGB8, clip_rect);
+    framebuffer_fill_circle(fb, head, st->outline_r + g, GColorBlackARGB8, clip_rect);
+    framebuffer_fill_circle(fb, head, st->head_r + g, GColorWhiteARGB8, clip_rect);
 }
 
 static bool project_lat_lon_to_globe_point_with_depth(GlobeView *view,
@@ -1560,35 +1661,71 @@ static void draw_saved_location_pins(GBitmap *fb, GlobeView *view,
     int pin_radius = radius - GLOBE_OUTLINE_PX;
     if (pin_radius <= 0) return;
 
+    // Two passes: project + cull into a list, depth-sort (back pins paint
+    // first so near cities overlap far ones — the 3D read), then draw. The
+    // sort is stable and Current is appended last, so at equal depth the
+    // current-location pin still paints on top (old semantics).
+    typedef struct { GPoint pt; uint8_t depth; bool emphasized; } PinDrawEntry;
+    PinDrawEntry pins[SAVED_LOCATIONS_MAX_ENTRIES + 1];
+    int n = 0;
+
     int max_index = globe_max_selector_index(view);
-    for (int i = 0; i <= max_index; i++) {
+    for (int i = 0; i <= max_index && n < (int)(sizeof(pins) / sizeof(pins[0])); i++) {
         SavedLocationEntry *entry = saved_entry_for_index(view, i);
         if (!saved_entry_has_globe_coordinates(view, entry)) continue;
         if (entry->kind == SavedLocationKindCurrent) continue;
 
         GPoint pin;
+        int depth = 255;
         if (!project_lat_lon_to_globe_point_with_depth(view,
                                                        saved_entry_latitude_e2(view, entry),
                                                        saved_entry_longitude_e2(view, entry),
                                                        center, pin_radius,
                                                        GLOBE_PIN_EDGE_FRONT_Q10,
-                                                       &pin, NULL)) {
+                                                       &pin, &depth)) {
             continue;
         }
 
-        framebuffer_draw_raised_pin(fb, center, pin, clip_rect);
+        bool emphasized = (i == view->selected_city_index);
+#if WEATHER_PLATFORM_TOUCH_COLOR
+        emphasized = emphasized && !view->is_free_roam;
+        if (view->city_anim && view->hover_lock_active) {
+            // Grow mid-swoop so the emphasis lands as the pin centres.
+            emphasized = emphasized &&
+                         view->city_anim_progress > ANIMATION_NORMALIZED_MAX / 2;
+        }
+#endif
+        pins[n++] = (PinDrawEntry){ .pt = pin, .depth = (uint8_t)depth,
+                                    .emphasized = emphasized };
     }
 
-    if (view->has_current_location) {
+    if (view->has_current_location && n < (int)(sizeof(pins) / sizeof(pins[0]))) {
         GPoint pin;
+        int depth = 255;
         if (project_lat_lon_to_globe_point_with_depth(view,
                                                        view->current_location_latitude_e2,
                                                        view->current_location_longitude_e2,
                                                        center, pin_radius,
                                                        GLOBE_PIN_EDGE_FRONT_Q10,
-                                                       &pin, NULL)) {
-            framebuffer_draw_raised_pin(fb, center, pin, clip_rect);
+                                                       &pin, &depth)) {
+            pins[n++] = (PinDrawEntry){ .pt = pin, .depth = (uint8_t)depth,
+                                        .emphasized = false };
         }
+    }
+
+    for (int i = 1; i < n; i++) {   // stable insertion sort, ascending depth
+        PinDrawEntry key = pins[i];
+        int j = i;
+        while (j > 0 && pins[j - 1].depth > key.depth) {
+            pins[j] = pins[j - 1];
+            j--;
+        }
+        pins[j] = key;
+    }
+
+    for (int k = 0; k < n; k++) {
+        framebuffer_draw_raised_pin(fb, center, pins[k].pt, pins[k].depth,
+                                    pins[k].emphasized, clip_rect);
     }
 }
 
@@ -1738,8 +1875,18 @@ static void draw_cubemap_globe_at_center(GContext *ctx, GlobeView *view,
                 if (ax < lo || ax > hi) continue;
                 if (sz < GLOBE_HAZE_RIM_SZ_Q10) {
                     // Luminous rim: the atmosphere outshines the terrain at
-                    // the very edge of the disc (merges with the halo ring).
-                    ri.data[ax] = GColorCelesteARGB8;
+                    // the very edge of the disc (merges with the halo ring),
+                    // whitened into a fresnel glint where the limb faces the
+                    // light — solid White arc with a 50%-dithered skirt.
+                    int32_t rim_light =
+                        (light_base + light_col) >> GLOBE_ROT_SHIFT;
+                    uint8_t rim_color = GColorCelesteARGB8;
+                    if (rim_light >= GLOBE_RIM_HOT_MIN_Q10 ||
+                        (rim_light >= GLOBE_RIM_WARM_MIN_Q10 &&
+                         dither_row[ax % GLOBE_SPACE_FADE_DITHER_SIZE] < 8)) {
+                        rim_color = GColorWhiteARGB8;
+                    }
+                    ri.data[ax] = rim_color;
                     continue;
                 }
                 uint8_t tex = cubemap_sample(
@@ -1750,20 +1897,28 @@ static void draw_cubemap_globe_at_center(GContext *ctx, GlobeView *view,
                 // Posterized lambert shading, dithered at the band edges.
                 int32_t dith =
                     (int32_t)dither_row[ax % GLOBE_SPACE_FADE_DITHER_SIZE];
-                int32_t light = (light_base + light_col) >> GLOBE_ROT_SHIFT;
-                light += (dith - 8) << 4;
+                int32_t light_pre = (light_base + light_col) >> GLOBE_ROT_SHIFT;
+                int32_t light = light_pre + ((dith - 8) << 4);
                 int band = light >= GLOBE_SHADE_LIT_MIN_Q10
                                ? 0
                                : (light >= GLOBE_SHADE_MID_MIN_Q10 ? 1 : 2);
                 uint8_t color = GLOBE_SHADE_PALETTE[band][tex];
+                if (band == 0 && light_pre >= GLOBE_GLINT_MIN_Q10 &&
+                    ((dith * GLOBE_GLINT_SPAN_Q10) >> 4) <=
+                        (light_pre - GLOBE_GLINT_MIN_Q10)) {
+                    // Specular sun pool (screen-fixed; terrain scrolls under
+                    // it) — water brightens one ramp step, land stays matte.
+                    color = GLOBE_SHADE_PALETTE[3][tex];
+                }
                 if (sz < GLOBE_HAZE_BLEND_SZ_Q10) {
-                    // Bluish atmospheric wash over terrain near the horizon,
-                    // dithered denser toward the rim.
-                    int32_t haze_span =
-                        GLOBE_HAZE_BLEND_SZ_Q10 - GLOBE_HAZE_RIM_SZ_Q10;
+                    // Atmospheric wash over terrain near the horizon, dithered
+                    // denser toward the rim; color + reach keyed by band (the
+                    // sunlit limb blooms Celeste and reaches deeper — haze
+                    // wins over the glint, so the rim stays atmospheric).
+                    int32_t haze_span = GLOBE_HAZE_SPAN_BY_BAND[band];
                     if (((dith * haze_span) >> 4) >=
                         (sz - GLOBE_HAZE_RIM_SZ_Q10)) {
-                        color = GColorPictonBlueARGB8;
+                        color = GLOBE_HAZE_WASH_BY_BAND[band];
                     }
                 }
                 ri.data[ax] = color;
@@ -1772,6 +1927,18 @@ static void draw_cubemap_globe_at_center(GContext *ctx, GlobeView *view,
     }
 
     draw_saved_location_pins(fb, view, center, radius, clipped);
+
+    if (view->lock_pulse_anim) {
+        // Lock pulse: a Celeste ring expanding from the settled pin's head
+        // (raised 4px above center) and easing out — "target acquired".
+        int eased = ease_out_quad(view->lock_pulse_progress);
+        int outer_r = GLOBE_LOCK_PULSE_R_MIN_PX +
+                      (GLOBE_LOCK_PULSE_R_GROW_PX * eased) /
+                          ANIMATION_NORMALIZED_MAX;
+        framebuffer_draw_ring(fb, GPoint(center.x, center.y - 5), outer_r,
+                              outer_r - GLOBE_LOCK_PULSE_THICKNESS_PX,
+                              GColorCelesteARGB8, clipped);
+    }
 
     graphics_release_frame_buffer(ctx, fb);
 }
@@ -1816,6 +1983,23 @@ static void mark_dynamic_globe_dirty(GlobeView *view) {
 static int32_t ease_out_quad(AnimationProgress progress) {
     int32_t inv = ANIMATION_NORMALIZED_MAX - (int32_t)progress;
     return ANIMATION_NORMALIZED_MAX - weather_norm_square(inv);
+}
+
+// Integer ease-out-back (s = 7/4, ~10.5% peak overshoot at t~=0.58):
+// f(t) = 1 - (s+1)*inv^3 + s*inv^2, inv = 1-t. Fed to the hover-lock SERVO,
+// values past MAX drive the pin slightly PAST center and back — a real
+// magnetic snap that self-scales with capture distance (50px capture
+// overshoots ~5px, 5px capture ~0.5px). Endpoints exact; defensively clamped.
+// MUST only be used where a closed-loop correction follows (the hover branch)
+// — never for open-loop lat/lon interpolation (10% of a long arc is huge).
+static int32_t ease_out_back(AnimationProgress progress) {
+    int32_t inv = ANIMATION_NORMALIZED_MAX - (int32_t)progress;
+    if (inv <= 0) return ANIMATION_NORMALIZED_MAX;
+    int32_t inv2 = weather_norm_square(inv);                               // inv^2/N
+    int32_t inv3 = weather_scale_i32(inv2, inv, ANIMATION_NORMALIZED_MAX); // inv^3/N^2
+    int32_t eased = ANIMATION_NORMALIZED_MAX + (7 * inv2 - 11 * inv3) / 4;
+    int32_t cap = ANIMATION_NORMALIZED_MAX + ANIMATION_NORMALIZED_MAX / 8;
+    return eased > cap ? cap : eased;
 }
 
 static AnimationProgress color_transition_grow_progress(int amount) {
@@ -2099,7 +2283,11 @@ static void city_anim_update(Animation *anim, AnimationProgress progress) {
 
 #if WEATHER_PLATFORM_TOUCH_COLOR
     if (view->hover_lock_active && view->hover_city_index >= 0) {
-        int eased = ease_out_quad(progress);
+        // Ease-out-BACK in the servo: eased exceeds MAX near the end, so
+        // `remaining` goes briefly negative and the pin swings a few px PAST
+        // center and settles back — a magnetic snap that self-scales with the
+        // capture distance. (Safe only here: the servo re-corrects per frame.)
+        int eased = ease_out_back(progress);
         int remaining = ANIMATION_NORMALIZED_MAX - eased;
         int target_dx = weather_scale_i32(view->city_anim_longitude_delta_e2,
                                           remaining,
@@ -2152,6 +2340,7 @@ static void city_anim_stopped(Animation *anim, bool finished, void *context) {
         if (owns_anim && finished) {
             settle_city_pin_to_center(view, view->hover_city_index);
             update_city_label_layer(view);
+            start_lock_pulse(view);   // ring flash: target acquired
             mark_dynamic_globe_dirty(view);
         }
         if (owns_anim) {
@@ -2166,6 +2355,7 @@ static void city_anim_stopped(Animation *anim, bool finished, void *context) {
                               view->city_anim_target_latitude_e2,
                               view->city_anim_target_longitude_e2);
         reload_color_frame(view);
+        start_lock_pulse(view);   // button-nav arrival gets the same pulse
     }
 
     if (owns_anim) {
@@ -2205,6 +2395,65 @@ static void bounce_anim_stopped(Animation *anim, bool finished, void *context) {
 static const AnimationImplementation s_bounce_anim_impl = {
     .update = bounce_anim_update
 };
+
+// ---- Lock pulse: an expanding Celeste ring from the locked pin's head ----
+static void lock_pulse_anim_update(Animation *anim, AnimationProgress progress) {
+    GlobeView *view = (GlobeView *)animation_get_context(anim);
+    if (!view) return;
+
+    view->lock_pulse_progress = progress;
+    mark_dynamic_globe_dirty(view);
+}
+
+static void lock_pulse_anim_stopped(Animation *anim, bool finished, void *context) {
+    (void)finished;
+    GlobeView *view = (GlobeView *)context;
+    if (!view) return;
+
+    bool owns_anim = view->lock_pulse_anim == anim;
+    if (owns_anim) {
+        view->lock_pulse_anim = NULL;
+    }
+    view->lock_pulse_progress = 0;
+    mark_dynamic_globe_dirty(view);
+
+    if (owns_anim) {
+        animation_destroy(anim);
+    }
+}
+
+static const AnimationImplementation s_lock_pulse_anim_impl = {
+    .update = lock_pulse_anim_update
+};
+
+static void cancel_lock_pulse_animation(GlobeView *view) {
+    if (view) cancel_animation_slot(&view->lock_pulse_anim);
+}
+
+static Animation *start_view_animation(GlobeView *view, uint32_t duration_ms,
+                                       AnimationCurve curve,
+                                       const AnimationImplementation *impl,
+                                       AnimationStoppedHandler stopped);
+
+static void start_lock_pulse(GlobeView *view) {
+    if (!view) return;
+    cancel_lock_pulse_animation(view);
+    view->lock_pulse_progress = 0;
+    view->lock_pulse_anim = start_view_animation(view,
+                                                 GLOBE_LOCK_PULSE_DURATION_MS,
+                                                 AnimationCurveLinear,
+                                                 &s_lock_pulse_anim_impl,
+                                                 lock_pulse_anim_stopped);
+    // The lightest haptic nudge, landing with the ring: one 25ms segment at
+    // 25% amplitude — a whisper tick, nothing like a notification buzz.
+    static const uint32_t nudge_ms[] = { 25 };
+    static const uint32_t nudge_amp[] = { 25 };
+    vibes_enqueue_custom_pattern_with_amplitudes((VibePatternWithAmplitudes){
+        .durations = nudge_ms,
+        .amplitudes = nudge_amp,
+        .num_segments = 1,
+    });
+}
 
 // Shared boilerplate for the view's stopped-handler animations: create,
 // configure, schedule. Returns the animation (NULL if creation failed) so
@@ -2270,9 +2519,12 @@ static void start_city_rotation(GlobeView *view, int city_index) {
         return;
     }
 
+    // Linear: city_anim_update applies ease_out_quad itself — a curved
+    // AnimationCurve here would double-ease into mush (brisk start, crisp
+    // landing is the point; the arrival pulse supplies the punctuation).
     view->city_anim = start_view_animation(view,
                                            GLOBE_CITY_ROTATION_DURATION_MS,
-                                           AnimationCurveEaseInOut,
+                                           AnimationCurveLinear,
                                            &s_city_anim_impl,
                                            city_anim_stopped);
     update_city_label_layer(view);
@@ -2280,7 +2532,12 @@ static void start_city_rotation(GlobeView *view, int city_index) {
 }
 
 #if WEATHER_PLATFORM_TOUCH_COLOR
-static bool try_start_magnetic_city_lock(GlobeView *view, int radius_px) {
+// vx_q8/vy_q8: the coast velocity at the call (zeros when called at rest).
+// A pin still moving AWAY from center is not captured — the coast tick
+// retries at dead-stop, so a retrograde fling locks gently from standstill
+// instead of being yanked mid-flight.
+static bool try_start_magnetic_city_lock_v(GlobeView *view, int radius_px,
+                                           int32_t vx_q8, int32_t vy_q8) {
     if (!view || view->city_anim) return false;
 
     int city_index = nearest_centered_city_index(view, radius_px);
@@ -2293,6 +2550,13 @@ static bool try_start_magnetic_city_lock(GlobeView *view, int radius_px) {
     int deadzone_sq = GLOBE_LOCK_SETTLE_DEADZONE_PX *
                       GLOBE_LOCK_SETTLE_DEADZONE_PX;
 
+    if ((vx_q8 | vy_q8) != 0 && has_offset) {
+        // Directional gate: coast deltas move the pin WITH the velocity, so a
+        // positive dot product = the pin is receding from center — defer.
+        int32_t dot = vx_q8 * start_dx + vy_q8 * start_dy;
+        if (dot > 0) return false;
+    }
+
     stop_globe_coast(view, false);
     cancel_bounce_animation(view);
     view->selected_city_index = city_index;
@@ -2302,6 +2566,7 @@ static bool try_start_magnetic_city_lock(GlobeView *view, int radius_px) {
 
     if (!has_offset || (start_dx * start_dx) + (start_dy * start_dy) <=
         deadzone_sq) {
+        start_lock_pulse(view);   // instant lock (already centered)
         mark_dynamic_globe_dirty(view);
         return true;
     }
@@ -2314,8 +2579,20 @@ static bool try_start_magnetic_city_lock(GlobeView *view, int radius_px) {
     view->city_anim_longitude_delta_e2 = start_dx;
     view->city_anim_progress = 0;
 
+    // Swoop duration proportional to the capture distance: a 5px capture no
+    // longer crawls and a 49px capture no longer whips.
+    int dist_px = weather_isqrt(start_dx * start_dx + start_dy * start_dy);
+    uint32_t swoop_ms = GLOBE_LOCK_SWOOP_BASE_MS +
+                        (uint32_t)dist_px * GLOBE_LOCK_SWOOP_MS_PER_PX;
+    if (swoop_ms < GLOBE_LOCK_SWOOP_MIN_MS) swoop_ms = GLOBE_LOCK_SWOOP_MIN_MS;
+    if (swoop_ms > GLOBE_LOCK_SWOOP_DURATION_MS) {
+        swoop_ms = GLOBE_LOCK_SWOOP_DURATION_MS;
+    }
+
+    // Linear is MANDATORY: city_anim_update's servo applies ease_out_back
+    // itself; a curved AnimationCurve would compose with it and distort.
     view->city_anim = start_view_animation(view,
-                                           GLOBE_LOCK_SWOOP_DURATION_MS,
+                                           swoop_ms,
                                            AnimationCurveLinear,
                                            &s_city_anim_impl,
                                            city_anim_stopped);
@@ -2324,6 +2601,10 @@ static bool try_start_magnetic_city_lock(GlobeView *view, int radius_px) {
         mark_dynamic_globe_dirty(view);
     }
     return true;
+}
+
+static bool try_start_magnetic_city_lock(GlobeView *view, int radius_px) {
+    return try_start_magnetic_city_lock_v(view, radius_px, 0, 0);
 }
 #endif
 
@@ -2489,7 +2770,9 @@ static void globe_coast_timer_handler(void *context) {
     int32_t speed = abs_i32(view->coast_velocity_x_q8) +
                     abs_i32(view->coast_velocity_y_q8);
     if (speed <= GLOBE_COAST_SETTLE_SPEED_Q8 &&
-        try_start_magnetic_city_lock(view, GLOBE_LOCK_RADIUS_PX)) {
+        try_start_magnetic_city_lock_v(view, GLOBE_LOCK_RADIUS_PX,
+                                       view->coast_velocity_x_q8,
+                                       view->coast_velocity_y_q8)) {
         return;
     }
 
@@ -2497,6 +2780,11 @@ static void globe_coast_timer_handler(void *context) {
         view->coast_active = false;
         view->coast_velocity_x_q8 = 0;
         view->coast_velocity_y_q8 = 0;
+        // Dead-stop retry: a lock deferred by the directional gate (pin was
+        // still receding mid-flight) captures gently now that we're still.
+        if (try_start_magnetic_city_lock(view, GLOBE_LOCK_RADIUS_PX)) {
+            return;
+        }
         mark_dynamic_globe_dirty(view);
         return;
     }
@@ -2624,6 +2912,7 @@ static void cancel_all_view_animations(GlobeView *view) {
     cancel_reveal_animation(view);
     cancel_city_animation(view);
     cancel_bounce_animation(view);
+    cancel_lock_pulse_animation(view);
 }
 
 static void toggle_reveal(GlobeView *view) {
@@ -3097,6 +3386,11 @@ static bool point_is_on_revealed_globe(GlobeView *view, int16_t x, int16_t y) {
 static void touch_handler(const TouchEvent *event, void *context) {
     GlobeView *view = (GlobeView *)context;
     if (!view) return;
+    // Pop-transition gap: globe_view_pop stops the animation state BEFORE the
+    // async window pop finishes, but touch stays subscribed until disappear.
+    // Ignore events in that window — a drag could re-arm timers the disappear
+    // handler already skipped, and a tap could double-pop the stack.
+    if (!view->is_animating) return;
 
     if (event->type == TouchEvent_Touchdown) {
         note_globe_interaction(view);

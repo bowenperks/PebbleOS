@@ -43,6 +43,12 @@ typedef struct {
 } SavedLocationsConfig;
 
 void saved_locations_push(const SavedLocationsConfig *config);
+
+//! Re-send the watch->phone "add location" request (Pebble Protocol endpoint
+//! 6100) for every dictated custom location still missing coordinates. Call
+//! at app launch: delivery is best-effort, so this recovers requests lost
+//! while the phone was disconnected. The phone treats ADD idempotently.
+void saved_locations_send_pending_queries(void);
 int saved_locations_get_entries(SavedLocationEntry *entries,
                                 int max_entries,
                                 const char *current_location_label,

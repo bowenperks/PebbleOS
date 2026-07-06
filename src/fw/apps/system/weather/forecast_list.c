@@ -5,12 +5,15 @@
 #include "weather.h"
 #include "expanded_view.h"
 #include "applib/ui/app_window_stack.h"
+#include "applib/ui/status_bar_layer.h"   // status-bar height/offset constants (top time)
 #include "weather_math.h"
 #include "resource_ids.pin.h"
+#include "pbl/services/clock.h"            // clock_copy_time_string — notification-style top time
 #include "applib/graphics/gdraw_command_transforms.h"
 #include "applib/graphics/gdraw_command.h"
 #include "applib/graphics/gdraw_command_list.h"
 #include "applib/graphics/gdraw_command_image.h"
+#include "applib/graphics/gpath.h"          // octagonal animated-sun body (matches static PDC)
 #include "applib/applib_malloc.auto.h"
 #include "applib/ui/animation.h"
 #include "applib/ui/animation_interpolate.h"
@@ -146,6 +149,11 @@ typedef struct {
   int       fx_dot_y;                      // burst dot centre y (flies R5_DOT_REST_Y -> centre)
   int       fx_shake_dx, fx_shake_dy;      // stage-2 orbital shake offset from centre
   Animation *clock_anim;                   // separate from `anim` so the two never collide
+  // SELECT -> weather report transition: squash-left, ball roll-in, paper unfold.
+  int       report_fx;                     // 0 none, 1 squash-left, 2 ball roll, 3 unfold+hold
+  int       fx_ball_x;                     // ball centre x (rolls W+14 -> W/2, y = R5_SCREEN_CY)
+  AnimationProgress report_p;              // raw stage-3 progress (unfold_p = clip(p*6/5))
+  int32_t   report_angle;                  // frozen unfold fan start-ray (picked at stage-3 arm)
 #if !PBL_ROUND
   // ---- Return from clock (UP): the forecast jelly-drops in from above, mirroring the clock's
   // downward squash-stretch exit. Same whole-screen capture + two-moook-edge scale. Rect only
@@ -554,8 +562,12 @@ static void prv_canvas_draw_gabbro(Layer *layer, GContext *ctx) {
 #define R5_DOT_INNER    2     // inner white radius (hollow dot)
 #define R5_HAIRLINE_Y   PBL_IF_ROUND_ELSE(88, 80)   // hairline rule under today header
 #define R5_TODAY_X      PBL_IF_ROUND_ELSE(68, 18)   // today icon draw offset (emery left margin)
-#define R5_TODAY_Y      PBL_IF_ROUND_ELSE(26, 12)
-#define R5_DAYDATE_Y    PBL_IF_ROUND_ELSE(68, 58)   // day + date, below the today icon
+// Emery today icon/temp top pushed down to y=20 — the exact slot a notification puts its top
+// icon (STATUS_BAR_LAYER_HEIGHT 20 + CARD_ICON_UPPER_PADDING 0 on emery) — so the top clock has
+// the same clearance above the icon that a Gmail-style notification gives. Date row follows so
+// the header block stays clear of the moved icon and the hairline below it.
+#define R5_TODAY_Y      PBL_IF_ROUND_ELSE(26, 20)
+#define R5_DAYDATE_Y    PBL_IF_ROUND_ELSE(68, 62)   // day + date, below the today icon
 
 // DOWN/UP header transition travel (emery / !PBL_ROUND). HEADER_TRAVEL slides the today
 // header (icon/temp/date/condition/hairline) fully off the top; SECTION_TRAVEL lifts the
@@ -621,6 +633,8 @@ static Animation *prv_start_anim(uint32_t dur_ms, AnimationCurve curve,
 #define SQUASH_DROP_IN   1   // fall in from above   (returning from the clock)
 #define SQUASH_DOWN_EXIT 2   // swoosh down off-bottom (heading up to the expanded card)
 #define SQUASH_RISE_IN   3   // rise up from below   (returning from above)
+#define SQUASH_UP_EXIT   5   // clock-burst stage-1: jelly-stretch up off the top (= WEATHER_SQUASH_UP_EXIT)
+#define SQUASH_LEFT_EXIT 6   // select-exit stage-1: jelly-stretch off the LEFT (= WEATHER_SQUASH_LEFT_EXIT)
 
 // Entry squash armed by weather.c (0 = none) just before the covering window dismisses; consumed
 // by prv_window_appear so the very first revealed frame is already off-screen (no rest flash).
@@ -811,7 +825,18 @@ static void prv_start_clock_stage2(void);
 
 static void prv_clock_stage1_update(Animation *anim, AnimationProgress progress) {
   if (!s_list) return;
-  s_list->header_scroll = (int)prv_moook_soft3(progress, R5_HEADER_TRAVEL, R5_CLOCK_EXIT);
+#if !PBL_ROUND
+  if (s_list->squash_mode == SQUASH_UP_EXIT) {
+    // Squash path: the scene keeps drawing at the scrolled rest (header_scroll pinned at
+    // R5_HEADER_TRAVEL by prv_start_clock_stage1) and the whole frame — precip pill
+    // included — jelly-stretches up off the top in prv_render_squash_in.
+    s_list->squash_in_p = progress;
+  } else
+#endif
+  {
+    // Fallback (round / squash scratch OOM): plain translated exit, as before.
+    s_list->header_scroll = (int)prv_moook_soft3(progress, R5_HEADER_TRAVEL, R5_CLOCK_EXIT);
+  }
   // The dot eases cleanly into the centre (ease-out quad — NO moook anticipation dip or overshoot
   // wobble) so it lands exactly at the animation's end and the shake fires the instant it lands.
   const int32_t q = ANIMATION_NORMALIZED_MAX - (int32_t)progress;
@@ -821,9 +846,20 @@ static void prv_clock_stage1_update(Animation *anim, AnimationProgress progress)
   layer_mark_dirty(s_list->canvas);
 }
 
+#if !PBL_ROUND
+static void prv_clock_stage1_end_squash(void) {
+  if (s_list->squash_mode != SQUASH_UP_EXIT) return;
+  s_list->squash_mode = 0;
+  if (s_list->squash_scratch) { free(s_list->squash_scratch); s_list->squash_scratch = NULL; }
+}
+#endif
+
 static void prv_clock_stage1_stopped(Animation *anim, bool finished, void *context) {
   if (!s_list) return;
   s_list->clock_anim = NULL;
+#if !PBL_ROUND
+  prv_clock_stage1_end_squash();
+#endif
   if (!finished) {                                 // BACK cancelled — snap back to the scrolled screen
     s_list->clock_fx = 0;
     s_list->header_scroll = R5_HEADER_TRAVEL;
@@ -887,11 +923,290 @@ static void prv_start_clock_stage1(void) {
     animation_unschedule(old);
     animation_destroy(old);
   }
-  // 330ms — Timeline feel. Curve left at the create-time default (unchanged behaviour).
+#if !PBL_ROUND
+  // Whole-frame squash-stretch exit (Timeline jelly): the scene stays drawn at the scrolled
+  // rest and SQUASH_UP_EXIT sweeps it — precip pill and all — up off the top. On scratch
+  // OOM the update falls back to the plain translated exit.
+  if (!s_list->squash_mode && s_list->canvas) {
+    GRect bounds = layer_get_bounds(s_list->canvas);
+    s_list->squash_scratch = malloc_try((size_t)bounds.size.w * (size_t)bounds.size.h);
+    if (s_list->squash_scratch) {
+      s_list->squash_mode = SQUASH_UP_EXIT;
+      s_list->squash_in_p = 0;
+    }
+  }
+#endif
+  // 330ms — Timeline feel. LINEAR like every other squash driver: the jelly edges (and the
+  // fallback's moook) carry ALL the shaping, so the curve must not pre-ease the progress.
   s_list->clock_anim = prv_start_anim(interpolate_moook_soft_duration(3),
-                                      AnimationCurveDefault, &s_clock_stage1_impl,
+                                      AnimationCurveLinear, &s_clock_stage1_impl,
                                       prv_clock_stage1_stopped);
 }
+
+// ===================================================================================
+// SELECT -> weather report: squash-LEFT -> ball roll-in -> Timeline unfold -> hard cut.
+// Stage 1 jelly-squashes the whole frame off the left (the clock burst's grammar rotated
+// 90°); at 55% the SELECT nub's ball rolls in from the right edge to screen centre
+// (stage 2); the ball then becomes the newspaper: the WEATHER_REPORT_PAPER PDC plays the
+// Timeline day-separator unfold (stage 3) with "WEATHER REPORT" rising beneath, and the
+// report window hard-cuts in on the final frame.
+// ===================================================================================
+
+// SELECT-exit contract state — shared with the round/OOM fallback slide below, so these
+// three live OUTSIDE the rect gate.
+static Animation *s_select_exit_anim;
+static void (*s_select_exit_done)(void *ctx);
+static void *s_select_exit_ctx;
+
+#if WEATHER_ANIM_5DAY && !PBL_ROUND
+static Animation *s_report_anim;               // stages 2-4 (stage 2 overlaps stage 1's tail)
+#define R5_REPORT_BALL_R      13                                  // = the SELECT nub's radius
+// The SELECT nub is fill_oval(GRect(W-5, (H-26)/2, 26, 26)) — a r13 circle centred at
+// x = W + 8. The ball starts EXACTLY there, so the indicator visibly becomes the ball.
+#define R5_REPORT_BALL_X0(W)  ((W) + 8)
+#define R5_REPORT_BALL_START  (ANIMATION_NORMALIZED_MAX * 40 / 100)
+#define R5_REPORT_BALL_MS     200
+// Stage 3: 1000ms total, matching Timeline's day separator exactly — DAY_SEP_TIMEOUT_MS
+// (timeline.c:570) starts when the separator APPEARS, so the 500ms unfold plays inside
+// the second and the settled paper holds the remainder.
+#define R5_REPORT_SHOW_MS     1000
+
+static void prv_start_report_stage2(void);
+static void prv_start_report_stage3(void);
+static void prv_start_report_stage4(void);
+static void prv_report_stage4_stopped(Animation *anim, bool finished, void *context);
+
+// Stage 1: drives the squash-left + spawns the overlapping ball once the frame has
+// mostly cleared.
+static void prv_report_stage1_update(Animation *anim, AnimationProgress progress) {
+  (void)anim;
+  if (!s_list) return;
+  s_list->squash_in_p = progress;
+  if (s_list->report_fx == 1 && progress >= R5_REPORT_BALL_START) {
+    prv_start_report_stage2();   // overlap: the ball rolls in while the squash tail clears
+  }
+  layer_mark_dirty(s_list->canvas);
+}
+
+static void prv_report_stage1_stopped(Animation *anim, bool finished, void *context) {
+  (void)anim; (void)context;
+  s_select_exit_anim = NULL;
+  if (!s_list) return;
+  if (s_list->squash_mode == SQUASH_LEFT_EXIT) {   // free scratch on finish AND cancel
+    s_list->squash_mode = 0;
+    if (s_list->squash_scratch) { free(s_list->squash_scratch); s_list->squash_scratch = NULL; }
+  }
+  if (!finished) {   // only unload cancels (inputs are guarded)
+    s_list->report_fx = 0;
+    layer_mark_dirty(s_list->canvas);
+    return;
+  }
+  if (s_list->report_fx == 1) prv_start_report_stage2();   // threshold missed (paranoia)
+}
+static const AnimationImplementation s_report_stage1_impl = { .update = prv_report_stage1_update };
+
+// Stage 2: the ball. Burst-dot grammar — clean ease-out-quad, no bounce (the unfold's
+// deflate overshoot supplies the landing energy; a ball bounce would double-bounce).
+static void prv_report_stage2_update(Animation *anim, AnimationProgress progress) {
+  (void)anim;
+  if (!s_list) return;
+  const int W = layer_get_bounds(s_list->canvas).size.w;
+  const int x0 = R5_REPORT_BALL_X0(W), x1 = W / 2;
+  const int32_t q = ANIMATION_NORMALIZED_MAX - (int32_t)progress;
+  const int32_t eased =
+      ANIMATION_NORMALIZED_MAX - (int32_t)((int64_t)q * q / ANIMATION_NORMALIZED_MAX);
+  s_list->fx_ball_x = x0 + (x1 - x0) * (int)eased / ANIMATION_NORMALIZED_MAX;
+  layer_mark_dirty(s_list->canvas);
+}
+
+static void prv_report_stage2_stopped(Animation *anim, bool finished, void *context) {
+  (void)anim; (void)context;
+  s_report_anim = NULL;
+  if (!s_list) return;
+  if (!finished) { s_list->report_fx = 0; layer_mark_dirty(s_list->canvas); return; }
+  s_list->fx_ball_x = layer_get_bounds(s_list->canvas).size.w / 2;   // parked at centre
+  prv_start_report_stage3();
+}
+static const AnimationImplementation s_report_stage2_impl = { .update = prv_report_stage2_update };
+
+static void prv_start_report_stage2(void) {
+  if (!s_list || s_report_anim) return;
+  s_list->report_fx = 2;
+  s_list->fx_ball_x = R5_REPORT_BALL_X0(layer_get_bounds(s_list->canvas).size.w);
+  s_report_anim = prv_start_anim(R5_REPORT_BALL_MS, AnimationCurveLinear,
+                                 &s_report_stage2_impl, prv_report_stage2_stopped);
+}
+
+// Stage 3: the unfold + the day-separator-length hold.
+static void prv_report_stage3_update(Animation *anim, AnimationProgress progress) {
+  (void)anim;
+  if (!s_list) return;
+  s_list->report_p = progress;
+  layer_mark_dirty(s_list->canvas);
+}
+
+static void prv_report_stage3_stopped(Animation *anim, bool finished, void *context) {
+  (void)anim; (void)context;
+  s_report_anim = NULL;
+  if (!s_list) return;
+  if (!finished) {   // only unload cancels; it clears the done cb + fly itself
+    s_list->report_fx = 0;
+    prv_clear_fly();
+    layer_mark_dirty(s_list->canvas);
+    return;
+  }
+  prv_start_report_stage4();   // the paper takes its bow: squash-stretch off the left
+}
+static const AnimationImplementation s_report_stage3_impl = { .update = prv_report_stage3_update };
+
+static void prv_start_report_stage3(void) {
+  s_list->report_fx = 3;
+  s_list->report_p  = 0;
+  prv_clear_fly();   // the fly slot carries the paper clone + fan lookup (idempotent)
+  GDrawCommandImage *raw =
+      gdraw_command_image_create_with_resource(RESOURCE_ID_WEATHER_REPORT_PAPER);
+  s_list->fly_pdc = raw ? gdraw_command_image_clone(raw) : NULL;   // flash PDC is read-only
+  if (raw) gdraw_command_image_destroy(raw);
+  // Frozen fan start-ray (Timeline picks a random ray per unfold; RTC seconds vary plenty).
+  s_list->report_angle = (int32_t)(rtc_get_time() % TRIG_MAX_ANGLE);
+  if (!s_list->fly_pdc) {   // resource missing: skip straight to the handoff
+    prv_report_stage4_stopped(NULL, true, NULL);
+    return;
+  }
+  s_report_anim = prv_start_anim(R5_REPORT_SHOW_MS, AnimationCurveLinear,
+                                 &s_report_stage3_impl, prv_report_stage3_stopped);
+}
+
+// Stage 4: the unfolded paper + caption jelly-squash off the LEFT (same mode as stage 1 —
+// the scene draws them at rest and the squash pass warps the whole frame), then the done
+// cb fires in the same call stack: weather.c arms the report's squash-in-from-the-right.
+static void prv_report_stage4_update(Animation *anim, AnimationProgress progress) {
+  (void)anim;
+  if (!s_list) return;
+  s_list->squash_in_p = progress;
+  layer_mark_dirty(s_list->canvas);
+}
+
+static void prv_report_stage4_stopped(Animation *anim, bool finished, void *context) {
+  (void)anim; (void)context;
+  s_report_anim = NULL;
+  if (!s_list) return;
+  if (s_list->squash_mode == SQUASH_LEFT_EXIT) {
+    s_list->squash_mode = 0;
+    if (s_list->squash_scratch) { free(s_list->squash_scratch); s_list->squash_scratch = NULL; }
+  }
+  s_list->report_fx = 0;
+  prv_clear_fly();
+  void (*done)(void *) = s_select_exit_done;
+  void *dctx = s_select_exit_ctx;
+  s_select_exit_done = NULL;
+  s_select_exit_ctx  = NULL;
+  if (finished && done) done(dctx);   // -> weather.c: arm the report's squash-in + push
+  layer_mark_dirty(s_list->canvas);
+}
+static const AnimationImplementation s_report_stage4_impl = { .update = prv_report_stage4_update };
+
+static void prv_start_report_stage4(void) {
+  s_list->report_fx = 4;
+  s_list->report_p  = ANIMATION_NORMALIZED_MAX;   // paper drawn fully at rest beneath the squash
+  if (!s_list->squash_mode && s_list->canvas) {
+    GRect b = layer_get_bounds(s_list->canvas);
+    s_list->squash_scratch = malloc_try((size_t)b.size.w * (size_t)b.size.h);
+    if (s_list->squash_scratch) {
+      s_list->squash_mode = SQUASH_LEFT_EXIT;
+      s_list->squash_in_p = 0;
+    }
+  }
+  if (s_list->squash_mode != SQUASH_LEFT_EXIT) {   // scratch OOM: skip the exit flourish
+    prv_report_stage4_stopped(NULL, true, NULL);
+    return;
+  }
+  s_report_anim = prv_start_anim(240, AnimationCurveLinear,   // hasted soft-moook: snappy exit
+                                 &s_report_stage4_impl, prv_report_stage4_stopped);
+}
+
+// The rolling ball: a black disc with a white notch orbiting at rolling-without-slipping
+// speed (leftward travel = counter-clockwise spin; circumference 2*pi*13 ~= 82px).
+static void prv_draw_report_ball(GContext *ctx) {
+  const GRect mb = layer_get_bounds(s_list->canvas);
+  const int cx = s_list->fx_ball_x, cy = R5_SCREEN_CY;
+  graphics_context_set_fill_color(ctx, GColorBlack);
+  graphics_fill_circle(ctx, GPoint(cx, cy), R5_REPORT_BALL_R);
+  const int32_t a = -(int32_t)(mb.size.w + R5_REPORT_BALL_R + 1 - cx) * (TRIG_MAX_ANGLE / 82);
+  graphics_context_set_fill_color(ctx, GColorWhite);
+  graphics_fill_circle(ctx, GPoint(cx + (int)((int32_t)sin_lookup(a) * 7 / TRIG_MAX_RATIO),
+                                   cy - (int)((int32_t)cos_lookup(a) * 7 / TRIG_MAX_RATIO)), 3);
+}
+
+// Timeline day-separator unfold, hand-rolled in the prv_draw_flying_icon idiom (clone per
+// frame from the pristine fly_pdc; angle-fan lookup built once): collapse-at-centre ->
+// deflate-8 intermediate -> rest, 3 clockwise delay groups, fat stroke decaying from the
+// ball's diameter over the first quarter so the dot IS the paper's first frame.
+static void prv_draw_unfolding_paper(GContext *ctx) {
+  if (!s_list->fly_pdc) return;
+  GDrawCommandImage *clone = gdraw_command_image_clone(s_list->fly_pdc);
+  if (!clone) return;
+  GDrawCommandList *list = gdraw_command_image_get_command_list(clone);
+  if (!list) { gdraw_command_image_destroy(clone); return; }
+  const GSize nsz = gdraw_command_image_get_bounds_size(clone);       // 80x80
+  if (!s_list->fly_lookup) {                                          // pristine geometry: cache
+    GPointIndexLookup *lu = gdraw_command_list_create_index_lookup_by_angle(
+        list, GPoint(nsz.w / 2, nsz.h / 2), s_list->report_angle);
+    if (!lu) { gdraw_command_image_destroy(clone); return; }
+    gpoint_index_lookup_set_groups(lu, 3, Fixed_S32_16(3 * FIXED_S32_16_ONE.raw_value / 2));
+    s_list->fly_lookup = lu;
+  }
+  AnimationProgress up = (AnimationProgress)((int64_t)s_list->report_p * 2);   // unfold done
+  if (up > ANIMATION_NORMALIZED_MAX) up = ANIMATION_NORMALIZED_MAX;   // at 500/1000ms, then hold
+  const GRect mb = layer_get_bounds(s_list->canvas);
+  const GPoint origin = GPoint((mb.size.w - nsz.w) / 2, R5_SCREEN_CY - nsz.h / 2);
+  if (4 * up < ANIMATION_NORMALIZED_MAX) {   // dot phase: keep the ball UNDER the fat stroke
+    graphics_context_set_fill_color(ctx, GColorBlack);
+    graphics_fill_circle(ctx, GPoint(mb.size.w / 2, R5_SCREEN_CY), R5_REPORT_BALL_R);
+  }
+  const GRect to   = GRect(0, 0, nsz.w, nsz.h);
+  const GRect from = GRect(nsz.w / 2, nsz.h / 2, 0, 0);   // collapsed dot at centre = the ball
+  const Fixed_S32_16 point_dur  = Fixed_S32_16(FIXED_S32_16_ONE.raw_value / 6);
+  const Fixed_S32_16 effect_dur = Fixed_S32_16(3 * FIXED_S32_16_ONE.raw_value / 4);
+  GRect intermediate = grect_scalar_expand(to, 8);        // deflate 8, no bounce (day-sep exact)
+  GSize size = nsz;
+  AnimationProgress seg = animation_timing_segmented(up, 0, 2, effect_dur);
+  gdraw_command_list_scale_segmented_to(list, size, from, intermediate, seg,
+                                        NULL, s_list->fly_lookup, point_dur, false);
+  size = intermediate.size;
+  seg = animation_timing_segmented(up, 1, 2, effect_dur);
+  gdraw_command_list_scale_segmented_to(list, size, intermediate, to, seg,
+                                        NULL, s_list->fly_lookup, point_dur, true);
+  const AnimationProgress sw = animation_timing_curve(
+      animation_timing_clip(4 * up), AnimationCurveEaseInOut);   // fat stroke decays, first 25%
+  gdraw_command_list_scale_stroke_width(list,
+      Fixed_S16_3((2 * R5_REPORT_BALL_R) << FIXED_S16_3_PRECISION), FIXED_S16_3_ONE,
+      GStrokeWidthOpSet, GStrokeWidthOpMultiply, sw);
+  gdraw_command_image_draw(ctx, clone, origin);
+  gdraw_command_image_destroy(clone);
+}
+
+// "WEATHER REPORT" rises in under the paper, landing with the fan's last delay group.
+static void prv_draw_report_caption(GContext *ctx) {
+  AnimationProgress up = (AnimationProgress)((int64_t)s_list->report_p * 2);   // unfold-relative
+  if (up > ANIMATION_NORMALIZED_MAX) up = ANIMATION_NORMALIZED_MAX;
+  const AnimationProgress start = ANIMATION_NORMALIZED_MAX * 3 / 5;
+  if (up < start) return;
+  int dy = 0;   // 6px ease-out-quad rise over up in [0.6, 0.96]
+  if (up < ANIMATION_NORMALIZED_MAX * 24 / 25) {
+    int32_t t = (int32_t)((int64_t)(up - start) * ANIMATION_NORMALIZED_MAX
+                          / (ANIMATION_NORMALIZED_MAX * 9 / 25));
+    if (t > ANIMATION_NORMALIZED_MAX) t = ANIMATION_NORMALIZED_MAX;
+    const int32_t q = ANIMATION_NORMALIZED_MAX - t;
+    dy = (int)(6 * ((int64_t)q * q / ANIMATION_NORMALIZED_MAX) / ANIMATION_NORMALIZED_MAX);
+  }
+  const GRect mb = layer_get_bounds(s_list->canvas);
+  graphics_context_set_text_color(ctx, GColorBlack);
+  graphics_draw_text(ctx, "WEATHER REPORT", fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
+                     GRect(0, R5_SCREEN_CY + 46 + dy, mb.size.w, 24),
+                     GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
+}
+#endif  // WEATHER_ANIM_5DAY && !PBL_ROUND
 
 // ===================================================================================
 // Timeline up/down icon transition: a real TRAVEL scale-segment (NOT an in-place squash).
@@ -1130,20 +1445,18 @@ static void prv_draw_bottom_stats(GContext *ctx, const WeatherLocationForecast *
                                   const int *col_x, int W) {
   if (s_list->header_scroll <= 0) return;   // hidden until the gap starts opening
   const int slide = R5_HEADER_TRAVEL - s_list->header_scroll;  // off the bottom at A, in-gap at B
-  if (!s_list->clock_fx) {   // hide the precip banner during the clock burst — only the dot stays
-    prv_draw_stat_pill(ctx, "PRECIPITATION", 143 + slide, W, GColorPictonBlue);
-    prv_draw_stat_row (ctx, fan, n, col_x,   162 + slide);
-  }
-  // Timeline's day-separator peek dot (the one that unwinds into "Tomorrow"/"Tuesday"): a 12px
-  // black circle, horizontally centred, the same 30px above the bottom edge as Timeline. On emery
-  // (>=200px height -> s_style_large) its centre lands at y = future_top_margin(7) + fat_pin(131) +
-  // future_dot_offset(16) + thin_pin(88)/2 = 198 on the 228px screen.
-  graphics_context_set_fill_color(ctx, GColorBlack);
-  if (s_list->clock_fx) {
-    // burst transition: the dot has decoupled — fly to centre (stage 1) / orbital-shake (stage 2)
-    graphics_fill_circle(ctx, GPoint(W / 2 + s_list->fx_shake_dx,
-                                     s_list->fx_dot_y + s_list->fx_shake_dy), 6);
-  } else {
+  // The precip banner rides `slide` like everything else, INCLUDING during the clock burst:
+  // stage 1 squashes the whole drawn frame up off the top (SQUASH_UP_EXIT), so the pill must
+  // stay in the frame to exit with it; in stage 2 (header_scroll = R5_CLOCK_EXIT) slide puts
+  // it far off-screen. The burst dot is decoupled — drawn AFTER the squash in prv_canvas_draw.
+  prv_draw_stat_pill(ctx, "PRECIPITATION", 143 + slide, W, GColorPictonBlue);
+  prv_draw_stat_row (ctx, fan, n, col_x,   162 + slide);
+  if (!s_list->clock_fx) {
+    // Timeline's day-separator peek dot (the one that unwinds into "Tomorrow"/"Tuesday"): a 12px
+    // black circle, horizontally centred, the same 30px above the bottom edge as Timeline. On emery
+    // (>=200px height -> s_style_large) its centre lands at y = future_top_margin(7) + fat_pin(131) +
+    // future_dot_offset(16) + thin_pin(88)/2 = 198 on the 228px screen.
+    graphics_context_set_fill_color(ctx, GColorBlack);
     graphics_fill_circle(ctx, GPoint(W / 2, R5_DOT_REST_Y + slide), 6);
   }
 }
@@ -1184,16 +1497,41 @@ static void prv_draw_bottom_stats(GContext *ctx, const WeatherLocationForecast *
 #define R5_ICON_SLIDE      14    // px the icon travels during the fade transition
 #define R5_FADE_LEVELS     4     // dither steps for the cross-fade
 
+// Set to 1 to render the animated weather bitmaps (rain streaks, snow flakes, sun body +
+// rays) in monochrome black instead of their per-condition colours. Flip to 0 to restore the
+// original palette — the source colours live untouched in the PrecipStyle structs + the #else
+// branches here, so this one toggle is the whole revert. (Clouds are the official PDC art and
+// are unaffected either way.)
+#define WEATHER_ANIM_MONO_BLACK 1
+
+// Filled flat-top regular octagon centred at `c`, apothem `a` (centre→flat-edge). Matches the
+// static sun PDC's body (Pebble_80x80_Sunny_day: verts at (±d,±a)/(±a,±d), d = a·tan22.5°) so
+// the animated sun reads as the same jagged octagon rather than a circle.
+static void prv_fill_octagon(GContext *ctx, GPoint c, int a, GColor col) {
+  if (a < 1) return;
+  const int d = (a * 41 + 50) / 100;   // corner offset ≈ a·tan(22.5°) ≈ 0.414a
+  GPoint pts[8] = {
+    {-d, -a}, {-a, -d}, {-a, d}, {-d, a}, {d, a}, {a, d}, {a, -d}, {d, -a},
+  };
+  GPath p = { .num_points = 8, .points = pts, .offset = c };
+  graphics_context_set_fill_color(ctx, col);
+  gpath_draw_filled(ctx, &p);
+}
+
 static void prv_draw_animated_sun(GContext *ctx, GPoint c, int32_t phase,
                                   int body_r, int ray_inner, int ray_min, int ray_max) {
+#if WEATHER_ANIM_MONO_BLACK
+  const GColor sun_color = GColorBlack;
+#else
   // Warm yellow-orange = the partly-cloudy disc colour on this screen (not pure red
   // orange). Pulled from the same source so it matches exactly. This icon only.
   const GColor sun_color = prv_weather_bg_color(WeatherType_PartlyCloudy);
+#endif
   graphics_context_set_antialiased(ctx, true);
-  graphics_context_set_fill_color(ctx, sun_color);
-  graphics_fill_circle(ctx, c, body_r + 1);
-  graphics_context_set_fill_color(ctx, GColorWhite);
-  graphics_fill_circle(ctx, c, body_r - 1);
+  // Octagonal body (white fill + a 1px-ish outline ring) instead of a circle, matching the
+  // static sun PDC. Outer octagon = sun_color, inner = white → the ring is the outline.
+  prv_fill_octagon(ctx, c, body_r + 1, sun_color);
+  prv_fill_octagon(ctx, c, body_r - 1, GColorWhite);
   // Rays: each orbits clockwise; length depends only on its current angle.
   graphics_context_set_stroke_color(ctx, sun_color);
   graphics_context_set_stroke_width(ctx, 2);
@@ -1376,6 +1714,15 @@ static void prv_draw_flake(GContext *ctx, GPoint c, int r) {
 
 static void prv_draw_animated_precip(GContext *ctx, GPoint pdc_offset, int32_t phase,
                                      const PrecipStyle *st) {
+#if WEATHER_ANIM_MONO_BLACK
+  // Snow + heavy snow fall as WHITE flakes (crisp on the blue banner under the dark cloud);
+  // rain/storm/sleet stay black. Pointer-compare the two snow styles (defined just above).
+  const bool white_flakes = (st == &kLightSnowStyle || st == &kHeavySnowStyle);
+  const GColor main_col = white_flakes ? GColorWhite : GColorBlack;
+  const GColor pale_col = main_col;
+#else
+  const GColor main_col = st->main_col, pale_col = st->pale_col;
+#endif
   // phase is the sun-angle accumulator -> back to a tick count (sun-speed independent).
   const int tick = phase / R5_SUN_ANGLE_STEP;
   const int32_t ay = (int32_t)(tick % st->bob_ticks) * (TRIG_MAX_ANGLE / st->bob_ticks);
@@ -1391,7 +1738,7 @@ static void prv_draw_animated_precip(GContext *ctx, GPoint pdc_offset, int32_t p
   const int cx    = pdc_offset.x + R5_TODAY_ICON / 2;
   graphics_context_set_antialiased(ctx, true);
   graphics_context_set_stroke_width(ctx, st->snow ? 1 : 2);
-  if (st->snow) graphics_context_set_stroke_color(ctx, st->main_col);
+  if (st->snow) graphics_context_set_stroke_color(ctx, main_col);
   for (int i = 0; i < st->n_drops; i++) {
     const RainDrop *d = &st->drops[i];
     const int prog = ((tick * d->spd) / 10 + d->off) % range;
@@ -1414,7 +1761,7 @@ static void prv_draw_animated_precip(GContext *ctx, GPoint pdc_offset, int32_t p
         len = R5_RAIN_LEN;
       }
       len = R5_FADE(len);
-      const GColor col = (prog < 2 || prog >= range - 2) ? st->pale_col : st->main_col;
+      const GColor col = (prog < 2 || prog >= range - 2) ? pale_col : main_col;
       graphics_context_set_stroke_color(ctx, col);
       const int head_x = cx + d->dx - prog * st->slant / 16;
       const int tail_x = head_x + len * st->slant / 16;
@@ -1461,10 +1808,12 @@ static void prv_draw_today_anim(GContext *ctx, const WeatherLocationForecast *to
   }
 }
 
-// Dither-erase part of a rectangle to white, simulating a stepped fade — the same
+// Dither-erase part of a rectangle to `bg`, simulating a stepped fade — the same
 // no-alpha technique the clock screen uses for its weather bitmaps. keep: 0 (gone) ..
-// R5_FADE_LEVELS (fully opaque). Operates directly on the framebuffer.
-static void prv_fade_erase(GContext *ctx, GRect r, int keep) {
+// R5_FADE_LEVELS (fully opaque). `bg` is the surface the icon fades into: the blue banner
+// on emery, white on round — erasing to the wrong colour paints a visible box. Operates
+// directly on the framebuffer.
+static void prv_fade_erase(GContext *ctx, GRect r, int keep, GColor bg) {
   if (keep >= R5_FADE_LEVELS) return;   // fully opaque — nothing to erase
   static const uint8_t bayer[4][4] = {
     {  0,  8,  2, 10 }, { 12,  4, 14,  6 }, {  3, 11,  1,  9 }, { 15,  7, 13,  5 },
@@ -1479,13 +1828,12 @@ static void prv_fade_erase(GContext *ctx, GRect r, int keep) {
     for (int x = r.origin.x; x < r.origin.x + r.size.w; x++) {
       if (x < (int)ri.min_x || x > (int)ri.max_x) continue;
       if (bayer[y & 3][x & 3] >= thr) {
-        ri.data[x] = GColorWhite.argb;
+        ri.data[x] = bg.argb;
       }
     }
   }
   graphics_release_frame_buffer(ctx, fb);
 }
-
 
 // Connector polyline for one masked series (skip segments touching an unknown value).
 static void prv_draw_series_links(GContext *ctx, const int *colx, const int *y,
@@ -1547,6 +1895,43 @@ static void prv_canvas_draw_round_5day(Layer *layer, GContext *ctx) {
 
   int total = (int)s_list->num_days;
   if (total <= 0) return;
+#if !PBL_ROUND
+  // Blue "today" banner: fill the header region (screen top → hairline) with the same
+  // PictonBlue as the precipitation pill. It collapses upward with the header scroll — the
+  // bottom edge tracks the hairline (R5_HAIRLINE_Y - hs) — so the today content slides up and
+  // vanishes behind it. White header text + a white disc behind the today icon (both below)
+  // keep everything legible on the blue field.
+  {
+    const int band_bottom = R5_HAIRLINE_Y - hs;
+    if (band_bottom > 0) {
+      graphics_context_set_fill_color(ctx, GColorPictonBlue);
+      graphics_fill_rect(ctx, GRect(0, 0, W, band_bottom), 0, GCornerNone);
+    }
+  }
+  // Current time at the very top, drawn exactly like the notification status-bar clock
+  // (StatusBarLayerModeClock, status_bar_layer.c): white, centred, FONT_KEY_GOTHIC_18, and
+  // bottom-aligned within the STATUS_BAR_LAYER_HEIGHT (20px on emery) band minus its 2px
+  // separator padding. clock_copy_time_string is the same helper notifications use (same
+  // 12/24h format). It rides the header scroll (- hs) so it collapses up with the banner.
+  // Cached per wall-clock minute: a per-frame localtime+strftime would starve the touch task
+  // (see the day/date cache below), so refresh only when the minute changes.
+  {
+    static char s_time_str[16];
+    static time_t s_time_min = -1;
+    const time_t cur_min = time(NULL) / 60;
+    if (cur_min != s_time_min) {
+      clock_copy_time_string(s_time_str, sizeof(s_time_str));
+      s_time_min = cur_min;
+    }
+    GFont sb_font = fonts_get_system_font(FONT_KEY_GOTHIC_18);
+    const int sb_fh = fonts_get_font_height(sb_font);
+    const int sb_ty = (STATUS_BAR_LAYER_HEIGHT - 2 * STATUS_BAR_LAYER_SEPARATOR_Y_OFFSET - sb_fh)
+                      - hs;
+    graphics_context_set_text_color(ctx, GColorWhite);
+    graphics_draw_text(ctx, s_time_str, sb_font, GRect(0, sb_ty, W, sb_fh),
+                       GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
+  }
+#endif
   int n = total - 1;                  // fan columns — today headlines the block above
   if (n > R5_MAX_COLS) n = R5_MAX_COLS;
   if (n < 0) n = 0;
@@ -1656,27 +2041,29 @@ static void prv_canvas_draw_round_5day(Layer *layer, GContext *ctx) {
     }
   } else {
     // Two-phase, NON-overlapping transition (mirrors the clock screen). First half: the
-    // colour animation drops down + dither-fades out, reaching fully WHITE by the midpoint.
-    // Second half: from that blank frame, the static icon rises up into position + fades in.
+    // colour animation drops down + dither-fades out into the banner. Second half: from that
+    // blank frame, the static icon rises up into position + fades in. The dither erases to
+    // the banner colour (blue on emery) so only the bitmap fades — no white box on the blue.
+    const GColor icon_bg = PBL_IF_ROUND_ELSE(GColorWhite, GColorPictonBlue);
     const int half = R5_FADE_MAX / 2;
     if (fade > half) {
-      // Outgoing colour animation: drop down + fade out to white.
+      // Outgoing colour animation: drop down + fade out into the banner.
       const int prog = R5_FADE_MAX - fade;                          // 1 → half
       const int drop = R5_ICON_SLIDE * prog / half;                 // 0 → full drop
-      const int keep_out = (fade - half) * R5_FADE_LEVELS / half;   // opaque → gone (white)
+      const int keep_out = (fade - half) * R5_FADE_LEVELS / half;   // opaque → gone
       prv_draw_today_anim(ctx, today, today_x, R5_TODAY_Y - hs + drop);
       // Erase wider than the 40px box: the cloud art (and the two-cloud cloudy float) spills
       // past the icon edges, so a tight rect would leave its far sides un-faded.
       prv_fade_erase(ctx, GRect(today_x - 10, R5_TODAY_Y - hs + drop, R5_TODAY_ICON + 20,
-                                R5_TODAY_ICON + 8), keep_out);
+                                R5_TODAY_ICON + 8), keep_out, icon_bg);
     } else if (s_list->today_pdc) {
       // Incoming static icon: rise up from below + fade in (blank at the midpoint).
       const int prog = half - fade;                                 // 0 → half
       const int rise = R5_ICON_SLIDE * fade / half;                 // full below → 0
-      const int keep_in = prog * R5_FADE_LEVELS / half;             // gone (white) → opaque
+      const int keep_in = prog * R5_FADE_LEVELS / half;             // gone → opaque
       gdraw_command_image_draw(ctx, s_list->today_pdc, GPoint(today_x, R5_TODAY_Y - hs + rise));
       prv_fade_erase(ctx, GRect(today_x - 10, R5_TODAY_Y - hs + rise, R5_TODAY_ICON + 20,
-                                R5_TODAY_ICON), keep_in);
+                                R5_TODAY_ICON), keep_in, icon_bg);
     }
   }
   char tnow[16];
@@ -1685,19 +2072,20 @@ static void prv_canvas_draw_round_5day(Layer *layer, GContext *ctx) {
   } else {
     snprintf(tnow, sizeof(tnow), "--\xC2\xB0");
   }
-  graphics_context_set_text_color(ctx, GColorBlack);
   // Large temp, sized + vertically aligned to balance the 40px today icon.
 #if PBL_ROUND
+  graphics_context_set_text_color(ctx, GColorBlack);
   graphics_draw_text(ctx, tnow, fonts_get_system_font(FONT_KEY_LECO_36_BOLD_NUMBERS),
       GRect(112, 22, 120, 44),
       GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
 #else
-  // Emery: mirror the today icon — right-align the temp to a right margin equal to the
-  // icon's left margin (R5_TODAY_X) and centre it on the icon's vertical centre
-  // (icon centre ≈ R5_TODAY_Y + R5_TODAY_ICON/2). This makes the pair read as balanced.
+  // Emery: FLAT white LECO on the blue — the same treatment as every other element on
+  // this banner (time, condition, date) and the Timeline card's own big-number grammar.
+  // Right margin equals the icon's left margin (R5_TODAY_X).
+  graphics_context_set_text_color(ctx, GColorWhite);
   graphics_draw_text(ctx, tnow, fonts_get_system_font(FONT_KEY_LECO_36_BOLD_NUMBERS),
-      GRect(W / 2, R5_TODAY_Y - 2 - hs, W / 2 - R5_TODAY_X, 40),  // -2 optical rise: LECO has no
-      GTextOverflowModeTrailingEllipsis, GTextAlignmentRight, NULL);  // descenders, parks low
+      GRect(W - R5_TODAY_X - 120, R5_TODAY_Y - 2 - hs, 120, 44),   // -2: LECO parks low
+      GTextOverflowModeTrailingEllipsis, GTextAlignmentRight, NULL);
 #endif
   char cond[24];
   snprintf(cond, sizeof(cond), "%s",
@@ -1706,7 +2094,7 @@ static void prv_canvas_draw_round_5day(Layer *layer, GContext *ctx) {
   // Title-case (e.g. "Partly Cloudy") — Pebble reserves ALL CAPS for terse labels/units.
   // Condition matches the date: same font/size/weight, same baseline (date is on
   // the left under the icon, condition on the right under the temp).
-  graphics_context_set_text_color(ctx, GColorBlack);
+  graphics_context_set_text_color(ctx, PBL_IF_ROUND_ELSE(GColorBlack, GColorWhite));
   // Condition: right-anchored at x=230 (mirrors the left date, aligned to the fan's
   // 30/230 columns), growing LEFT as it lengthens down to x=110 (just clear of the
   // date). Length-dependent: measure the phrase + step the font down one size if even
@@ -1716,7 +2104,7 @@ static void prv_canvas_draw_round_5day(Layer *layer, GContext *ctx) {
   graphics_draw_text(ctx, cond, cond_font,
       GRect(cond_l, R5_DAYDATE_Y - hs, cond_r - cond_l, 16),
       GTextOverflowModeTrailingEllipsis, GTextAlignmentRight, NULL);
-  graphics_context_set_text_color(ctx, GColorBlack);
+  graphics_context_set_text_color(ctx, PBL_IF_ROUND_ELSE(GColorBlack, GColorWhite));
   // Date: left box, left-aligned (the today icon above is centred over this string).
   graphics_draw_text(ctx, daydate, day_font,   // day_font IS GOTHIC_14_BOLD — no re-lookup
       GRect(PBL_IF_ROUND_ELSE(30, R5_TODAY_X), R5_DAYDATE_Y - hs,
@@ -1951,6 +2339,24 @@ static void prv_canvas_draw(Layer *layer, GContext *ctx) {
   return;
 #endif
 #if WEATHER_ANIM_5DAY
+#if !PBL_ROUND
+  if (s_list->report_fx == 4) {
+    // Stage 4 — the paper's bow: white card + paper/caption at rest, then the whole
+    // frame jelly-squashes off the left (capture must run AFTER the paper is drawn).
+    graphics_context_set_fill_color(ctx, GColorWhite);
+    graphics_fill_rect(ctx, layer_get_bounds(layer), 0, GCornerNone);
+    prv_draw_unfolding_paper(ctx);
+    prv_draw_report_caption(ctx);
+    prv_render_squash_in(ctx);
+    return;
+  }
+  if (s_list->report_fx >= 2 && !s_list->squash_mode) {
+    // Report scene, content cleared off-left: a pure-white title-card backdrop (matches the
+    // squash memset and the report window bg — seamless at both cuts).
+    graphics_context_set_fill_color(ctx, GColorWhite);
+    graphics_fill_rect(ctx, layer_get_bounds(layer), 0, GCornerNone);
+  } else
+#endif
   prv_canvas_draw_round_5day(layer, ctx);
 #if !PBL_ROUND
   // Pebble-Health "select" marker: a half-circle nub on the centre-right edge identifying the
@@ -1958,7 +2364,8 @@ static void prv_canvas_draw(Layer *layer, GContext *ctx) {
   // so it only protrudes ~5px (origin.x = W - protrusion) — shallow enough to clear the right-hand
   // weather disc. Only on the resting main view — hidden during any transition so it never gets
   // captured into the jelly/squash.
-  if (s_list->header_shown && !s_list->fx_active && !s_list->clock_fx && !s_list->squash_mode) {
+  if (s_list->header_shown && !s_list->fx_active && !s_list->clock_fx && !s_list->squash_mode &&
+      !s_list->report_fx) {
     const int protrusion = 5;
     GRect mb = layer_get_bounds(layer);
     graphics_context_set_fill_color(ctx, GColorBlack);
@@ -1966,6 +2373,23 @@ static void prv_canvas_draw(Layer *layer, GContext *ctx) {
                        GOvalScaleModeFitCircle);
   }
   if (s_list->squash_mode) prv_render_squash_in(ctx);
+  if (s_list->clock_fx) {
+    // Burst dot: decoupled from the content — drawn AFTER the squash so it flies to centre
+    // (stage 1) / orbital-shakes (stage 2) crisply while the frame jelly-stretches off the top.
+    GRect mb = layer_get_bounds(layer);
+    graphics_context_set_fill_color(ctx, GColorBlack);
+    graphics_fill_circle(ctx, GPoint(mb.size.w / 2 + s_list->fx_shake_dx,
+                                     s_list->fx_dot_y + s_list->fx_shake_dy), 6);
+  }
+  // Report scene: the ball (parked on the nub's spot during stage 1, rolling in stage 2)
+  // and the unfolding paper + caption (stage 3), drawn after the squash like the burst
+  // dot so they ride crisply over the clearing frame.
+  if (s_list->report_fx == 1 || s_list->report_fx == 2) {
+    prv_draw_report_ball(ctx);
+  } else if (s_list->report_fx == 3) {
+    prv_draw_unfolding_paper(ctx);
+    prv_draw_report_caption(ctx);
+  }
   // Hero icon-fly + the card's glance text ride ON TOP of the squashed screen (both excluded from
   // the squash), landing together as the mainscreen clears. On the reverse fly (card -> forecast,
   // riding the RISE_IN) only the icon flies — there is no incoming card text.
@@ -2129,10 +2553,7 @@ static void prv_note_icon_interaction(void) {
 #endif
 
 // ---- Button input ----
-
-// SELECT-exit slide handle (defined with its animation further down; declared here so the
-// UP/DOWN guard can see it).
-static Animation *s_select_exit_anim;
+// (The select-exit statics now live with the report-scene block above.)
 
 static void prv_click_up_down(ClickRecognizerRef recognizer, void *context) {
   if (!s_list) return;
@@ -2142,7 +2563,7 @@ static void prv_click_up_down(ClickRecognizerRef recognizer, void *context) {
   // squash to/from the card, hero icon-fly, select-exit slide) UP/DOWN presses are dropped —
   // starting a header transition mid-flight would fight it for header_scroll and desync the
   // resting state. Header transitions themselves stay interruptible (hasted re-press).
-  if (s_list->clock_fx || s_list->flying_icon || s_select_exit_anim
+  if (s_list->clock_fx || s_list->flying_icon || s_select_exit_anim || s_list->report_fx
 #if !PBL_ROUND
       || s_list->squash_mode
 #endif
@@ -2189,12 +2610,9 @@ static void prv_click_back(ClickRecognizerRef recognizer, void *context) {
   app_window_stack_pop_all(true);  // BACK exits the app from any ring page
 }
 
-// ---- SELECT expand, phase A: the main forecast slides off to the left, then hard-cuts to the
-// condensed view — the analog of Timeline's prv_animate_to_pin_window (timeline.c:398): a 115ms
-// interpolate_moook slide of the whole canvas, with the cut (push condensed) fired in .stopped,
-// exactly as Timeline pushes the card window in prv_move_timeline_layer_stopped.
-static void (*s_select_exit_done)(void *ctx);
-static void *s_select_exit_ctx;
+// ---- SELECT expand, fallback slide (round / squash-scratch OOM): the main forecast slides
+// off to the left, then hard-cuts — the analog of Timeline's prv_animate_to_pin_window
+// (timeline.c:398). On rect the full squash->ball->unfold scene above replaces this.
 
 static void prv_select_exit_update(Animation *anim, AnimationProgress progress) {
   (void)anim;
@@ -2238,8 +2656,37 @@ bool forecast_list_get_today_icon_rect(GRect *out) {
 void forecast_list_start_select_exit(void (*done_cb)(void *ctx), void *ctx) {
   if (!s_list || !s_list->canvas) { if (done_cb) done_cb(ctx); return; }
   if (s_select_exit_anim) return;
+#if WEATHER_ANIM_5DAY && !PBL_ROUND
+  if (s_report_anim || s_list->report_fx) return;
+#endif
   s_select_exit_done = done_cb;
   s_select_exit_ctx  = ctx;
+#if WEATHER_ANIM_5DAY && !PBL_ROUND
+  // The full scene: whole-frame squash-left (stage 1), ball roll-in (2), unfold (3).
+  if (!s_list->squash_mode) {
+    if (s_list->anim) {   // capture-first, same defensive kill as prv_start_clock_stage1
+      Animation *old = s_list->anim;
+      s_list->anim = NULL;
+      animation_unschedule(old);
+      animation_destroy(old);
+    }
+    GRect b = layer_get_bounds(s_list->canvas);
+    s_list->squash_scratch = malloc_try((size_t)b.size.w * (size_t)b.size.h);
+    if (s_list->squash_scratch) {
+      s_list->squash_mode = SQUASH_LEFT_EXIT;
+      s_list->squash_in_p = 0;
+      s_list->report_fx   = 1;
+      // The ball is born on the SELECT nub's own spot (decoupled from the squash, like
+      // the burst dot) — the indicator visibly becomes the ball.
+      s_list->fx_ball_x   = R5_REPORT_BALL_X0(b.size.w);
+      s_select_exit_anim = prv_start_anim(interpolate_moook_soft_duration(3),  // 330ms
+                                          AnimationCurveLinear,   // jelly does the shaping
+                                          &s_report_stage1_impl, prv_report_stage1_stopped);
+      return;
+    }
+  }
+#endif
+  // Fallback (round / scratch OOM): the legacy 115ms moook slide; done cb fires in its .stopped.
   s_select_exit_anim = prv_start_anim(interpolate_moook_duration() / 2,  // 115ms (Timeline)
                                       AnimationCurveLinear,               // moook is the shaping
                                       &s_select_exit_impl, prv_select_exit_stopped);
@@ -2253,9 +2700,9 @@ static void prv_click_select(ClickRecognizerRef recognizer, void *context) {
   // Only from the resting main view (State A, no transition in flight) — same condition as the
   // "select" marker that advertises this button.
   if (!s_list->header_shown || s_list->fx_active || s_list->clock_fx || s_list->squash_mode ||
-      s_select_exit_anim) return;
+      s_select_exit_anim || s_list->report_fx) return;
 #endif
-  s_list->on_select_request_cb(s_list->on_select_request_ctx);  // -> weather.c pushes the condensed view
+  s_list->on_select_request_cb(s_list->on_select_request_ctx);  // -> weather.c pushes the report
 }
 
 // ---- Touch input (touch colour platforms) ----
@@ -2272,7 +2719,7 @@ static void prv_touch_handler(const TouchEvent *event, void *context) {
   } else if (event->type == TouchEvent_Liftoff && s_list->touch_active) {
     s_list->touch_active = false;
     // Same exclusive-transition guard as the buttons — see prv_click_up_down.
-    if (s_list->clock_fx || s_list->flying_icon || s_select_exit_anim
+    if (s_list->clock_fx || s_list->flying_icon || s_select_exit_anim || s_list->report_fx
 #if !PBL_ROUND
         || s_list->squash_mode
 #endif
@@ -2560,6 +3007,15 @@ static void prv_window_unload(Window *window) {
     animation_unschedule(a);
     animation_destroy(a);
   }
+#if WEATHER_ANIM_5DAY && !PBL_ROUND
+  if (s_report_anim) {   // capture-first: the synchronous .stopped sees the NULLed handle
+    Animation *a = s_report_anim;
+    s_report_anim = NULL;
+    animation_unschedule(a);
+    animation_destroy(a);
+  }
+  s_list->report_fx = 0;
+#endif
 #if !PBL_ROUND
   if (s_list->squash_in_anim) {
     animation_unschedule(s_list->squash_in_anim);

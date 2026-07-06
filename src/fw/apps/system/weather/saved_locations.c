@@ -6,6 +6,8 @@
 #include "city_presets.h"
 #include "resource_ids.pin.h"
 #include "weather_data_source.h"
+#include "pbl/services/comm_session/session.h"
+#include "pbl/services/system_task.h"
 #include "weather_types.h"
 
 #define SAVED_LOCATIONS_PERSIST_COUNT_KEY 6100
@@ -80,9 +82,10 @@ static bool s_custom_loaded;
 
 // ---- At-a-glance weather for the list rows ---------------------------------
 // Snapshot of the weather-service locations, refreshed when the list opens.
-// Rows are matched to snapshots by name prefix (the service stores
-// "New York, United States"; the preset row is "New York"), so cities without
-// synced weather just fall back to the plain two-line row.
+// Rows are matched to snapshots by case-insensitive substring (the service
+// stores "New York, United States"; the preset row is "New York"; a dictated
+// "Jamaica" matches "Kingston, Jamaica"), so cities without synced weather
+// just fall back to the plain two-line row.
 #define GLANCE_MAX_LOCATIONS 12
 #define GLANCE_WEATHER_TYPES 9  // WeatherType_PartlyCloudy(0) .. WeatherType_RainAndSnow(8)
 typedef struct {
@@ -148,24 +151,21 @@ static GBitmap *prv_glance_icon(uint8_t type) {
   return s_glance_icons[type];
 }
 
-static bool prv_glance_name_prefix(const char *name, const char *prefix) {
-  if (!prefix || !prefix[0]) return false;
-  for (size_t i = 0; prefix[i]; i++) {
-    char a = name[i];
-    char b = prefix[i];
-    if (a >= 'A' && a <= 'Z') a += 'a' - 'A';
-    if (b >= 'A' && b <= 'Z') b += 'a' - 'A';
-    if (a != b) return false;
-  }
-  return true;
-}
-
 static const GlanceEntry *prv_glance_find(const char *label, bool want_current) {
-  for (int i = 0; i < s_glance_count; i++) {
-    if (want_current ? s_glance[i].is_current
-                     : prv_glance_name_prefix(s_glance[i].name, label)) {
-      return &s_glance[i];
+  if (want_current) {
+    for (int i = 0; i < s_glance_count; i++) {
+      if (s_glance[i].is_current) return &s_glance[i];
     }
+    return NULL;
+  }
+  // Prefix matches beat bare substring matches (see weather_ds_name_matches),
+  // so the "London" row can't pick up an "East London, SA" record's temp while
+  // real London is also synced.
+  for (int i = 0; i < s_glance_count; i++) {
+    if (weather_ds_name_prefix(s_glance[i].name, label)) return &s_glance[i];
+  }
+  for (int i = 0; i < s_glance_count; i++) {
+    if (weather_ds_name_matches(s_glance[i].name, label)) return &s_glance[i];
   }
   return NULL;
 }
@@ -263,6 +263,22 @@ static void prv_load_custom_locations(void) {
       s_custom_locations[i].query[sizeof(s_custom_locations[i].query) - 1] = '\0';
     }
   }
+
+#if defined(CONFIG_SOC_QEMU)
+  // QEMU test artifact (the emulator has no dictation): on a fresh persist store,
+  // seed one custom location exactly as the voice-add flow stores it — name only,
+  // NO coordinates. Together with the synth "Kingston, Jamaica" record this
+  // exercises the real path: coordinate backfill -> globe placement -> commit.
+  if (!persist_exists(SAVED_LOCATIONS_PERSIST_COUNT_KEY) && s_custom_count == 0 &&
+      prv_ensure_custom_locations()) {
+    strncpy(s_custom_locations[0].label, "Jamaica",
+            sizeof(s_custom_locations[0].label) - 1);
+    strncpy(s_custom_locations[0].query, "Jamaica",
+            sizeof(s_custom_locations[0].query) - 1);
+    s_custom_locations[0].has_coordinates = false;
+    s_custom_count = 1;
+  }
+#endif
 }
 
 static void prv_save_custom_locations(void) {
@@ -295,6 +311,82 @@ static void prv_save_builtin_locations(void) {
                     (int)s_deleted_preset_mask);
   persist_write_int(SAVED_LOCATIONS_PERSIST_CURRENT_VISIBLE_KEY,
                     s_current_visible ? 1 : 0);
+}
+
+// ---- Watch -> phone: dictated-location sync (endpoint 6100) ----------------
+// A dictated custom location is only a NAME — the watch can't geocode. This
+// tells the mobile app about it so it can geocode the query, add it to its
+// weather-location list, and sync back a v4 record whose lat/lon then pins
+// the city on the globe (see prv_backfill_custom_coords).
+//
+// Wire format on Pebble Protocol endpoint 6100 (watch -> phone only):
+//   uint8_t command;    // 1 = add/geocode this query, 2 = remove it
+//   uint8_t query_len;  // UTF-8 byte count (no NUL terminator)
+//   char    query[query_len];
+//
+// Delivery is best-effort: sends are marshalled to the system task (comm
+// session objects must not be touched from the app task), a NULL session
+// (phone disconnected) just drops the message, and every weather-app launch
+// re-sends ADD for customs still missing coordinates — so the phone MUST
+// treat ADD idempotently (same query twice = one location).
+#define WEATHER_LOCATION_ENDPOINT 6100
+#define WEATHER_LOCATION_CMD_ADD 1
+#define WEATHER_LOCATION_CMD_REMOVE 2
+
+typedef struct {
+  uint8_t state;   // 0 = free; 1 = ready (app task fills, system task clears)
+  uint8_t cmd;
+  uint8_t len;
+  char query[SAVED_LOCATION_QUERY_SIZE];
+} PendingLocationMsg;
+
+// Static slots (firmware .bss): safe for the system-task callback even if the
+// weather app exits before it runs. One slot per custom + add/remove slack.
+static PendingLocationMsg s_loc_msgs[SAVED_LOCATIONS_MAX_CUSTOM + 2];
+
+static void prv_location_msg_send_cb(void *data) {
+  PendingLocationMsg *msg = (PendingLocationMsg *)data;
+  if (msg->state != 1) return;
+  CommSession *session = comm_session_get_system_session();
+  if (session) {
+    uint8_t buf[2 + SAVED_LOCATION_QUERY_SIZE];
+    buf[0] = msg->cmd;
+    buf[1] = msg->len;
+    memcpy(&buf[2], msg->query, msg->len);
+    comm_session_send_data(session, WEATHER_LOCATION_ENDPOINT, buf,
+                           (size_t)(2 + msg->len),
+                           COMM_SESSION_DEFAULT_TIMEOUT);
+  }
+  msg->state = 0;
+}
+
+static void prv_send_location_request(uint8_t cmd, const char *query) {
+  if (!query || !query[0]) return;
+  size_t len = strlen(query);
+  if (len > SAVED_LOCATION_QUERY_SIZE) len = SAVED_LOCATION_QUERY_SIZE;
+  for (size_t i = 0; i < sizeof(s_loc_msgs) / sizeof(s_loc_msgs[0]); i++) {
+    PendingLocationMsg *msg = &s_loc_msgs[i];
+    if (msg->state != 0) continue;
+    msg->cmd = cmd;
+    msg->len = (uint8_t)len;
+    memcpy(msg->query, query, len);
+    msg->state = 1;   // publish BEFORE queueing (the callback checks it)
+    if (!system_task_add_callback(prv_location_msg_send_cb, msg)) {
+      msg->state = 0;   // queue full — drop; the launch re-send recovers ADDs
+    }
+    return;
+  }
+  // No free slot: drop. ADDs are recovered by the launch re-send.
+}
+
+void saved_locations_send_pending_queries(void) {
+  prv_load_custom_locations();
+  if (s_custom_count <= 0 || !s_custom_locations) return;
+  for (int i = 0; i < s_custom_count; i++) {
+    if (s_custom_locations[i].has_coordinates) continue;   // already pinned
+    prv_send_location_request(WEATHER_LOCATION_CMD_ADD,
+                              s_custom_locations[i].query);
+  }
 }
 
 static int prv_find_custom_by_query(const char *query) {
@@ -348,6 +440,58 @@ static void saved_locations_add_custom_location(const char *query, const char *l
 }
 
 
+// A voice-added custom location starts with a name only — the watch can't geocode.
+// The phone geocodes it and syncs a weather-db record that DOES carry lat/lon, so
+// lazily copy those coordinates into the custom slot (matched by name) and persist.
+// This is what puts a dictated city like "Jamaica" on the globe: entries without
+// coordinates can't be placed, so until the phone syncs its record the city only
+// shows in this list, then appears on the globe on the next reveal.
+static void prv_backfill_custom_coords(void) {
+  prv_load_custom_locations();
+  if (s_custom_count <= 0 || !s_custom_locations) return;
+  bool any_missing = false;
+  for (int i = 0; i < s_custom_count; i++) {
+    if (!s_custom_locations[i].has_coordinates) { any_missing = true; break; }
+  }
+  if (!any_missing || !weather_ds_supported()) return;
+
+  WxDsForecast *scratch = malloc_try(sizeof(*scratch));  // ~400 B; keep off the task stack
+  if (!scratch) return;
+  bool changed = false;
+  const int count = weather_ds_location_count();
+  // Two passes: PREFIX matches first, bare substring as a fallback — so a record
+  // whose name merely CONTAINS the custom's name ("New York..." for a dictated
+  // "York") can't claim it while a better record exists in the same sync.
+  for (int pass = 0; pass < 2; pass++) {
+    for (int r = 0; r < count; r++) {
+      if (!weather_ds_read_index(r, scratch)) continue;
+      if (scratch->is_current_location) continue;  // customs are never the current location
+      // Only trust coordinates from a REAL v4 record: the phone geocoded these. The
+      // v3-era placeholder seed fabricates coords (see WEATHER_V4_TEST_SEED), and
+      // persisting those would pin the city in the wrong place with no self-heal.
+      if (!scratch->is_v4) continue;
+      if (scratch->latitude_e2 == INT16_MIN || scratch->longitude_e2 == INT16_MIN) continue;
+      for (int i = 0; i < s_custom_count; i++) {
+        SavedCustomLocation *c = &s_custom_locations[i];
+        if (c->has_coordinates) continue;
+        const bool match = (pass == 0)
+            ? (weather_ds_name_prefix(scratch->location_name, c->query) ||
+               weather_ds_name_prefix(scratch->location_name, c->label))
+            : (weather_ds_name_matches(scratch->location_name, c->query) ||
+               weather_ds_name_matches(scratch->location_name, c->label));
+        if (match) {
+          c->latitude_e2 = scratch->latitude_e2;
+          c->longitude_e2 = scratch->longitude_e2;
+          c->has_coordinates = true;
+          changed = true;
+        }
+      }
+    }
+  }
+  free(scratch);
+  if (changed) prv_save_custom_locations();
+}
+
 int saved_locations_get_entries(SavedLocationEntry *entries,
                                 int max_entries,
                                 const char *current_location_label,
@@ -356,6 +500,7 @@ int saved_locations_get_entries(SavedLocationEntry *entries,
                                 bool has_current_location) {
   if (!entries || max_entries <= 0) return 0;
   prv_load_custom_locations();
+  prv_backfill_custom_coords();
 
   int count = 0;
   entries[count] = (SavedLocationEntry) {
@@ -816,6 +961,8 @@ static void prv_touch_handler(const TouchEvent *event, void *context) {
 static void prv_delete_custom_at_index(int custom_index) {
   if (custom_index < 0 || custom_index >= s_custom_count) return;
 
+  prv_send_location_request(WEATHER_LOCATION_CMD_REMOVE,
+                            s_custom_locations[custom_index].query);
   if (custom_index + 1 < s_custom_count) {
     memmove(&s_custom_locations[custom_index],
             &s_custom_locations[custom_index + 1],
@@ -1118,6 +1265,7 @@ static void prv_dictation_callback(DictationSession *session,
   }
 
   saved_locations_add_custom_location(transcription, transcription);
+  prv_send_location_request(WEATHER_LOCATION_CMD_ADD, transcription);
   if (view->select_callback) {
     view->select_callback(SavedLocationKindCustom, -1, transcription,
                           view->select_context);

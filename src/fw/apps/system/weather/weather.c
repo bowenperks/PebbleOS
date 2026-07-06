@@ -15,7 +15,7 @@
 
 #include "weather.h"
 #include "clock_face.h"
-#include "condensed_view.h"
+#include "weather_report.h"
 #include "expanded_view.h"
 #include "forecast_list.h"
 #include "globe_view.h"
@@ -55,6 +55,13 @@ typedef struct WeatherAppData {
   // Active location's timezone, minutes east of UTC (v4.1; for city-local
   // sunset/hourly display). INT16_MIN = unknown → fall back to the watch tz.
   int16_t utc_offset_min;
+  // The user's GPS location — ALWAYS the record flagged is_current_location,
+  // NEVER the active selection. Feeds the globe's "My Location" entry and the
+  // saved-locations Current row, so switching city on the globe can't overwrite
+  // them with a duplicate of the selected city.
+  char    current_loc_buf[64];
+  int16_t current_lat_e2;
+  int16_t current_lon_e2;
 } WeatherAppData;
 
 static WeatherAppData *s_data;
@@ -101,7 +108,8 @@ static void prv_day_label(int day_offset, char *buf, size_t bufsize) {
   } else if (day_offset == 1) {
     strncpy(buf, "Tomorrow", bufsize - 1);
   } else {
-    static const char *const kWday[7] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+    static const char *const kWday[7] = {"Sunday", "Monday", "Tuesday", "Wednesday",
+                                         "Thursday", "Friday", "Saturday"};
     time_t t = rtc_get_time() + (time_t)day_offset * SECONDS_PER_DAY;
     struct tm *lt = localtime(&t);  // compat maps to pbl_override_localtime
     int w = (lt && lt->tm_wday >= 0 && lt->tm_wday < 7) ? lt->tm_wday : 0;
@@ -136,6 +144,11 @@ static void prv_fill_days_from_ds(WeatherAppData *data, const WxDsForecast *ds) 
     .today_uv = ds->today_uv,
     .today_precip_mm = ds->today_precip,
     .today_wind_mph = ds->today_wind,
+    .today_feels = ds->today_feels,
+    .today_wmo = ds->today_wmo,
+    .today_humidity = ds->today_humidity,
+    .today_visibility_m = (int)ds->today_visibility_m,
+    .today_precip_sum_mm = ds->today_precip_sum_mm,
     .current_weather_type = (WeatherType)ds->current_weather_type,
     .current_weather_phrase = data->phrase_buf[0],
     .label = data->label_buf[0],
@@ -163,6 +176,11 @@ static void prv_fill_days_from_ds(WeatherAppData *data, const WxDsForecast *ds) 
         .today_uv = ds->daily[i].uv,             // per-day UV (seed; -1 for real v4)
         .today_precip_mm = ds->daily[i].precip,  // per-day precip + wind (seed; -1 for real v4)
         .today_wind_mph = ds->daily[i].wind,
+        .today_feels = ds->daily[i].feels,       // per-day feels-like (v4.2 daily_feels_like)
+        .today_wmo = -1,             // warning readings are today-only (v4.2)
+        .today_humidity = -1,
+        .today_visibility_m = -1,
+        .today_precip_sum_mm = -1,
         .current_weather_type = (WeatherType)ds->daily[i].type,
         .current_weather_phrase = data->phrase_buf[i],
         .label = data->label_buf[i],
@@ -187,6 +205,11 @@ static void prv_fill_days_from_ds(WeatherAppData *data, const WxDsForecast *ds) 
         .today_uv = -1,
         .today_precip_mm = -1,
         .today_wind_mph = -1,
+        .today_feels = WEATHER_SERVICE_LOCATION_FORECAST_UNKNOWN_TEMP,  // zeroed = a KNOWN 0°
+        .today_wmo = -1,
+        .today_humidity = -1,
+        .today_visibility_m = -1,
+        .today_precip_sum_mm = -1,
         .current_weather_type = (WeatherType)ds->tomorrow_weather_type,
         .current_weather_phrase = data->phrase_buf[1],
         .label = data->label_buf[1],
@@ -210,6 +233,24 @@ static void prv_sync_glance_strings(WeatherAppData *data) {
                            today ? today->today_precip_mm : -1);
 }
 
+// Refresh the GPS ("My Location") identity from the record flagged is_current_location
+// (fallback: index 0 by convention). Kept SEPARATE from the active selection on purpose —
+// see the WeatherAppData fields. Reuses the caller's scratch record.
+static void prv_read_current_location(WeatherAppData *data, WxDsForecast *scratch) {
+  int idx = 0;
+  for (int i = 0; i < data->location_count; i++) {
+    if (weather_ds_read_index(i, scratch) && scratch->is_current_location) {
+      idx = i;
+      break;
+    }
+  }
+  if (!weather_ds_read_index(idx, scratch)) return;
+  strncpy(data->current_loc_buf, scratch->location_name, sizeof(data->current_loc_buf) - 1);
+  data->current_loc_buf[sizeof(data->current_loc_buf) - 1] = '\0';
+  data->current_lat_e2 = scratch->latitude_e2;
+  data->current_lon_e2 = scratch->longitude_e2;
+}
+
 static void prv_refresh(WeatherAppData *data) {
   data->location_count = weather_ds_location_count();
   if (data->location_count <= 0) {
@@ -221,6 +262,7 @@ static void prv_refresh(WeatherAppData *data) {
     data->active_index = 0;
   }
   WxDsForecast ds;
+  prv_read_current_location(data, &ds);
   if (weather_ds_read_index(data->active_index, &ds)) {
     prv_fill_days_from_ds(data, &ds);
     if (data->current_day_index >= data->days_received) {
@@ -234,8 +276,8 @@ static void prv_refresh(WeatherAppData *data) {
     expanded_view_update_data(data->days_received >= 1 ? &data->days[0] : NULL,
                               data->latitude_e2, data->longitude_e2,
                               data->utc_offset_min);
-    // And the condensed view — it borrows days[] and must re-clamp its focused day.
-    condensed_view_update_data(data->days, data->days_received);
+    // And the weather report — it borrows days[] and must re-render today's edition.
+    weather_report_update_data(data->days, data->days_received);
     prv_sync_glance_strings(data);   // for the hero-fly text
   }
 }
@@ -340,9 +382,9 @@ static void prv_expanded_select_to_globe(void *ctx) {
   // slide-out completion). Push the globe sliding in from the RIGHT on top, then dismiss the
   // now-hidden card underneath (its white slide-out already covered the base — no flash).
   if (!data->globe_view) { expanded_view_dismiss(false); s_page = PAGE_LIST; return; }
-  if (data->latitude_e2 != INT16_MIN && data->longitude_e2 != INT16_MIN) {
-    globe_view_set_current_location(data->globe_view, data->location_buf,
-                                    data->latitude_e2, data->longitude_e2);
+  if (data->current_lat_e2 != INT16_MIN && data->current_lon_e2 != INT16_MIN) {
+    globe_view_set_current_location(data->globe_view, data->current_loc_buf,
+                                    data->current_lat_e2, data->current_lon_e2);
   }
   s_page = PAGE_GLOBE;
   globe_view_push_slide_in_right(data->globe_view);
@@ -359,22 +401,22 @@ static void prv_expanded_down_to_main(void *ctx) {
   s_page = PAGE_LIST;
 }
 
-static void prv_condensed_after_exit(void *ctx) {
+static void prv_report_after_exit(void *ctx) {
   WeatherAppData *data = (WeatherAppData *)ctx;
-  condensed_view_arm_select_in();   // today bitmap squash-stretches in from the right
-  condensed_view_push(data->days, data->days_received, (int)data->current_day_index);
+  weather_report_arm_static_in();   // the unfold scene already delivered the entrance — hard cut
+  weather_report_push(data->days, data->days_received, (int)data->current_day_index);
 }
 
-static void prv_on_condensed_requested(void *ctx) {
+static void prv_on_report_requested(void *ctx) {
   WeatherAppData *data = (WeatherAppData *)ctx;
-  // SELECT on the forecast main view -> slide the main screen off to the left, then hard-cut to the
-  // condensed view. Falls back to a plain push where the today-icon rect isn't available.
-  if (!data || condensed_view_is_showing()) return;
+  // SELECT on the forecast main view -> slide the main screen off to the left, then hard-cut to
+  // the weather report. Falls back to a plain push where the today-icon rect isn't available.
+  if (!data || weather_report_is_showing()) return;
   GRect from;
   if (forecast_list_get_today_icon_rect(&from)) {
-    forecast_list_start_select_exit(prv_condensed_after_exit, data);
+    forecast_list_start_select_exit(prv_report_after_exit, data);
   } else {
-    condensed_view_push(data->days, data->days_received, (int)data->current_day_index);
+    weather_report_push(data->days, data->days_received, (int)data->current_day_index);
   }
 }
 
@@ -387,7 +429,7 @@ static void prv_on_list_transition_done(void *ctx) {
                      prv_on_city_select_requested, data);
   forecast_list_set_on_clock_request(prv_on_clock_burst_requested, data);
   forecast_list_set_on_up_request(prv_on_list_up_to_expanded, data);
-  forecast_list_set_on_select_request(prv_on_condensed_requested, data);
+  forecast_list_set_on_select_request(prv_on_report_requested, data);
   // The base window now exists, so the initial glance strings will actually land (the prv_refresh
   // in prv_init ran before it, when forecast_list_set_glance_strings was a no-op).
   prv_sync_glance_strings(data);
@@ -403,9 +445,9 @@ static void prv_push_globe(WeatherAppData *data, bool animated) {
   if (!data->globe_view) {
     return;
   }
-  if (data->latitude_e2 != INT16_MIN && data->longitude_e2 != INT16_MIN) {
-    globe_view_set_current_location(data->globe_view, data->location_buf,
-                                    data->latitude_e2, data->longitude_e2);
+  if (data->current_lat_e2 != INT16_MIN && data->current_lon_e2 != INT16_MIN) {
+    globe_view_set_current_location(data->globe_view, data->current_loc_buf,
+                                    data->current_lat_e2, data->current_lon_e2);
   }
   globe_view_push_animated(data->globe_view, animated);
 }
@@ -443,22 +485,12 @@ static void prv_globe_back_to_expanded(void *ctx) {
   prv_push_expanded(data, ExpandedViewEntranceCardFromLeft);
 }
 
-// Case-insensitive: does `name` ("New York, United States") start with `prefix` ("New York")?
-static bool prv_name_prefix_match(const char *name, const char *prefix) {
-  if (!name || !prefix || !prefix[0]) return false;
-  for (size_t i = 0; prefix[i]; i++) {
-    char a = name[i], b = prefix[i];
-    if (a >= 'A' && a <= 'Z') a += 'a' - 'A';
-    if (b >= 'A' && b <= 'Z') b += 'a' - 'A';
-    if (a != b) return false;
-  }
-  return true;
-}
-
 // Map a globe/saved-locations selection onto a weather-ds location index, or -1 when the
 // phone hasn't synced a record for that city. Presets match by COORDINATES first (every v4
 // record carries the phone's geocoded lat/lon; accept within ~2° taxicab of the preset's),
-// with a name-prefix fallback; custom cities match by name (the phone geocoded the query).
+// with a name-PREFIX fallback (preset names are canonical). Custom cities match by name:
+// prefix first, then substring — so a dictated "Jamaica" finds "Kingston, Jamaica", but a
+// containing name ("New York...") can't shadow an exact one ("York, UK") when both exist.
 static int prv_ds_index_for_selection(SavedLocationKind kind, int preset_index,
                                       const char *query) {
   const int count = weather_ds_location_count();
@@ -466,7 +498,7 @@ static int prv_ds_index_for_selection(SavedLocationKind kind, int preset_index,
   if (!ds) return -1;
   const CityPreset *preset =
       (kind == SavedLocationKindPreset) ? city_presets_get(preset_index) : NULL;
-  int best_coord = -1, best_dist = 0, first_name = -1;
+  int best_coord = -1, best_dist = 0, first_name = -1, first_substr = -1;
   for (int i = 0; i < count; i++) {
     if (!weather_ds_read_index(i, ds)) continue;
     if (kind == SavedLocationKindCurrent) {
@@ -480,13 +512,18 @@ static int prv_ds_index_for_selection(SavedLocationKind kind, int preset_index,
           best_dist = d;
         }
       }
-      if (first_name < 0 && prv_name_prefix_match(ds->location_name, preset->city)) {
+      if (first_name < 0 && weather_ds_name_prefix(ds->location_name, preset->city)) {
         first_name = i;
       }
     } else if (kind == SavedLocationKindCustom) {
-      if (first_name < 0 && query && query[0] &&
-          prv_name_prefix_match(ds->location_name, query)) {
-        first_name = i;
+      if (ds->is_current_location) continue;   // customs are never the current location
+      if (query && query[0]) {
+        if (first_name < 0 && weather_ds_name_prefix(ds->location_name, query)) {
+          first_name = i;
+        } else if (first_substr < 0 &&
+                   weather_ds_name_matches(ds->location_name, query)) {
+          first_substr = i;
+        }
       }
     }
   }
@@ -494,7 +531,8 @@ static int prv_ds_index_for_selection(SavedLocationKind kind, int preset_index,
   if (kind == SavedLocationKindCurrent && best_coord < 0 && count > 0) {
     return 0;   // index 0 is treated as the current location by convention
   }
-  return (best_coord >= 0) ? best_coord : first_name;
+  if (best_coord >= 0) return best_coord;
+  return (first_name >= 0) ? first_name : first_substr;
 }
 
 static void prv_globe_location_selected(SavedLocationKind kind, int preset_index,
@@ -507,7 +545,7 @@ static void prv_globe_location_selected(SavedLocationKind kind, int preset_index
   const int idx = prv_ds_index_for_selection(kind, preset_index, query);
   if (idx >= 0) {
     // Switch the ACTIVE location: prv_refresh re-reads the ds record and pushes
-    // the chosen city into every view (forecast base, card, condensed, glance),
+    // the chosen city into every view (forecast base, card, report, glance),
     // so the revealed mainscreen already shows the new city's data.
     data->active_index = idx;
     data->current_day_index = 0;
@@ -544,7 +582,8 @@ static void prv_open_saved_locations(void *ctx) {
     return;
   }
   SavedLocationsConfig config = {
-    .current_location_label = data->location_buf[0] ? data->location_buf : "Current Location",
+    .current_location_label =
+        data->current_loc_buf[0] ? data->current_loc_buf : "Current Location",
     // -1, NOT data->active_index: that field is a weather-ds LOCATION index (0 = current
     // location), while this config field is a CityPreset index — passing 0 pre-highlighted
     // preset 0 ("New York") instead of the Current Location row the -1 fallback selects.
@@ -584,8 +623,17 @@ static NOINLINE void prv_init(void) {
   s_data = data;
   // The animated forecast is the carousel base window; start the ring there.
   s_page = PAGE_LIST;
+  // zalloc leaves coords at 0 — a VALID lat/lon (0°,0°). Unknown must be INT16_MIN so the
+  // "have GPS coords?" gates don't pass before prv_refresh reads the current-location record.
+  data->current_lat_e2 = INT16_MIN;
+  data->current_lon_e2 = INT16_MIN;
 
   prv_refresh(data);
+
+  // Tell the phone about dictated locations it may not have heard about yet
+  // (endpoint 6100; best-effort sends are re-issued here every launch until
+  // the phone's geocoded v4 record gives the city coordinates).
+  saved_locations_send_pending_queries();
 
   // Create the globe once (held for the app's lifetime; ~31KB of cubemap +
   // starfield + sequence resources). prv_refresh ran first, so lat/lon is set.
@@ -596,9 +644,9 @@ static NOINLINE void prv_init(void) {
     globe_view_set_main_callback(data->globe_view, prv_globe_down_to_expanded, data);
     globe_view_set_back_callback(data->globe_view, prv_globe_back_to_expanded, data);
     globe_view_set_saved_locations_callback(data->globe_view, prv_open_saved_locations, data);
-    if (data->latitude_e2 != INT16_MIN && data->longitude_e2 != INT16_MIN) {
-      globe_view_set_current_location(data->globe_view, data->location_buf,
-                                      data->latitude_e2, data->longitude_e2);
+    if (data->current_lat_e2 != INT16_MIN && data->current_lon_e2 != INT16_MIN) {
+      globe_view_set_current_location(data->globe_view, data->current_loc_buf,
+                                      data->current_lat_e2, data->current_lon_e2);
     }
   }
   clock_face_set_wrap_callback(prv_on_clock_wrap_to_main, data);

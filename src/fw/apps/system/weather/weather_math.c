@@ -39,6 +39,46 @@ void weather_render_squash(GContext *ctx, uint8_t *scratch, AnimationProgress m,
     GBitmapDataRowInfo ri = gbitmap_get_data_row_info(fb, (uint16_t)y);
     memcpy(scratch + (uint32_t)y * W, ri.data + ri.min_x, W);
   }
+  const uint8_t white = GColorWhite.argb;
+  if (mode == WEATHER_SQUASH_LEFT_EXIT || mode == WEATHER_SQUASH_RIGHT_IN) {
+    // Horizontal jelly (the vertical grammar rotated 90°).
+    int left_edge, right_edge;
+    if (mode == WEATHER_SQUASH_LEFT_EXIT) {
+      // Left edge leads 0 -> -W (delay 0); right trails the HALF-lag (average of leading
+      // and 1/6-lagged), both clamped to rest so the moook anticipation never pokes the
+      // frame rightward (same reasoning as the UP_EXIT clamp).
+      left_edge  = prv_jelly_edge(m, 0, 0, -W);
+      right_edge = (prv_jelly_edge(m, 0, W, 0) + prv_jelly_edge(m, 1, W, 0)) / 2;
+      if (left_edge > 0)  left_edge  = 0;
+      if (right_edge > W) right_edge = W;
+    } else {
+      // RIGHT_IN (RISE_IN rotated): left edge leads W -> 0 into place; right trails
+      // 2W -> W. The trailing edge's overshoot past W is the landing jelly — keep it.
+      left_edge  = prv_jelly_edge(m, 0, W, 0);
+      right_edge = prv_jelly_edge(m, 1, 2 * W, W);
+      if (left_edge < 0) left_edge = 0;   // pin the leading overshoot at rest
+    }
+    int dst_w = right_edge - left_edge;
+    if (dst_w < 1) dst_w = 1;
+    const int32_t sx_step = ((int32_t)W << 16) / dst_w;
+    int vis0 = left_edge > 0 ? left_edge : 0;
+    int vis1 = right_edge < W ? right_edge : W;
+    if (vis1 < vis0) vis1 = vis0;
+    for (int y = 0; y < H; y++) {
+      GBitmapDataRowInfo ri = gbitmap_get_data_row_info(fb, (uint16_t)y);
+      uint8_t *dst = ri.data + ri.min_x;
+      const uint8_t *src = scratch + (uint32_t)y * W;
+      if (vis0 > 0) memset(dst, white, (size_t)vis0);
+      if (vis1 < W) memset(dst + vis1, white, (size_t)(W - vis1));
+      for (int x = vis0; x < vis1; x++) {
+        int sx = (int)((((int32_t)(x - left_edge)) * sx_step) >> 16);
+        if (sx < 0) sx = 0; else if (sx >= W) sx = W - 1;
+        dst[x] = src[sx];
+      }
+    }
+    graphics_release_frame_buffer(ctx, fb);
+    return;
+  }
   int top_edge, bot_edge;
   if (mode == WEATHER_SQUASH_DOWN_EXIT) {   // down exit: bottom leads off the bottom
     // Compress the exit into the first ~75% of the animation so the screen has fully
@@ -53,6 +93,15 @@ void weather_render_squash(GContext *ctx, uint8_t *scratch, AnimationProgress m,
   } else if (mode == WEATHER_SQUASH_RISE_IN) {   // rise from below: top leads up into place
     top_edge = prv_jelly_edge(m, 0, H,     0);
     bot_edge = prv_jelly_edge(m, 1, 2 * H, H);
+  } else if (mode == WEATHER_SQUASH_UP_EXIT) {   // up exit: top leads off the top; the bottom
+    // trails a HALF-lag (1/12 — the average of the leading and 1/6-lagged edges) for a
+    // subtler stretch than the other modes. Full timeline (no haste), like mode 4.
+    top_edge = prv_jelly_edge(m, 0, 0, -H);
+    bot_edge = (prv_jelly_edge(m, 0, H, 0) + prv_jelly_edge(m, 1, H, 0)) / 2;
+    // Never let the frame move DOWN past its rest: the moook anticipation dip would poke
+    // the bottom content below the decoupled burst dot for a beat, which reads wrong.
+    if (top_edge > 0) top_edge = 0;
+    if (bot_edge > H) bot_edge = H;
   } else {                                       // drop-in: bottom leads down into place
     top_edge = prv_jelly_edge(m, 1, -H, 0);
     bot_edge = prv_jelly_edge(m, 0,  0, H);
@@ -60,7 +109,6 @@ void weather_render_squash(GContext *ctx, uint8_t *scratch, AnimationProgress m,
   int dst_h = bot_edge - top_edge;
   if (dst_h < 1) dst_h = 1;
   const int32_t sy_step = ((int32_t)H << 16) / dst_h;
-  const uint8_t white = GColorWhite.argb;
   for (int ay = 0; ay < H; ay++) {
     GBitmapDataRowInfo ri = gbitmap_get_data_row_info(fb, (uint16_t)ay);
     if (ay >= top_edge && ay < bot_edge) {
