@@ -1188,16 +1188,21 @@ static void prv_render_layout(Layer *layer, GContext *context) {
                            bounds.size.w - (2 * content_x_offset) - 2, 2),
                      0, GCornerNone);
 #else
-  // The original standalone app's mainscreen divider: 2px dots with 3px gaps,
-  // LightGray, edge to edge (ported verbatim from the pre-firmware app).
-  graphics_context_set_stroke_width(context, 1);
-  graphics_context_set_stroke_color(context,
-                                    PBL_IF_COLOR_ELSE(GColorLightGray, GColorBlack));
-  for (int x = 0; x < bounds.size.w; x += 5) {
-    int x_end = x + 1;
-    if (x_end >= bounds.size.w) x_end = bounds.size.w - 1;
-    graphics_draw_line(context, GPoint(x, separator_y - 1),
-                       GPoint(x_end, separator_y - 1));
+  // Divider (reference photo): light gray, small square dots — EXACTLY 45 of
+  // them (user counted the reference photo by hand), EVERY gap identical
+  // (user rejected the earlier "spans exactly edge to edge" version because
+  // 200px isn't divisible by 45, forcing a wobble between 4px/5px gaps).
+  // Fixed integer pitch instead — perfectly uniform — with the whole group
+  // centered (a few px of margin on each side beats uneven internal spacing).
+  graphics_context_set_fill_color(context, PBL_IF_COLOR_ELSE(GColorLightGray, GColorBlack));
+  const int divider_dot_y = separator_y - 1 - 3;
+  const int dot_w = 2;
+  const int pitch = 4;   // dot + gap, IDENTICAL for every one of the 45 dots
+  const int total_span = 44 * pitch + dot_w;
+  const int start_x = (bounds.size.w - total_span) / 2;
+  for (int i = 0; i < 45; i++) {
+    graphics_fill_rect(context, GRect(start_x + i * pitch, divider_dot_y, dot_w, 2),
+                       0, GCornerNone);
   }
 #endif
 
@@ -1799,9 +1804,10 @@ void weather_app_layout_init(WeatherAppLayout *layout, const GRect *frame) {
     .origin = PBL_IF_RECT_ELSE(
         // Disc top rides 5px ABOVE the hero temp's cap line (temp ink top 39
         // after the −3 trim, disc top 34 -> icon y 44), right margin 9px —
-        // user-calibrated relationship, kept through moves.
+        // user-calibrated relationship, kept through moves. Moved up 8px more
+        // (2026-07-07, user request) -> y 36.
         GPoint(content_layer_frame.size.w - s_today_icon_size.w -
-               (WEATHER_APP_LAYOUT_CONTENT_LAYER_HORIZONTAL_INSET + 11), 44),
+               (WEATHER_APP_LAYOUT_CONTENT_LAYER_HORIZONTAL_INSET + 11), 36),
         GPoint(content_layer_frame.size.w - s_today_icon_size.w - icon_x_inset -
                today_icon_x_adjust,
                content_layer_frame.origin.y + icon_layer_margin_top + icon_y_adjust +
