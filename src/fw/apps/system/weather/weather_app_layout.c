@@ -703,32 +703,40 @@ static void prv_draw_top_rows(const WeatherAppLayout *layout, GPoint *off, int c
   // warning, wind, precip. Measured and CENTERED in the band between the
   // condition text's bottom (the flow's current line) and the UV box top —
   // one- and two-line descriptions both float mid-band.
+  int box_top = off->y + 150;   // no-description fallback: the classic anchor
   if (t->desc && t->desc[0]) {
     const GSize dsz = graphics_text_layout_get_content_size(
         t->desc, layout->metrics_font, GRect(0, 0, cw, 40),
         GTextOverflowModeWordWrap, GTextAlignmentLeft);
     const int band_top = line.y;
-    const int band_bot = off->y + 150;   // UV box top
+    const int band_bot = off->y + 150;   // the box's nominal top (keeps desc placement)
     int desc_y = band_top + (band_bot - band_top - dsz.h) / 2;
     if (desc_y < band_top) desc_y = band_top;
     graphics_context_set_text_color(ctx, GColorBlack);
     graphics_draw_text(ctx, t->desc, layout->metrics_font,
                        GRect(off->x, desc_y, cw, dsz.h + 2),
                        GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+    // Center the UV box between the description's ink bottom and the y195
+    // divider — per page, since one- and two-line descriptions end at
+    // different depths (same optical rule as the fin below the divider).
+    const int desc_bot = desc_y + dsz.h + 2;   // +2: G14's descent runs past the metric
+    const int divider_y = off->y + 195;
+    box_top = desc_bot + (divider_y - desc_bot - 40) / 2;
+    if (box_top < desc_bot) box_top = desc_bot;
   }
 
   // The BIG UV BAR (brought back from the newspaper version, verbatim grid):
   // double-bordered full-measure box, sun + "UV INDEX" header top-left, ten
   // 10px tally squares (13px pitch) filled in the WHO severity color, and a
-  // near-box-height LECO numeral on the right. Absolute band y150..190 —
-  // 5px above the footer rule, the newspaper's own rhythm — riding the day
-  // slide via off->y. Hidden when UV is off the wire.
+  // near-box-height LECO numeral on the right. The 40px box floats centred
+  // between the description above and the y195 divider (box_top, computed
+  // per page) — riding the day slide via off->y. Hidden when UV is off the wire.
   if (t->uv && t->uv[0] && t->uv[0] != '-') {
     int uvv = 0;
     for (const char *c = t->uv; *c >= '0' && *c <= '9'; c++) {
       uvv = uvv * 10 + (*c - '0');
     }
-    const int by = off->y + 150;
+    const int by = box_top;
     graphics_context_set_stroke_color(ctx, GColorBlack);
     graphics_context_set_stroke_width(ctx, 1);
     graphics_draw_rect(ctx, GRect(off->x, by, cw, 40));
@@ -1180,12 +1188,17 @@ static void prv_render_layout(Layer *layer, GContext *context) {
                            bounds.size.w - (2 * content_x_offset) - 2, 2),
                      0, GCornerNone);
 #else
-  // The original app's fine dotted rule: 1px dots on a 2px checkerboard pitch,
-  // LightGray, edge to edge.
+  // The original standalone app's mainscreen divider: 2px dots with 3px gaps,
+  // LightGray, edge to edge (ported verbatim from the pre-firmware app).
+  graphics_context_set_stroke_width(context, 1);
   graphics_context_set_stroke_color(context,
                                     PBL_IF_COLOR_ELSE(GColorLightGray, GColorBlack));
-  graphics_draw_horizontal_line_dotted(context, GPoint(0, separator_y - 1),
-                                       (uint16_t)bounds.size.w);
+  for (int x = 0; x < bounds.size.w; x += 5) {
+    int x_end = x + 1;
+    if (x_end >= bounds.size.w) x_end = bounds.size.w - 1;
+    graphics_draw_line(context, GPoint(x, separator_y - 1),
+                       GPoint(x_end, separator_y - 1));
+  }
 #endif
 
   prv_draw_weather_icon_backgrounds(layout, context);
@@ -1532,9 +1545,10 @@ static void prv_animate_fin_in(WeatherAppLayout *layout, uint32_t total_ms) {
   GSize fin_size = gdraw_command_image_get_bounds_size(layout->fin_pdc);
   GRect to = (GRect){
     GPoint(cl.origin.x + (cl.size.w - fin_size.w) / 2,
-           // Rect: rest in the footer zone (ink under the y196 rule, the
-           // newspaper fin position); round keeps the classic centred rest.
-           cl.origin.y + cl.size.h - fin_size.h + PBL_IF_RECT_ELSE(13, -12)),
+           // Rect: rest in the footer zone — the PDC's ink (rows 12..32 of its
+           // 50px box) vertically centred between the y195 divider and the
+           // screen bottom; round keeps the classic centred rest.
+           cl.origin.y + cl.size.h - fin_size.h + PBL_IF_RECT_ELSE(11, -12)),
     fin_size
   };
   GRect from = to;
@@ -1651,9 +1665,10 @@ static GRect prv_fin_rest_frame(WeatherAppLayout *layout) {
                                       : GSize(0, 0);
   return (GRect){
     GPoint(cl.origin.x + (cl.size.w - fin_size.w) / 2,
-           // Rect: rest in the footer zone (ink under the y196 rule, the
-           // newspaper fin position); round keeps the classic centred rest.
-           cl.origin.y + cl.size.h - fin_size.h + PBL_IF_RECT_ELSE(13, -12)),
+           // Rect: rest in the footer zone — the PDC's ink (rows 12..32 of its
+           // 50px box) vertically centred between the y195 divider and the
+           // screen bottom; round keeps the classic centred rest.
+           cl.origin.y + cl.size.h - fin_size.h + PBL_IF_RECT_ELSE(11, -12)),
     fin_size
   };
 }
