@@ -663,10 +663,6 @@ static NOINLINE void prv_init(void) {
   // Push the animated forecast as the carousel base window.
   prv_on_list_transition_done(data);
 
-  // The Weather Channel intro card: a beat of solid blue, then a cross-dissolve
-  // into the live forecast — the original app's launch feel (drawn as an overlay
-  // INSIDE the forecast window so the dissolve reveals real content, not white).
-  forecast_list_begin_splash();
 }
 
 static void prv_deinit(void) {

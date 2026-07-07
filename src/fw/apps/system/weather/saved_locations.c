@@ -201,6 +201,8 @@ static void prv_confirm_delete_click(ClickRecognizerRef recognizer,
                                      void *context);
 static void prv_confirm_window_unload(Window *window);
 static void prv_result_window_unload(Window *window);
+static void prv_save_custom_locations(void);
+static void prv_compact_customs(void);
 
 static void prv_load_custom_locations(void) {
   if (s_custom_loaded) return;
@@ -278,6 +280,28 @@ static void prv_load_custom_locations(void) {
     s_custom_count = 1;
   }
 #endif
+
+  // Heal any phantom slots (empty label) left by a count/persist desync: they
+  // would otherwise draw as blank "ghost" rows in the list. Compacting here and
+  // re-persisting means a corrupted store fixes itself on the next open.
+  prv_compact_customs();
+}
+
+// Drop custom slots with an empty label (phantoms from a count/persist desync)
+// and close the gaps, so s_custom_locations[0..count-1] are all real. Re-persist
+// only when something actually changed.
+static void prv_compact_customs(void) {
+  if (!s_custom_locations || s_custom_count <= 0) return;
+  int w = 0;
+  for (int r = 0; r < s_custom_count; r++) {
+    if (s_custom_locations[r].label[0] == '\0') continue;   // skip the phantom
+    if (w != r) s_custom_locations[w] = s_custom_locations[r];
+    w++;
+  }
+  if (w != s_custom_count) {
+    s_custom_count = w;
+    prv_save_custom_locations();
+  }
 }
 
 static void prv_save_custom_locations(void) {
@@ -563,6 +587,24 @@ int saved_locations_get_entries(SavedLocationEntry *entries,
   return count;
 }
 
+// A custom slot with an empty label is a phantom (count/persist desync). It must
+// never occupy a row, or it draws as a blank "ghost" cell (user-reported after a
+// voice-add). prv_compact_customs() heals the persisted store on load; these two
+// helpers make the row model count/map only real slots, so even a phantom created
+// mid-session (before the next compaction) can't render.
+static bool prv_custom_slot_valid(int i) {
+  return s_custom_locations && i >= 0 && i < s_custom_count &&
+         s_custom_locations[i].label[0] != '\0';
+}
+
+static int prv_valid_custom_count(void) {
+  int n = 0;
+  for (int i = 0; i < s_custom_count; i++) {
+    if (prv_custom_slot_valid(i)) n++;
+  }
+  return n;
+}
+
 static int prv_num_rows(void) {
   prv_load_custom_locations();
   int rows = 2;  // add row + the always-visible Current Location row
@@ -570,7 +612,7 @@ static int prv_num_rows(void) {
     if (!prv_is_default_saved_preset(i)) continue;
     if ((s_deleted_preset_mask & (1u << i)) == 0) rows++;
   }
-  return rows + s_custom_count;
+  return rows + prv_valid_custom_count();
 }
 
 static int prv_visible_preset_count(void) {
@@ -626,13 +668,21 @@ static int prv_row_for_preset_index(int preset_index) {
   return -1;
 }
 
+// Map a list row to a real custom slot, skipping phantom (empty-label) slots so
+// the k-th custom ROW resolves to the k-th VALID slot (not the k-th array slot).
 static int prv_custom_index_for_row(int row) {
-  return row - prv_custom_start_row();
+  int k = row - prv_custom_start_row();
+  if (k < 0) return -1;
+  for (int i = 0; i < s_custom_count; i++) {
+    if (!prv_custom_slot_valid(i)) continue;
+    if (k == 0) return i;
+    k--;
+  }
+  return -1;
 }
 
 static bool prv_row_is_custom(int row) {
-  int index = prv_custom_index_for_row(row);
-  return index >= 0 && index < s_custom_count;
+  return prv_custom_index_for_row(row) >= 0;
 }
 
 static void prv_draw_plus_row(GContext *ctx, const Layer *cell_layer) {

@@ -2691,11 +2691,6 @@
       "type": "pdc",
       "name": "WEATHER_REPORT_PAPER",
       "file": "normal/base/images/Pebble_80x80_Weather_report.svg"
-    },
-    {
-      "type": "png",
-      "name": "WEATHER_CHANNEL_LOGO",
-      "file": "normal/base/images/weather_channel_logo.png"
     }
   ],
   "timeline": [

@@ -179,12 +179,6 @@ typedef struct {
   void   (*on_select_request_cb)(void *ctx);  // SELECT on the resting main view -> open the condensed view
   void    *on_select_request_ctx;
   int      start_day_index;  // focused day from main view; list opens scrolled here
-  // The Weather Channel intro card, drawn as a topmost overlay of THIS window so
-  // the dissolve is a true cross-fade into the live mainscreen beneath it.
-  int      splash_keep;      // 0 = off; 16 = solid card; 15..1 = dissolving
-  GBitmap *splash_logo;      // 80x80 boxed logo (owned while the splash lives)
-  uint8_t *splash_scratch;   // W*H forecast-frame snapshot for the dissolve
-  AppTimer *splash_timer;
   // First-entry clock-slot intro: the ACTIVE LOCATION holds the top clock slot for
   // 2s, then swaps out with the sunset card's own status-bar swap (both slide right,
   // the time trailing in from the left). Latched once per app run.
@@ -199,12 +193,11 @@ typedef struct {
 static ForecastListData *s_list;
 
 // One 4x4 ordered-dither (bayer) table for every stipple on this screen
-// (icon crossfade + splash dissolve).
+// (icon crossfade).
 static const uint8_t s_bayer4[4][4] = {
   {  0,  8,  2, 10 }, { 12,  4, 14,  6 }, {  3, 11,  1,  9 }, { 15,  7, 13,  5 },
 };
 
-static void prv_draw_splash_overlay(Layer *layer, GContext *ctx);   // defined below
 #if !PBL_ROUND
 static void prv_clock_loc_city(char *dst, size_t dst_size, const char *src);  // defined below
 #endif
@@ -2482,7 +2475,6 @@ static void prv_canvas_draw(Layer *layer, GContext *ctx) {
   if (!s_list) return;
 #if defined(PBL_PLATFORM_GABBRO)
   prv_canvas_draw_gabbro(layer, ctx);
-  prv_draw_splash_overlay(layer, ctx);
   return;
 #endif
 #if WEATHER_ANIM_5DAY
@@ -2548,7 +2540,6 @@ static void prv_canvas_draw(Layer *layer, GContext *ctx) {
     }
   }
 #endif
-  prv_draw_splash_overlay(layer, ctx);   // topmost: the intro card over everything
   return;
 #endif
   GRect bounds = layer_get_bounds(layer);
@@ -2780,8 +2771,7 @@ void forecast_list_replay_location_intro(void) {
 #endif
 }
 
-// Start the 2s hold — called when the screen is actually VISIBLE (first appear when no
-// splash runs; end of the splash dissolve otherwise, so the intro doesn't eat the hold).
+// Start the 2s hold — called when the screen first appears.
 #if !PBL_ROUND
 static void prv_clock_loc_hold(void) {
   if (!s_list || !s_list->clock_loc_show || s_list->clock_loc_timer ||
@@ -2792,114 +2782,8 @@ static void prv_clock_loc_hold(void) {
 }
 #endif
 
-// ---- The Weather Channel splash overlay (the original app's intro, as a true
-// cross-dissolve): solid GColorBlue card + centred logo for the hold, then the
-// card dissolves on the 4x4 bayer grid INTO the live forecast beneath — the
-// dissolve snapshots the forecast frame (drawn first, under this overlay),
-// paints the card, then restores forecast pixels where the grid has opened.
-static void prv_draw_splash_overlay(Layer *layer, GContext *ctx) {
-  if (!s_list || s_list->splash_keep <= 0) return;
-  const GRect b = layer_get_bounds(layer);
-  const bool dissolving = (s_list->splash_keep < 16) && s_list->splash_scratch;
-  if (dissolving) {   // snapshot the forecast frame before the card lands on it
-    GBitmap *fb = graphics_capture_frame_buffer(ctx);
-    if (fb) {
-      for (int y = 0; y < b.size.h; y++) {
-        GBitmapDataRowInfo ri = gbitmap_get_data_row_info(fb, (uint16_t)y);
-        for (int x = ri.min_x; x <= ri.max_x; x++) {
-          s_list->splash_scratch[y * b.size.w + x] = ri.data[x];
-        }
-      }
-      graphics_release_frame_buffer(ctx, fb);
-    }
-  }
-  graphics_context_set_fill_color(ctx, GColorBlue);
-  graphics_fill_rect(ctx, b, 0, GCornerNone);
-  if (s_list->splash_logo) {
-    const GRect ib = gbitmap_get_bounds(s_list->splash_logo);
-    graphics_context_set_compositing_mode(ctx, GCompOpSet);
-    graphics_draw_bitmap_in_rect(ctx, s_list->splash_logo,
-        GRect((b.size.w - ib.size.w) / 2, (b.size.h - ib.size.h) / 2,
-              ib.size.w, ib.size.h));
-    graphics_context_set_compositing_mode(ctx, GCompOpAssign);
-  }
-  if (dissolving) {   // open the grid: forecast pixels return where bayer >= keep
-    GBitmap *fb = graphics_capture_frame_buffer(ctx);
-    if (fb) {
-      for (int y = 0; y < b.size.h; y++) {
-        GBitmapDataRowInfo ri = gbitmap_get_data_row_info(fb, (uint16_t)y);
-        for (int x = ri.min_x; x <= ri.max_x; x++) {
-          if (s_bayer4[y & 3][x & 3] >= s_list->splash_keep) {
-            ri.data[x] = s_list->splash_scratch[y * b.size.w + x];
-          }
-        }
-      }
-      graphics_release_frame_buffer(ctx, fb);
-    }
-  }
-}
-
-static void prv_splash_end(void) {
-  if (!s_list) return;
-  s_list->splash_keep = 0;
-  if (s_list->splash_logo)    { gbitmap_destroy(s_list->splash_logo); s_list->splash_logo = NULL; }
-  if (s_list->splash_scratch) { free(s_list->splash_scratch); s_list->splash_scratch = NULL; }
-#if !PBL_ROUND
-  prv_clock_loc_hold();   // the mainscreen is visible now — start the location's 2s
-#endif
-}
-
-static void prv_splash_tick(void *ctx) {
-  (void)ctx;
-  if (!s_list) return;
-  s_list->splash_timer = NULL;
-  s_list->splash_keep--;
-  if (s_list->splash_keep <= 0) {
-    prv_splash_end();
-  } else {
-    s_list->splash_timer = app_timer_register(25, prv_splash_tick, NULL);
-  }
-  if (s_list->canvas) layer_mark_dirty(s_list->canvas);
-}
-
-static void prv_splash_hold_done(void *ctx) {
-  (void)ctx;
-  if (!s_list) return;
-  s_list->splash_timer = NULL;
-  // The dissolve scratch is allocated HERE, not at begin: begin runs right after
-  // the push, before the window's .load has created the canvas. One second in,
-  // the canvas is long alive. Alloc failure = hard cut (skip the dissolve).
-  if (s_list->canvas && !s_list->splash_scratch) {
-    const GRect b = layer_get_bounds(s_list->canvas);
-    s_list->splash_scratch = malloc_try((size_t)b.size.w * (size_t)b.size.h);
-  }
-  if (!s_list->splash_scratch) {
-    prv_splash_end();
-    if (s_list->canvas) layer_mark_dirty(s_list->canvas);
-    return;
-  }
-  prv_splash_tick(NULL);   // begins the ~400ms dissolve (16 x 25ms)
-}
-
-void forecast_list_begin_splash(void) {
-  if (!s_list || s_list->splash_keep) return;   // canvas may not exist yet — that's fine,
-  s_list->splash_logo =                          // the overlay draws once the window loads
-      gbitmap_create_with_resource(RESOURCE_ID_WEATHER_CHANNEL_LOGO);
-  if (!s_list->splash_logo) return;   // resource missing: skip the intro
-  s_list->splash_keep = 16;           // solid through the hold
-  // The first appear may have armed the location hold already (begin runs after the
-  // push) — the splash owns the screen now; the hold restarts at the dissolve's end.
-  if (s_list->clock_loc_timer) {
-    app_timer_cancel(s_list->clock_loc_timer);
-    s_list->clock_loc_timer = NULL;
-  }
-  s_list->splash_timer = app_timer_register(1000, prv_splash_hold_done, NULL);
-  if (s_list->canvas) layer_mark_dirty(s_list->canvas);
-}
-
 static void prv_click_up_down(ClickRecognizerRef recognizer, void *context) {
   if (!s_list) return;
-  if (s_list->splash_keep > 0) return;   // the intro card owns the screen
   bool down = click_recognizer_get_button_id(recognizer) == BUTTON_ID_DOWN;
 #if WEATHER_ANIM_5DAY
   // Mirror prv_click_select: while an exclusive transition owns the screen (clock burst,
@@ -3039,7 +2923,6 @@ static void prv_click_select(ClickRecognizerRef recognizer, void *context) {
   (void)recognizer;
   (void)context;
   if (!s_list || !s_list->on_select_request_cb) return;
-  if (s_list->splash_keep > 0) return;   // the intro card owns the screen
 #if WEATHER_ANIM_5DAY && !PBL_ROUND
   // Only from the resting main view (State A, no transition in flight) — same condition as the
   // "select" marker that advertises this button.
@@ -3054,7 +2937,6 @@ static void prv_click_select(ClickRecognizerRef recognizer, void *context) {
 #define SWIPE_THRESHOLD 20   // px; same tap/swipe split as clock_face + the original app
 
 static void prv_touch_handler(const TouchEvent *event, void *context) {
-  if (s_list && s_list->splash_keep > 0) return;   // the intro card owns the screen
   (void)context;
   if (!s_list) return;
   if (event->type == TouchEvent_Touchdown) {
@@ -3276,14 +3158,13 @@ static void prv_window_load(Window *window) {
 static void prv_window_appear(Window *window) {
   (void)window;
   // First-entry clock-slot intro: show the active location for 2s, then swap to the
-  // time (sunset-card swap). Latched once per app run; under the splash the hold
-  // starts when the dissolve ends (prv_splash_end) so the intro doesn't eat it.
+  // time (sunset-card swap). Latched once per app run.
 #if !PBL_ROUND
   if (s_list && !s_list->clock_loc_done && s_list->num_days > 0 &&
       s_list->days[0].location_name && s_list->days[0].location_name[0]) {
     s_list->clock_loc_done = true;
     s_list->clock_loc_show = true;
-    if (!s_list->splash_keep) prv_clock_loc_hold();
+    prv_clock_loc_hold();
   }
 #endif
 #if WEATHER_PLATFORM_TOUCH_COLOR
@@ -3332,10 +3213,6 @@ static void prv_window_unload(Window *window) {
 #if WEATHER_PLATFORM_TOUCH_COLOR
   touch_service_unsubscribe();
 #endif
-  if (s_list && s_list->splash_timer) {
-    app_timer_cancel(s_list->splash_timer);
-    s_list->splash_timer = NULL;
-  }
   if (s_list && s_list->clock_loc_timer) {
     app_timer_cancel(s_list->clock_loc_timer);
     s_list->clock_loc_timer = NULL;
@@ -3345,8 +3222,7 @@ static void prv_window_unload(Window *window) {
     s_list->clock_swap_anim = NULL;
     animation_unschedule(a);
   }
-  s_list->clock_loc_show = false;   // splash end below must not re-arm the hold
-  prv_splash_end();
+  s_list->clock_loc_show = false;
   // Fire pop callback before tearing down so the main screen can start its return animation.
   if (s_list && s_list->on_pop_cb) {
     void (*cb)(void *) = s_list->on_pop_cb;
