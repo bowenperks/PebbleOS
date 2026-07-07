@@ -5,15 +5,15 @@
 
 static const CityPreset s_city_presets[CITY_PRESET_COUNT] = {
   { "New York", "United States", 4071, -7401 },
-  { "Toronto", "Canada", 4365, -7938 },
-  { "Rio de Janeiro", "Brazil", -2291, -4317 },
-  { "Reykjavik", "Iceland", 6415, -2194 },
+  { "", "", 0, 0 },   // (non-default preset slots emptied — never listable;
+  { "", "", 0, 0 },   //  indices must stay stable for the deleted-preset persist mask)
+  { "", "", 0, 0 },
   { "London", "United Kingdom", 5151, -13 },
   { "Paris", "France", 4886, 235 },
-  { "Cape Town", "South Africa", -3392, 1842 },
-  { "Dubai", "United Arab Emirates", 2520, 5527 },
-  { "Mumbai", "India", 1908, 7288 },
-  { "Singapore", "Singapore", 135, 10382 },
+  { "", "", 0, 0 },
+  { "", "", 0, 0 },
+  { "", "", 0, 0 },
+  { "", "", 0, 0 },
   { "Tokyo", "Japan", 3568, 13969 },
   { "Sydney", "Australia", -3387, 15121 },
 };

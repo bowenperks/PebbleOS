@@ -43,6 +43,7 @@ static void prv_fill_from_fw(WxDsForecast *out, const WeatherLocationForecast *f
   out->today_wind = -1;
   out->today_feels = WEATHER_SERVICE_LOCATION_FORECAST_UNKNOWN_TEMP;
   out->today_wmo = -1;
+  out->today_wind_dir = -1;
   out->today_humidity = -1;
   out->today_visibility_m = -1;
   out->today_precip_sum_mm = -1;
@@ -115,6 +116,7 @@ static void prv_overlay_v4(WxDsForecast *out, int location_id) {
       out->daily[i].precip = -1;  // minor-0 records carry no per-day metrics
       out->daily[i].wind = -1;
       out->daily[i].uv = -1;
+      out->daily[i].wind_dir = -1;
       out->daily[i].feels = WX_DS_UNKNOWN_TEMP;   // zeroed struct would read as a KNOWN 0°
     }
     if (entry->today_hourly_count == WEATHER_DB_HOURLY_COUNT) {
@@ -135,7 +137,7 @@ static void prv_overlay_v4(WxDsForecast *out, int location_id) {
       }
     }
     // v4.2 appended block (today's raw warning readings + per-day feels-like).
-    if (entry->minor_version >= 2 && len >= (int)WEATHER_DB_V4_FIXED_SIZE) {
+    if (entry->minor_version >= 2 && len >= (int)WEATHER_DB_V4_2_FIXED_SIZE) {
       if (entry->today_wmo_code != 0xFF)         out->today_wmo = entry->today_wmo_code;
       if (entry->today_humidity_pct != 0xFF)     out->today_humidity = entry->today_humidity_pct;
       if (entry->today_visibility_m != 0xFFFF)   out->today_visibility_m = entry->today_visibility_m;
@@ -143,6 +145,17 @@ static void prv_overlay_v4(WxDsForecast *out, int location_id) {
       for (uint8_t i = 0; i < nd; i++) {
         if (entry->daily_feels_like[i] != WEATHER_SERVICE_LOCATION_FORECAST_UNKNOWN_TEMP) {
           out->daily[i].feels = entry->daily_feels_like[i];
+        }
+      }
+    }
+    // v4.3 appended block (dominant wind direction, today + per-day).
+    if (entry->minor_version >= 3 && len >= (int)WEATHER_DB_V4_FIXED_SIZE) {
+      if (entry->today_wind_dir_deg >= 0) {
+        out->today_wind_dir = entry->today_wind_dir_deg;
+      }
+      for (uint8_t i = 0; i < nd; i++) {
+        if (entry->daily_wind_dir_deg[i] >= 0) {
+          out->daily[i].wind_dir = entry->daily_wind_dir_deg[i];
         }
       }
     }
@@ -175,7 +188,8 @@ static void prv_seed_v4_test(WxDsForecast *out) {
   // Today's extended metrics, so the detail view shows UV/precip/wind.
   if (out->today_uv < 0)     out->today_uv = 5;
   if (out->today_precip < 0) out->today_precip = 20;
-  if (out->today_wind < 0)   out->today_wind = 12;
+  if (out->today_wind < 0)     out->today_wind = 12;
+  if (out->today_wind_dir < 0) out->today_wind_dir = 225;   // SW, per the design mock
   // v4.2 warning readings — quiet values (no warning fires; the report's alert
   // stays on the precip path, "Chance of snow" for the seed's LightSnow today).
   if (out->today_wmo < 0)            out->today_wmo = 71;      // WMO light snow
@@ -196,12 +210,13 @@ static void prv_seed_v4_test(WxDsForecast *out) {
     WeatherType_Sun,
   };
   // High-contrast spread (test only): fan days = 25/13, 30/16, 20/10, 28/15, 23/12.
-  static const int kHiDelta[WX_DS_DAYS] = { 0, -3,  2, -8,  0, -5, -1 };
-  static const int kLoDelta[WX_DS_DAYS] = { 0, -5, -2, -8, -3, -6, -1 };
+  static const int8_t kHiDelta[WX_DS_DAYS] = { 0, -3,  2, -8,  0, -5, -1 };
+  static const int8_t kLoDelta[WX_DS_DAYS] = { 0, -5, -2, -8, -3, -6, -1 };
   // Per-day precip % + wind mph + UV index — test seed only (real v4 is today-only → future = -1).
-  static const int kPrecip[WX_DS_DAYS] = { 20, 10, 15, 55, 80, 25, 5 };
-  static const int kWind[WX_DS_DAYS]   = { 12,  8, 14, 20, 25, 10, 6 };
-  static const int kUv[WX_DS_DAYS]     = {  5,  6,  3,  2,  1,  5, 7 };  // sunnier days -> higher UV
+  static const int8_t kPrecip[WX_DS_DAYS] = { 20, 10, 15, 55, 80, 25, 5 };
+  static const int8_t kWind[WX_DS_DAYS]   = { 12,  8, 14, 20, 25, 10, 6 };
+  static const int8_t kUv[WX_DS_DAYS]     = {  5,  6,  3,  2,  1,  5,  7 };
+  static const int16_t kDir[WX_DS_DAYS]   = { 225, 270, 90, 200, 180, 315, 135 };  // varied compass spread
 
   out->num_daily = WX_DS_DAYS;
   out->daily[0].high = hi;
@@ -209,6 +224,7 @@ static void prv_seed_v4_test(WxDsForecast *out) {
   out->daily[0].type = t0;
   out->daily[0].precip = out->today_precip;  // today's value (set above)
   out->daily[0].wind   = out->today_wind;
+  out->daily[0].wind_dir = out->today_wind_dir;
   out->daily[0].uv     = out->today_uv;
   out->daily[0].feels  = out->today_feels;
   for (int i = 1; i < WX_DS_DAYS; i++) {
@@ -217,6 +233,7 @@ static void prv_seed_v4_test(WxDsForecast *out) {
     out->daily[i].type = kTypes[i];
     out->daily[i].precip = kPrecip[i];
     out->daily[i].wind   = kWind[i];
+    out->daily[i].wind_dir = kDir[i];
     out->daily[i].uv     = kUv[i];
     out->daily[i].feels  = out->daily[i].high - 2;   // plausible per-day apparent temp
   }
@@ -306,6 +323,7 @@ static void prv_qemu_synth(int index, WxDsForecast *out) {
   out->today_wind = -1;
   out->today_feels = WX_DS_UNKNOWN_TEMP;   // zeroed struct would read as a KNOWN 0deg
   out->today_wmo = -1;                     // same trap: zeroed = WMO 0 "clear" / 0m visibility
+  out->today_wind_dir = -1;                // zeroed = a KNOWN due-north wind
   out->today_humidity = -1;
   out->today_visibility_m = -1;
   out->today_precip_sum_mm = -1;

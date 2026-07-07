@@ -41,13 +41,12 @@ typedef struct {
   char     time_str[10];           // status bar time
   char     sunset_str[20];         // "Sunset 9:30 PM"
   char     temp_str[16];           // "23/14°"
-  char     loc_str[64];            // unused on the card now (kept for the shared formatter)
   // Content entrance: the card content slides in from the left + bounces (Timeline card entrance).
   AnimationProgress text_p;
   Animation        *text_anim;
   bool              text_active;
   ExpandedViewEntrance entrance;            // how the card animates in on first appear (latched off after)
-  // Status bar: show "Last updated ..." for 3s, then swap it out to the right while the time swoops
+  // Status bar: show "Last updated ..." for 2s, then swap it out to the right while the time swoops
   // in from the left.
   char              updated_str[24];        // "Last updated 8:23 PM"
   bool              show_updated;           // true until the swap completes
@@ -187,10 +186,11 @@ static void prv_set_from_forecast(const WeatherLocationForecast *f,
   s_ev->utc_off_min = utc_off_min;
   prv_build_time(s_ev->time_str, sizeof(s_ev->time_str));
   expanded_view_format_updated(f, s_ev->updated_str, sizeof(s_ev->updated_str));
+  char loc_scratch[64];   // the card doesn't display it; the shared formatter needs a sink
   expanded_view_format_glance(f, lat_e2, lon_e2, utc_off_min,
                               s_ev->sunset_str, sizeof(s_ev->sunset_str),
                               s_ev->temp_str, sizeof(s_ev->temp_str),
-                              s_ev->loc_str, sizeof(s_ev->loc_str));
+                              loc_scratch, sizeof(loc_scratch));
 
   if (s_ev->icon) { gdraw_command_image_destroy(s_ev->icon); s_ev->icon = NULL; }
   if (!f) {
@@ -220,14 +220,8 @@ static void prv_set_from_forecast(const WeatherLocationForecast *f,
 
 // WHO UV-index severity color — the SAME ramp as the condensed screen's UV
 // tally squares (weather_app_layout.c), so the dial and the squares always
-// tell the same story: 0-2 green, 3-5 yellow, 6-7 orange, 8-10 red, 11+ violet.
-static GColor prv_uv_severity_color(int uv) {
-  return (uv <= 2)  ? GColorIslamicGreen
-       : (uv <= 5)  ? GColorChromeYellow
-       : (uv <= 7)  ? GColorOrange
-       : (uv <= 10) ? GColorRed
-                    : GColorVividViolet;
-}
+// tell the same story: 0-2 green, 3-5 yellow, 6-7 orange, 8+ red (incl. off-scale).
+#define prv_uv_severity_color weather_uv_severity_color
 
 static void prv_draw_gauge(GContext *ctx, int cx, int cy, int r, const char *label,
                            int value, int max_val, const char *unit, bool unknown,
@@ -487,7 +481,7 @@ static void prv_start_text_in(void) {
   animation_schedule(s_ev->text_anim);
 }
 
-// ---- Status bar: "Last updated ..." -> time swap (3s after appear) --------
+// ---- Status bar: "Last updated ..." -> time swap (2s after appear) --------
 
 static void prv_swap_update(Animation *anim, AnimationProgress progress) {
   if (!s_ev) return;
@@ -531,9 +525,9 @@ static void prv_window_appear(Window *window) {
 #if WEATHER_PLATFORM_TOUCH_COLOR
   touch_service_subscribe(prv_touch_handler, s_ev);
 #endif
-  // Hold "Last updated ..." for 3s, then swap it out for the time (once).
+  // Hold "Last updated ..." for 2s, then swap it out for the time (once).
   if (!s_ev->updated_timer && s_ev->show_updated && !s_ev->swap_active) {
-    s_ev->updated_timer = app_timer_register(3000, prv_updated_timer_cb, NULL);
+    s_ev->updated_timer = app_timer_register(2000, prv_updated_timer_cb, NULL);
   }
   // Play the entrance animation (latched off after the first appearance so button-nav re-appears
   // don't replay it). Static = no entrance (the forecast's hero icon-fly already animated it in).

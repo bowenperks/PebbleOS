@@ -74,13 +74,16 @@ typedef struct WeatherAppLayout {
   struct {
     // Pre-formatted strings snapshot of the OUTGOING text (captured before forecast pointer updates)
     char top_label[16];
-    char top_phrase[20];   // condition text (rect right column)
-    char top_feels[16];    // "FEELS 21°" (rect left column; empty = hidden)
     char top_temp[15];
     char top_highlow[15];
-    char top_rain[12];
+#if PBL_ROUND
+    char top_rain[12];     // the metric row (round-only reader)
     char top_wind[16];
-    char top_uv[12];
+#else
+    char top_uv[12];       // UV bar numeral
+    char top_phrase[20];   // condition line
+    char top_desc[72];     // forecast description (warning/wind/precip)
+#endif
     char bot_label[16];
     char bot_highlow[15];
     bool bot_valid;

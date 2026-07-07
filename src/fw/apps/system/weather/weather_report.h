@@ -15,8 +15,6 @@
 // `days` is BORROWED (not copied) — the caller (weather.c) owns it for the app's lifetime.
 void weather_report_push(const WeatherLocationForecast *days, size_t num_days, int start_day_index);
 
-// Arm the SELECT expand-in (the page slides in from the right) for the NEXT push.
-void weather_report_arm_select_in(void);
 
 // Arm a hard-cut entrance for the NEXT push (no system slide, no slide-in) — used when a
 // transition scene (the unfold) has already delivered the entrance. Rect only.

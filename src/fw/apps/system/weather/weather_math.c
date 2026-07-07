@@ -10,6 +10,16 @@ int64_t weather_interpolate_moook_soft1(int32_t n, int64_t from, int64_t to) {
   return interpolate_moook_soft(n, from, to, 1);
 }
 
+// WHO UV-index severity color — ONE copy for every UV readout in the app
+// (the expanded card's dial + the report page's UV bar tell the same story):
+// 0-2 green, 3-5 yellow, 6-7 orange, 8+ red (incl. off-scale, per user).
+GColor weather_uv_severity_color(int uv) {
+  return (uv <= 2)  ? GColorIslamicGreen
+       : (uv <= 5)  ? GColorChromeYellow
+       : (uv <= 7)  ? GColorOrange
+                    : GColorRed;
+}
+
 const uint8_t weather_diurnal_curve[24] = {
    10,  6,  3,  0,  0,  3,  8, 16, 28, 42, 56, 70,
    82, 92, 98, 100, 96, 88, 76, 62, 48, 36, 26, 17,
@@ -40,10 +50,11 @@ void weather_render_squash(GContext *ctx, uint8_t *scratch, AnimationProgress m,
     memcpy(scratch + (uint32_t)y * W, ri.data + ri.min_x, W);
   }
   const uint8_t white = GColorWhite.argb;
-  if (mode == WEATHER_SQUASH_LEFT_EXIT || mode == WEATHER_SQUASH_RIGHT_IN) {
-    // Horizontal jelly (the vertical grammar rotated 90°).
+  if (mode == WEATHER_SQUASH_LEFT_EXIT) {
+    // Horizontal jelly (the vertical grammar rotated 90°). RIGHT_IN (mode 7) was
+    // trimmed with its last caller (the report's old squash-in entrance).
     int left_edge, right_edge;
-    if (mode == WEATHER_SQUASH_LEFT_EXIT) {
+    {
       // Left edge leads 0 -> -W (delay 0); right trails the HALF-lag (average of leading
       // and 1/6-lagged), both clamped to rest so the moook anticipation never pokes the
       // frame rightward (same reasoning as the UP_EXIT clamp).
@@ -51,12 +62,6 @@ void weather_render_squash(GContext *ctx, uint8_t *scratch, AnimationProgress m,
       right_edge = (prv_jelly_edge(m, 0, W, 0) + prv_jelly_edge(m, 1, W, 0)) / 2;
       if (left_edge > 0)  left_edge  = 0;
       if (right_edge > W) right_edge = W;
-    } else {
-      // RIGHT_IN (RISE_IN rotated): left edge leads W -> 0 into place; right trails
-      // 2W -> W. The trailing edge's overshoot past W is the landing jelly — keep it.
-      left_edge  = prv_jelly_edge(m, 0, W, 0);
-      right_edge = prv_jelly_edge(m, 1, 2 * W, W);
-      if (left_edge < 0) left_edge = 0;   // pin the leading overshoot at rest
     }
     int dst_w = right_edge - left_edge;
     if (dst_w < 1) dst_w = 1;
@@ -262,13 +267,8 @@ void weather_draw_lava_ring(GContext *ctx, GPoint center, int outer_r,
     span += (int32_t)close * (half / WEATHER_GLOW_WRAP_CLOSE_TICKS);
   }
 
-  int halo_r = outer_r + 3;
-  GRect halo_rect = { GPoint(center.x - halo_r, center.y - halo_r),
-                      GSize(halo_r * 2, halo_r * 2) };
-  graphics_context_set_fill_color(ctx, PBL_IF_COLOR_ELSE(GColorCeleste, GColorWhite));
-  prv_fill_wrapped_radial(ctx, halo_rect, 1, phase, span);
-  prv_fill_wrapped_radial(ctx, halo_rect, 1, neg, span);
-
+  // (The faded Celeste outer halo ring was removed 2026-07-07 by request —
+  // the temp keeps just the solid condition-colored ring + sparks/beads.)
   GRect ring_rect = { GPoint(center.x - outer_r, center.y - outer_r),
                       GSize(outer_r * 2, outer_r * 2) };
   graphics_context_set_fill_color(ctx, glow_color);

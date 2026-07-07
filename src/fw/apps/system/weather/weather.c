@@ -41,8 +41,9 @@ typedef struct WeatherAppData {
 
   WeatherLocationForecast days[WX_MAX_DAYS];
   char location_buf[64];
-  char phrase_buf[WX_MAX_DAYS][32];
-  char label_buf[WX_MAX_DAYS][16];
+  char phrase_buf0[32];               // day 0: the record's real short_phrase
+  char phrase_buf[WX_MAX_DAYS][15];   // days 1+: derived ("Partly Cloudy" max); row 0 unused (day 0 = phrase_buf0), kept for index parity with days[]
+  char label_buf[WX_MAX_DAYS][10];    // "Wednesday" is the widest
 
   // Today's hourly series (v4; clock dial glyphs + Select temperature reveal).
   // The v4 record carries hourly for TODAY only, so this applies to day 0.
@@ -133,7 +134,7 @@ static void prv_fill_days_from_ds(WeatherAppData *data, const WxDsForecast *ds) 
   data->utc_offset_min = ds->utc_offset_min;
 
   // Day 0 = today (full current metrics; v4 fills UV/precip/wind, else -1).
-  snprintf(data->phrase_buf[0], sizeof(data->phrase_buf[0]), "%s", ds->short_phrase);
+  snprintf(data->phrase_buf0, sizeof(data->phrase_buf0), "%s", ds->short_phrase);
   prv_day_label(0, data->label_buf[0], sizeof(data->label_buf[0]));
   data->days[0] = (WeatherLocationForecast) {
     .location_name = data->location_buf,
@@ -144,13 +145,14 @@ static void prv_fill_days_from_ds(WeatherAppData *data, const WxDsForecast *ds) 
     .today_uv = ds->today_uv,
     .today_precip_mm = ds->today_precip,
     .today_wind_mph = ds->today_wind,
+    .today_wind_dir_deg = ds->today_wind_dir,
     .today_feels = ds->today_feels,
     .today_wmo = ds->today_wmo,
     .today_humidity = ds->today_humidity,
     .today_visibility_m = (int)ds->today_visibility_m,
     .today_precip_sum_mm = ds->today_precip_sum_mm,
     .current_weather_type = (WeatherType)ds->current_weather_type,
-    .current_weather_phrase = data->phrase_buf[0],
+    .current_weather_phrase = data->phrase_buf0,
     .label = data->label_buf[0],
     .time_updated_utc = ds->time_updated_utc,
   };
@@ -176,6 +178,7 @@ static void prv_fill_days_from_ds(WeatherAppData *data, const WxDsForecast *ds) 
         .today_uv = ds->daily[i].uv,             // per-day UV (seed; -1 for real v4)
         .today_precip_mm = ds->daily[i].precip,  // per-day precip + wind (seed; -1 for real v4)
         .today_wind_mph = ds->daily[i].wind,
+        .today_wind_dir_deg = ds->daily[i].wind_dir,
         .today_feels = ds->daily[i].feels,       // per-day feels-like (v4.2 daily_feels_like)
         .today_wmo = -1,             // warning readings are today-only (v4.2)
         .today_humidity = -1,
@@ -205,6 +208,7 @@ static void prv_fill_days_from_ds(WeatherAppData *data, const WxDsForecast *ds) 
         .today_uv = -1,
         .today_precip_mm = -1,
         .today_wind_mph = -1,
+        .today_wind_dir_deg = -1,
         .today_feels = WEATHER_SERVICE_LOCATION_FORECAST_UNKNOWN_TEMP,  // zeroed = a KNOWN 0°
         .today_wmo = -1,
         .today_humidity = -1,
@@ -307,8 +311,8 @@ static void prv_push_clock(WeatherAppData *data, bool static_push) {
   // is synthesized from that day's high/low + type (a placeholder until the v4 struct is
   // extended to carry per-day hourly for the phone to populate — today is the only
   // day the record carries hourly for today).
-  static uint8_t s_hourly_type[24];
-  static int8_t  s_hourly_temp[24];
+  uint8_t s_hourly_type[24];   // stack scratch — every consumer copies synchronously
+  int8_t  s_hourly_temp[24];
   const uint8_t *hourly_types = NULL;
   bool have_hourly = false;
 
@@ -386,6 +390,8 @@ static void prv_expanded_select_to_globe(void *ctx) {
     globe_view_set_current_location(data->globe_view, data->current_loc_buf,
                                     data->current_lat_e2, data->current_lon_e2);
   }
+  // Open hovering the ACTIVE location's pin — the city last selected to look at.
+  globe_view_focus_coords(data->globe_view, data->latitude_e2, data->longitude_e2);
   s_page = PAGE_GLOBE;
   globe_view_push_slide_in_right(data->globe_view);
   expanded_view_dismiss(false);   // remove the card, now hidden beneath the globe
@@ -449,6 +455,7 @@ static void prv_push_globe(WeatherAppData *data, bool animated) {
     globe_view_set_current_location(data->globe_view, data->current_loc_buf,
                                     data->current_lat_e2, data->current_lon_e2);
   }
+  globe_view_focus_coords(data->globe_view, data->latitude_e2, data->longitude_e2);
   globe_view_push_animated(data->globe_view, animated);
 }
 
@@ -456,19 +463,7 @@ static void prv_on_city_select_requested(void *ctx) {
   prv_push_globe((WeatherAppData *)ctx, true);
 }
 
-static void prv_globe_down_to_expanded(void *ctx) {
-  WeatherAppData *data = (WeatherAppData *)ctx;
-  // DOWN off the globe now lands on the expanded card (globe -> card -> forecast). Dismiss the
-  // globe (and any clock) to reveal the forecast base, then bring the card up on top of it.
-  if (data->globe_view) {
-    globe_view_dismiss(data->globe_view, false);
-  }
-  if (clock_face_is_showing()) {
-    clock_face_dismiss(false);
-  }
-  s_page = PAGE_EXPANDED;
-  prv_push_expanded(data, ExpandedViewEntranceTextFromLeft);   // globe DOWN: the card slides its text in
-}
+// (globe DOWN-to-expanded path deleted with the dead main_callback chain)
 
 static void prv_globe_back_to_expanded(void *ctx) {
   WeatherAppData *data = (WeatherAppData *)ctx;
@@ -550,6 +545,9 @@ static void prv_globe_location_selected(SavedLocationKind kind, int preset_index
     data->active_index = idx;
     data->current_day_index = 0;
     prv_refresh(data);
+    // The globe's self-pop reveals the mainscreen next: replay the clock-slot
+    // intro so the NEW city's name holds the top slot, then swaps to the time.
+    forecast_list_replay_location_intro();
   } else {
     // The phone hasn't synced a weather record for this city (the mobile app must
     // sync one v4 record per saved location) — nothing to display, so keep the
@@ -573,6 +571,9 @@ static void prv_on_saved_location_selected(SavedLocationKind kind, int preset_in
     data->active_index = idx;
     data->current_day_index = 0;
     prv_refresh(data);
+    // This list eventually unwinds to the mainscreen too — replay the clock-slot
+    // intro so the NEW city's name greets the reveal (same as the globe commit).
+    forecast_list_replay_location_intro();
   }
 }
 
@@ -641,7 +642,6 @@ static NOINLINE void prv_init(void) {
   if (data->globe_view) {
     globe_view_set_location_select_callback(data->globe_view,
                                             prv_globe_location_selected, data);
-    globe_view_set_main_callback(data->globe_view, prv_globe_down_to_expanded, data);
     globe_view_set_back_callback(data->globe_view, prv_globe_back_to_expanded, data);
     globe_view_set_saved_locations_callback(data->globe_view, prv_open_saved_locations, data);
     if (data->current_lat_e2 != INT16_MIN && data->current_lon_e2 != INT16_MIN) {
@@ -662,6 +662,11 @@ static NOINLINE void prv_init(void) {
 
   // Push the animated forecast as the carousel base window.
   prv_on_list_transition_done(data);
+
+  // The Weather Channel intro card: a beat of solid blue, then a cross-dissolve
+  // into the live forecast — the original app's launch feel (drawn as an overlay
+  // INSIDE the forecast window so the dissolve reveals real content, not white).
+  forecast_list_begin_splash();
 }
 
 static void prv_deinit(void) {
@@ -673,6 +678,7 @@ static void prv_deinit(void) {
       s_data->globe_view = NULL;
     }
   }
+  saved_locations_reset();   // the custom-location cache lives on the dying app heap
   s_data = NULL;
 }
 

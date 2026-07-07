@@ -38,6 +38,9 @@ void weather_fill_weekday_abbrev(int day_offset, const char *fallback,
 // synth in weather.c and the v4 test seed in weather_data_source.c.
 extern const uint8_t weather_diurnal_curve[24];
 
+//! WHO UV severity ramp (shared by the card dial + the report UV bar).
+GColor weather_uv_severity_color(int uv);
+
 void weather_draw_lava_ring(GContext *ctx, GPoint center, int outer_r,
                             GColor glow_color, uint32_t phase,
                             uint8_t idle_progress);
@@ -61,6 +64,5 @@ void weather_draw_lava_ring(GContext *ctx, GPoint center, int outer_r,
 #define WEATHER_SQUASH_LEFT_EXIT  6
 // Mode 7: the weather report's entrance — RISE_IN rotated 90°: the whole screen
 // jelly-stretches IN from the RIGHT (left edge leads into place, right trails).
-#define WEATHER_SQUASH_RIGHT_IN   7
 void weather_render_squash(GContext *ctx, uint8_t *scratch, AnimationProgress m, int mode);
 #endif

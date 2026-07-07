@@ -20,7 +20,7 @@
 #define RESOURCE_ID_IMAGE_GENERIC_WEATHER_TINY  508
 
 // ---- SMALL (50x50 PNG / WX_*_SMALL) ----
-// RESOURCE_ID_IMAGE_SUNNY_DAY_SMALL provided by the real resource_ids.auto.h (id 8)
+// RESOURCE_ID_IMAGE_SUNNY_DAY_SMALL provided by the real resource_ids.auto.h (id 7)
 #define RESOURCE_ID_IMAGE_PARTLY_CLOUDY_SMALL   495
 #define RESOURCE_ID_IMAGE_CLOUDY_DAY_SMALL      497
 #define RESOURCE_ID_IMAGE_LIGHT_RAIN_SMALL      499

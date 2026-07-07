@@ -4,6 +4,8 @@
 #include "saved_locations.h"
 
 #include "city_presets.h"
+
+_Static_assert(CITY_PRESET_COUNT <= INT8_MAX, "SavedLocationEntry.preset_index is int8_t");
 #include "resource_ids.pin.h"
 #include "weather_data_source.h"
 #include "pbl/services/comm_session/session.h"
@@ -14,7 +16,7 @@
 #define SAVED_LOCATIONS_PERSIST_LABEL_KEY_BASE 6110
 #define SAVED_LOCATIONS_PERSIST_QUERY_KEY_BASE 6120
 #define SAVED_LOCATIONS_PERSIST_DELETED_PRESETS_KEY 6130
-#define SAVED_LOCATIONS_PERSIST_CURRENT_VISIBLE_KEY 6131
+// (persist key 6131, CURRENT_VISIBLE, retired — the row is always shown)
 #define SAVED_LOCATIONS_PERSIST_DEFAULT_PRESETS_V1_KEY 6132
 #define SAVED_LOCATIONS_PERSIST_LAT_KEY_BASE 6140
 #define SAVED_LOCATIONS_PERSIST_LON_KEY_BASE 6150
@@ -77,7 +79,6 @@ static SavedLocationsView *s_view;
 static SavedCustomLocation *s_custom_locations;
 static int s_custom_count;
 static uint16_t s_deleted_preset_mask;
-static bool s_current_visible;
 static bool s_custom_loaded;
 
 // ---- At-a-glance weather for the list rows ---------------------------------
@@ -207,7 +208,6 @@ static void prv_load_custom_locations(void) {
 
   s_custom_count = 0;
   s_deleted_preset_mask = 0;
-  s_current_visible = true;
 
   if (persist_exists(SAVED_LOCATIONS_PERSIST_DELETED_PRESETS_KEY)) {
     s_deleted_preset_mask =
@@ -219,8 +219,6 @@ static void prv_load_custom_locations(void) {
                       s_deleted_preset_mask);
     persist_write_int(SAVED_LOCATIONS_PERSIST_DEFAULT_PRESETS_V1_KEY, 1);
   }
-  s_current_visible = true;
-  persist_write_int(SAVED_LOCATIONS_PERSIST_CURRENT_VISIBLE_KEY, 1);
 
   if (persist_exists(SAVED_LOCATIONS_PERSIST_COUNT_KEY)) {
     s_custom_count = persist_read_int(SAVED_LOCATIONS_PERSIST_COUNT_KEY);
@@ -263,6 +261,7 @@ static void prv_load_custom_locations(void) {
       s_custom_locations[i].query[sizeof(s_custom_locations[i].query) - 1] = '\0';
     }
   }
+
 
 #if defined(CONFIG_SOC_QEMU)
   // QEMU test artifact (the emulator has no dictation): on a fresh persist store,
@@ -309,8 +308,6 @@ static void prv_save_custom_locations(void) {
 static void prv_save_builtin_locations(void) {
   persist_write_int(SAVED_LOCATIONS_PERSIST_DELETED_PRESETS_KEY,
                     (int)s_deleted_preset_mask);
-  persist_write_int(SAVED_LOCATIONS_PERSIST_CURRENT_VISIBLE_KEY,
-                    s_current_visible ? 1 : 0);
 }
 
 // ---- Watch -> phone: dictated-location sync (endpoint 6100) ----------------
@@ -334,19 +331,17 @@ static void prv_save_builtin_locations(void) {
 #define WEATHER_LOCATION_CMD_REMOVE 2
 
 typedef struct {
-  uint8_t state;   // 0 = free; 1 = ready (app task fills, system task clears)
   uint8_t cmd;
   uint8_t len;
   char query[SAVED_LOCATION_QUERY_SIZE];
-} PendingLocationMsg;
+} PendingLocationMsg;   // kernel-heap, one per in-flight send
 
-// Static slots (firmware .bss): safe for the system-task callback even if the
-// weather app exits before it runs. One slot per custom + add/remove slack.
-static PendingLocationMsg s_loc_msgs[SAVED_LOCATIONS_MAX_CUSTOM + 2];
-
+// Messages live on the KERNEL heap (not app heap — the system-task callback can
+// run after the app exits; not firmware .bss — 536 B resident for a rare event).
+// kernel_zalloc (NON-_check: on kernel OOM we drop the send silently, exactly the
+// old queue-full behavior) + kernel_free in the callback and on queue failure.
 static void prv_location_msg_send_cb(void *data) {
   PendingLocationMsg *msg = (PendingLocationMsg *)data;
-  if (msg->state != 1) return;
   CommSession *session = comm_session_get_system_session();
   if (session) {
     uint8_t buf[2 + SAVED_LOCATION_QUERY_SIZE];
@@ -357,26 +352,35 @@ static void prv_location_msg_send_cb(void *data) {
                            (size_t)(2 + msg->len),
                            COMM_SESSION_DEFAULT_TIMEOUT);
   }
-  msg->state = 0;
+  kernel_free(msg);
 }
 
 static void prv_send_location_request(uint8_t cmd, const char *query) {
   if (!query || !query[0]) return;
   size_t len = strlen(query);
   if (len > SAVED_LOCATION_QUERY_SIZE) len = SAVED_LOCATION_QUERY_SIZE;
-  for (size_t i = 0; i < sizeof(s_loc_msgs) / sizeof(s_loc_msgs[0]); i++) {
-    PendingLocationMsg *msg = &s_loc_msgs[i];
-    if (msg->state != 0) continue;
-    msg->cmd = cmd;
-    msg->len = (uint8_t)len;
-    memcpy(msg->query, query, len);
-    msg->state = 1;   // publish BEFORE queueing (the callback checks it)
-    if (!system_task_add_callback(prv_location_msg_send_cb, msg)) {
-      msg->state = 0;   // queue full — drop; the launch re-send recovers ADDs
-    }
-    return;
+  PendingLocationMsg *msg = kernel_zalloc(sizeof(*msg));
+  if (!msg) return;   // kernel OOM: drop; the launch re-send recovers ADDs
+  msg->cmd = cmd;
+  msg->len = (uint8_t)len;
+  memcpy(msg->query, query, len);
+  if (!system_task_add_callback(prv_location_msg_send_cb, msg)) {
+    kernel_free(msg);   // queue full — drop; the launch re-send recovers ADDs
   }
-  // No free slot: drop. ADDs are recovered by the launch re-send.
+}
+
+// Graceful-exit reset: s_custom_locations lives on the APP heap but is cached
+// in firmware statics — without this, the SECOND Weather launch per boot reads
+// and writes through a dangling pointer (and can persist garbage). Called from
+// the app's deinit; a force-killed app (deinit timeout) skips this, same as the
+// other firmware statics here.
+void saved_locations_reset(void) {
+  if (s_custom_locations) {
+    free(s_custom_locations);
+    s_custom_locations = NULL;
+  }
+  s_custom_loaded = false;
+  s_custom_count = 0;
 }
 
 void saved_locations_send_pending_queries(void) {
@@ -561,8 +565,7 @@ int saved_locations_get_entries(SavedLocationEntry *entries,
 
 static int prv_num_rows(void) {
   prv_load_custom_locations();
-  int rows = 1;  // add row
-  if (s_current_visible) rows++;
+  int rows = 2;  // add row + the always-visible Current Location row
   for (int i = 0; i < CITY_PRESET_COUNT; i++) {
     if (!prv_is_default_saved_preset(i)) continue;
     if ((s_deleted_preset_mask & (1u << i)) == 0) rows++;
@@ -580,11 +583,11 @@ static int prv_visible_preset_count(void) {
 }
 
 static int prv_current_row(void) {
-  return s_current_visible ? 1 : -1;
+  return 1;   // the Current Location row is always visible
 }
 
 static int prv_preset_start_row(void) {
-  return 1 + (s_current_visible ? 1 : 0);
+  return 2;   // add row + Current Location
 }
 
 static int prv_custom_start_row(void) {
@@ -592,7 +595,7 @@ static int prv_custom_start_row(void) {
 }
 
 static bool prv_row_is_current(int row) {
-  return s_current_visible && row == prv_current_row();
+  return row == prv_current_row();
 }
 
 static int prv_preset_index_for_row(int row) {
@@ -747,9 +750,12 @@ static void prv_draw_row(GContext *ctx, const Layer *cell_layer,
 
   if (prv_row_is_custom(row)) {
     int custom_index = prv_custom_index_for_row(row);
+    // NULL subtitle: a custom city without a synced glance draws as a clean
+    // single-line cell — the old "Saved Location" category line underneath
+    // read as its own hoverable row (user-reported).
     prv_draw_glance_row(ctx, cell_layer,
                         s_custom_locations[custom_index].label,
-                        "Saved Location",
+                        NULL,
                         prv_glance_find(s_custom_locations[custom_index].label,
                                         false));
   }
@@ -1440,7 +1446,7 @@ void saved_locations_push(const SavedLocationsConfig *config) {
   menu_layer_set_click_config_onto_window(view->menu_layer, view->window);
   layer_add_child(root, menu_layer_get_layer(view->menu_layer));
 
-  int selected_row = s_current_visible ? prv_current_row() : SAVED_LOCATIONS_ROW_ADD;
+  int selected_row = prv_current_row();
   if (view->active_city_index >= 0) {
     int row = prv_row_for_preset_index(view->active_city_index);
     if (row >= 0) selected_row = row;
@@ -1457,13 +1463,6 @@ void saved_locations_push(const SavedLocationsConfig *config) {
                                 MenuIndex(0, selected_row),
                                 MenuRowAlignCenter, false);
 
-  view->dictation_session = dictation_session_create(64,
-                                                     prv_dictation_callback,
-                                                     view);
-  if (view->dictation_session) {
-    dictation_session_enable_confirmation(view->dictation_session, true);
-    dictation_session_enable_error_dialogs(view->dictation_session, true);
-  }
-
+  // (dictation session is created lazily on the + row — the eager duplicate is gone)
   window_stack_push(view->window, true);
 }

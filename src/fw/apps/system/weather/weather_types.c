@@ -26,7 +26,7 @@ GColor weather_type_bg_color(WeatherType weather_type) {
 }
 
 uint32_t weather_type_icon_tiny_resource(WeatherType weather_type) {
-  static const uint32_t s_resources[] = {
+  static const uint16_t s_resources[] = {
     RESOURCE_ID_IMAGE_PARTLY_CLOUDY_TINY,
     RESOURCE_ID_IMAGE_CLOUDY_DAY_TINY,
     RESOURCE_ID_IMAGE_LIGHT_SNOW_TINY,
@@ -43,26 +43,27 @@ uint32_t weather_type_icon_tiny_resource(WeatherType weather_type) {
 
 uint32_t weather_type_icon_small_resource(WeatherType weather_type) {
 #if PBL_DISPLAY_HEIGHT >= 200
-  static const uint32_t s_resources[] = {
-    RESOURCE_ID_IMAGE_PARTLY_CLOUDY_SMALL,
-    RESOURCE_ID_IMAGE_CLOUDY_DAY_SMALL,
-    RESOURCE_ID_IMAGE_LIGHT_SNOW_SMALL,
-    RESOURCE_ID_IMAGE_LIGHT_RAIN_SMALL,
-    RESOURCE_ID_IMAGE_HEAVY_RAIN_SMALL,
-    RESOURCE_ID_IMAGE_HEAVY_SNOW_SMALL,
-    RESOURCE_ID_IMAGE_GENERIC_WEATHER_SMALL,
-    RESOURCE_ID_IMAGE_SUNNY_DAY_SMALL,
-    RESOURCE_ID_IMAGE_RAIN_AND_SNOW_SMALL,
-    RESOURCE_ID_IMAGE_GENERIC_WEATHER_SMALL,
-  };
-  return s_resources[weather_type_slot_index(weather_type)];
+  // Every SMALL id sits exactly one above its TINY twin — except Sun, whose
+  // SMALL is a separate legacy asset. Asserts pin the id-order invariant.
+  _Static_assert(RESOURCE_ID_IMAGE_PARTLY_CLOUDY_SMALL == RESOURCE_ID_IMAGE_PARTLY_CLOUDY_TINY + 1, "id order");
+  _Static_assert(RESOURCE_ID_IMAGE_CLOUDY_DAY_SMALL == RESOURCE_ID_IMAGE_CLOUDY_DAY_TINY + 1, "id order");
+  _Static_assert(RESOURCE_ID_IMAGE_LIGHT_SNOW_SMALL == RESOURCE_ID_IMAGE_LIGHT_SNOW_TINY + 1, "id order");
+  _Static_assert(RESOURCE_ID_IMAGE_LIGHT_RAIN_SMALL == RESOURCE_ID_IMAGE_LIGHT_RAIN_TINY + 1, "id order");
+  _Static_assert(RESOURCE_ID_IMAGE_HEAVY_RAIN_SMALL == RESOURCE_ID_IMAGE_HEAVY_RAIN_TINY + 1, "id order");
+  _Static_assert(RESOURCE_ID_IMAGE_HEAVY_SNOW_SMALL == RESOURCE_ID_IMAGE_HEAVY_SNOW_TINY + 1, "id order");
+  _Static_assert(RESOURCE_ID_IMAGE_GENERIC_WEATHER_SMALL == RESOURCE_ID_IMAGE_GENERIC_WEATHER_TINY + 1, "id order");
+  _Static_assert(RESOURCE_ID_IMAGE_RAIN_AND_SNOW_SMALL == RESOURCE_ID_IMAGE_RAIN_AND_SNOW_TINY + 1, "id order");
+  if (weather_type_slot_index(weather_type) == 7) {
+    return RESOURCE_ID_IMAGE_SUNNY_DAY_SMALL;   // the one exception (slot 7 = Sun)
+  }
+  return weather_type_icon_tiny_resource(weather_type) + 1;
 #else
   return weather_type_icon_tiny_resource(weather_type);
 #endif
 }
 
 uint32_t weather_type_icon_large_resource(WeatherType weather_type) {
-  static const uint32_t s_resources[] = {
+  static const uint16_t s_resources[] = {
     RESOURCE_ID_IMAGE_PARTLY_CLOUDY_LARGE,    // 0 PartlyCloudy
     RESOURCE_ID_IMAGE_CLOUDY_DAY_LARGE,       // 1 CloudyDay
     RESOURCE_ID_IMAGE_LIGHT_SNOW_LARGE,       // 2 LightSnow
@@ -79,18 +80,10 @@ uint32_t weather_type_icon_large_resource(WeatherType weather_type) {
 
 #if defined(PBL_PLATFORM_GABBRO)
 uint32_t weather_type_icon_clock_resource(WeatherType weather_type) {
-  static const uint32_t s_resources[] = {
-    RESOURCE_ID_IMAGE_PARTLY_CLOUDY_CLOCK,
-    RESOURCE_ID_IMAGE_CLOUDY_DAY_CLOCK,
-    RESOURCE_ID_IMAGE_LIGHT_SNOW_CLOCK,
-    RESOURCE_ID_IMAGE_LIGHT_RAIN_CLOCK,
-    RESOURCE_ID_IMAGE_HEAVY_RAIN_CLOCK,
-    RESOURCE_ID_IMAGE_HEAVY_SNOW_CLOCK,
-    RESOURCE_ID_IMAGE_GENERIC_WEATHER_CLOCK,
-    RESOURCE_ID_IMAGE_SUNNY_DAY_CLOCK,
-    RESOURCE_ID_IMAGE_RAIN_AND_SNOW_CLOCK,
-    RESOURCE_ID_IMAGE_GENERIC_WEATHER_CLOCK,  // Unknown fallback (slot 9) — match the other lookups
-  };
-  return s_resources[weather_type_slot_index(weather_type)];
+  // The CLOCK id set is numerically identical to TINY, slot for slot — pinned:
+  _Static_assert(RESOURCE_ID_IMAGE_PARTLY_CLOUDY_CLOCK == RESOURCE_ID_IMAGE_PARTLY_CLOUDY_TINY, "clock==tiny");
+  _Static_assert(RESOURCE_ID_IMAGE_SUNNY_DAY_CLOCK == RESOURCE_ID_IMAGE_SUNNY_DAY_TINY, "clock==tiny");
+  _Static_assert(RESOURCE_ID_IMAGE_RAIN_AND_SNOW_CLOCK == RESOURCE_ID_IMAGE_RAIN_AND_SNOW_TINY, "clock==tiny");
+  return weather_type_icon_tiny_resource(weather_type);
 }
 #endif

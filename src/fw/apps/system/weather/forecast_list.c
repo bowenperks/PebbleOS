@@ -179,9 +179,35 @@ typedef struct {
   void   (*on_select_request_cb)(void *ctx);  // SELECT on the resting main view -> open the condensed view
   void    *on_select_request_ctx;
   int      start_day_index;  // focused day from main view; list opens scrolled here
+  // The Weather Channel intro card, drawn as a topmost overlay of THIS window so
+  // the dissolve is a true cross-fade into the live mainscreen beneath it.
+  int      splash_keep;      // 0 = off; 16 = solid card; 15..1 = dissolving
+  GBitmap *splash_logo;      // 80x80 boxed logo (owned while the splash lives)
+  uint8_t *splash_scratch;   // W*H forecast-frame snapshot for the dissolve
+  AppTimer *splash_timer;
+  // First-entry clock-slot intro: the ACTIVE LOCATION holds the top clock slot for
+  // 2s, then swaps out with the sunset card's own status-bar swap (both slide right,
+  // the time trailing in from the left). Latched once per app run.
+  bool     clock_loc_show;
+  bool     clock_loc_done;
+  bool     clock_swap_active;
+  AnimationProgress clock_swap_p;
+  Animation *clock_swap_anim;
+  AppTimer  *clock_loc_timer;
 } ForecastListData;
 
 static ForecastListData *s_list;
+
+// One 4x4 ordered-dither (bayer) table for every stipple on this screen
+// (icon crossfade + splash dissolve).
+static const uint8_t s_bayer4[4][4] = {
+  {  0,  8,  2, 10 }, { 12,  4, 14,  6 }, {  3, 11,  1,  9 }, { 15,  7, 13,  5 },
+};
+
+static void prv_draw_splash_overlay(Layer *layer, GContext *ctx);   // defined below
+#if !PBL_ROUND
+static void prv_clock_loc_city(char *dst, size_t dst_size, const char *src);  // defined below
+#endif
 
 // ---- Helpers ----
 
@@ -561,6 +587,9 @@ static void prv_canvas_draw_gabbro(Layer *layer, GContext *ctx) {
 #define R5_DOT_R        5     // outer coloured dot radius
 #define R5_DOT_INNER    2     // inner white radius (hollow dot)
 #define R5_HAIRLINE_Y   PBL_IF_ROUND_ELSE(88, 80)   // hairline rule under today header
+// The emery "today" banner blue. Used by BOTH the banner fill AND the icon crossfade's
+// erase-to-background — they MUST stay the same colour or the animated↔static icon fade
+// shows a coloured box on the banner. Change only here.
 #define R5_TODAY_X      PBL_IF_ROUND_ELSE(68, 18)   // today icon draw offset (emery left margin)
 // Emery today icon/temp top pushed down to y=20 — the exact slot a notification puts its top
 // icon (STATUS_BAR_LAYER_HEIGHT 20 + CARD_ICON_UPPER_PADDING 0 on emery) — so the top clock has
@@ -579,7 +608,8 @@ static void prv_canvas_draw_gabbro(Layer *layer, GContext *ctx) {
 // Extra lift past today's old slot, applied uniformly to the whole scrolled 5-day section
 // (day names, discs, graph, icon rest + its stretch travel all key off SECTION_TRAVEL, so they
 // stay in lockstep) to free more room at the bottom of the scrolled screen for the new stats.
-#define R5_SCROLL_EXTRA_LIFT 10
+#define R5_SCROLL_EXTRA_LIFT 19   // scrolled day-name ink tops at y6 = the mainscreen
+                                  // clock's ink line (user-tuned); was 10
 #define R5_SECTION_TRAVEL ((R5_DAYNAME_Y - R5_TODAY_Y) + R5_SCROLL_EXTRA_LIFT)  // 82
 
 // ---- DOWN/UP header transition: the SAME 330ms moook-soft curve Pebble Timeline uses for
@@ -825,17 +855,28 @@ static void prv_start_clock_stage2(void);
 
 static void prv_clock_stage1_update(Animation *anim, AnimationProgress progress) {
   if (!s_list) return;
+  // The PAGE exits at DOUBLE TIME (fully off by the 50% mark) while the dot keeps the
+  // full-length ease below — the content clears the dot's climb path early and the dot
+  // rises the whole second half alone: the focal point the transition is about.
+  AnimationProgress pm = (progress > ANIMATION_NORMALIZED_MAX / 2)
+                             ? ANIMATION_NORMALIZED_MAX : progress * 2;
 #if !PBL_ROUND
   if (s_list->squash_mode == SQUASH_UP_EXIT) {
     // Squash path: the scene keeps drawing at the scrolled rest (header_scroll pinned at
     // R5_HEADER_TRAVEL by prv_start_clock_stage1) and the whole frame — precip pill
     // included — jelly-stretches up off the top in prv_render_squash_in.
-    s_list->squash_in_p = progress;
+    s_list->squash_in_p = pm;
   } else
 #endif
   {
-    // Fallback (round / squash scratch OOM): plain translated exit, as before.
-    s_list->header_scroll = (int)prv_moook_soft3(progress, R5_HEADER_TRAVEL, R5_CLOCK_EXIT);
+    // Fallback (round / squash scratch OOM): plain translated exit. CLAMPED at rest:
+    // moook_soft3's anticipation frames dip header_scroll below R5_HEADER_TRAVEL,
+    // which shoved the pill/%/graph DOWN into the burst dot for a beat — the content
+    // must stay clear above the dot throughout. The squash path never dips (its jelly
+    // edges are clamped the same way).
+    int hsv = (int)prv_moook_soft3(pm, R5_HEADER_TRAVEL, R5_CLOCK_EXIT);
+    if (hsv < R5_HEADER_TRAVEL) hsv = R5_HEADER_TRAVEL;
+    s_list->header_scroll = hsv;
   }
   // The dot eases cleanly into the centre (ease-out quad — NO moook anticipation dip or overshoot
   // wobble) so it lands exactly at the animation's end and the shake fires the instant it lands.
@@ -1077,13 +1118,13 @@ static void prv_start_report_stage3(void) {
                                  &s_report_stage3_impl, prv_report_stage3_stopped);
 }
 
-// Stage 4: the unfolded paper + caption jelly-squash off the LEFT (same mode as stage 1 —
-// the scene draws them at rest and the squash pass warps the whole frame), then the done
-// cb fires in the same call stack: weather.c arms the report's squash-in-from-the-right.
+// Stage 4: the paper + caption squash-stretch off the LEFT (the paper deforms ITSELF —
+// Timeline's smiley exit, not a framebuffer warp), then the done cb fires in the same
+// call stack: weather.c arms the report's squash-in-from-the-right.
 static void prv_report_stage4_update(Animation *anim, AnimationProgress progress) {
   (void)anim;
   if (!s_list) return;
-  s_list->squash_in_p = progress;
+  s_list->report_p = progress;   // stage 4 owns report_p: the exit flight's raw progress
   layer_mark_dirty(s_list->canvas);
 }
 
@@ -1108,21 +1149,18 @@ static const AnimationImplementation s_report_stage4_impl = { .update = prv_repo
 
 static void prv_start_report_stage4(void) {
   s_list->report_fx = 4;
-  s_list->report_p  = ANIMATION_NORMALIZED_MAX;   // paper drawn fully at rest beneath the squash
-  if (!s_list->squash_mode && s_list->canvas) {
-    GRect b = layer_get_bounds(s_list->canvas);
-    s_list->squash_scratch = malloc_try((size_t)b.size.w * (size_t)b.size.h);
-    if (s_list->squash_scratch) {
-      s_list->squash_mode = SQUASH_LEFT_EXIT;
-      s_list->squash_in_p = 0;
-    }
+  s_list->report_p  = 0;   // flight start: moook(0) = rest — no first-frame jump
+  // Stage 3's angle-fan lookup indexes the same pristine PDC but the exit needs a
+  // DISTANCE lookup — free it so prv_draw_exiting_paper builds its own in the slot.
+  if (s_list->fly_lookup) {
+    applib_free(s_list->fly_lookup);
+    s_list->fly_lookup = NULL;
   }
-  if (s_list->squash_mode != SQUASH_LEFT_EXIT) {   // scratch OOM: skip the exit flourish
-    prv_report_stage4_stopped(NULL, true, NULL);
-    return;
-  }
-  s_report_anim = prv_start_anim(240, AnimationCurveLinear,   // hasted soft-moook: snappy exit
+  s_report_anim = prv_start_anim(240, AnimationCurveLinear,   // the moook table IS the easing
                                  &s_report_stage4_impl, prv_report_stage4_stopped);
+  if (!s_report_anim) {   // OOM: skip the flourish, hand off directly
+    prv_report_stage4_stopped(NULL, true, NULL);
+  }
 }
 
 // The rolling ball: a black disc with a white notch orbiting at rolling-without-slipping
@@ -1187,8 +1225,11 @@ static void prv_draw_unfolding_paper(GContext *ctx) {
 }
 
 // "WEATHER REPORT" rises in under the paper, landing with the fan's last delay group.
-static void prv_draw_report_caption(GContext *ctx) {
-  AnimationProgress up = (AnimationProgress)((int64_t)s_list->report_p * 2);   // unfold-relative
+// dx slides the settled caption during the stage-4 exit; settled skips the rise
+// (stage 4 reuses report_p as its OWN progress — the rise must not replay).
+static void prv_draw_report_caption(GContext *ctx, int dx, bool settled) {
+  AnimationProgress up = settled ? ANIMATION_NORMALIZED_MAX
+                                 : (AnimationProgress)((int64_t)s_list->report_p * 2);
   if (up > ANIMATION_NORMALIZED_MAX) up = ANIMATION_NORMALIZED_MAX;
   const AnimationProgress start = ANIMATION_NORMALIZED_MAX * 3 / 5;
   if (up < start) return;
@@ -1203,8 +1244,39 @@ static void prv_draw_report_caption(GContext *ctx) {
   const GRect mb = layer_get_bounds(s_list->canvas);
   graphics_context_set_text_color(ctx, GColorBlack);
   graphics_draw_text(ctx, "WEATHER REPORT", fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
-                     GRect(0, R5_SCREEN_CY + 46 + dy, mb.size.w, 24),
+                     GRect(dx, R5_SCREEN_CY + 46 + dy, mb.size.w, 24),
                      GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
+}
+
+// Stage 4 — the paper takes its bow: the smiley's Timeline exit, rotated LEFT. One real
+// TRAVEL scale-segment (rest -> off the left edge) exactly like the up/down icon move
+// below: the moook's anticipation supplies the wind-up squash, the per-point
+// delay-by-distance lag the stretch — trailing (right) edge pulls last, same target
+// convention as the header jelly ({w/2, h} for upward travel), rotated: {w, h/2}.
+static void prv_draw_exiting_paper(GContext *ctx) {
+  if (!s_list->fly_pdc) return;
+  GDrawCommandImage *clone = gdraw_command_image_clone(s_list->fly_pdc);
+  if (!clone) return;
+  GDrawCommandList *list = gdraw_command_image_get_command_list(clone);
+  if (!list) { gdraw_command_image_destroy(clone); return; }
+  const GSize nsz = gdraw_command_image_get_bounds_size(clone);
+  const GRect mb = layer_get_bounds(s_list->canvas);
+  const GPoint origin = GPoint((mb.size.w - nsz.w) / 2, R5_SCREEN_CY - nsz.h / 2);
+  if (!s_list->fly_lookup) {   // stage-3's angle fan was freed at arm; build the exit's
+    GPointIndexLookup *lu = gdraw_command_list_create_index_lookup_by_distance(
+        list, GPoint(nsz.w, nsz.h / 2));
+    if (!lu) { gdraw_command_image_destroy(clone); return; }
+    s_list->fly_lookup = lu;
+  }
+  const GRect from = GRect(0, 0, nsz.w, nsz.h);
+  // END fully past the left edge with stretch headroom (the moook overshoots beyond it).
+  const GRect to = GRect(-(origin.x + nsz.w + 40), 0, nsz.w, nsz.h);
+  gdraw_command_image_scale_segmented_to(clone, from, to, s_list->report_p,
+                                         prv_moook_full, s_list->fly_lookup,
+                                         Fixed_S32_16(5 * FIXED_S32_16_ONE.raw_value / 6),
+                                         false);   // = R5_FX_POINT_DURATION (defined below)
+  gdraw_command_image_draw(ctx, clone, origin);
+  gdraw_command_image_destroy(clone);
 }
 #endif  // WEATHER_ANIM_5DAY && !PBL_ROUND
 
@@ -1449,8 +1521,12 @@ static void prv_draw_bottom_stats(GContext *ctx, const WeatherLocationForecast *
   // stage 1 squashes the whole drawn frame up off the top (SQUASH_UP_EXIT), so the pill must
   // stay in the frame to exit with it; in stage 2 (header_scroll = R5_CLOCK_EXIT) slide puts
   // it far off-screen. The burst dot is decoupled — drawn AFTER the squash in prv_canvas_draw.
-  prv_draw_stat_pill(ctx, "PRECIPITATION", 143 + slide, W, GColorPictonBlue);
-  prv_draw_stat_row (ctx, fan, n, col_x,   162 + slide);
+  // Pill at 145 / row at 164: with the deeper section lift (EXTRA_LIFT 19) the
+  // scrolled column's air splits evenly — solved for disc->graph = graph->pill =
+  // %-row->dot (~10-11px each; the graph auto-centres in its band, so the split
+  // holds for any temp spread).
+  prv_draw_stat_pill(ctx, "PRECIPITATION", 145 + slide, W, GColorPictonBlue);
+  prv_draw_stat_row (ctx, fan, n, col_x,   164 + slide);
   if (!s_list->clock_fx) {
     // Timeline's day-separator peek dot (the one that unwinds into "Tomorrow"/"Tuesday"): a 12px
     // black circle, horizontally centred, the same 30px above the bottom edge as Timeline. On emery
@@ -1467,15 +1543,9 @@ static void prv_draw_bottom_stats(GContext *ctx, const WeatherLocationForecast *
 // from its CURRENT angle to the sun's natural profile (short at top, long at bottom)
 // so the rays grow as they descend + shrink as they rise — a living glow. ----
 #define R5_SUN_RAYS       10
-#define R5_SUN_BODY_R     10   // sun body radius (approximates the PDC octagon)
-#define R5_SUN_RAY_INNER  15   // rays start out here → clear gap between body + rays
-#define R5_SUN_RAY_MIN    3    // shortest ray length (at the top)
-#define R5_SUN_RAY_MAX    10   // longest ray length (at the bottom)
+#define R5_SUN_SCALE      100  // body + ray scale, percent of the 40px reference
 // Partly cloudy reuses the same sun, smaller, poking out behind the cloud.
-#define R5_PC_SUN_BODY_R    6
-#define R5_PC_SUN_RAY_INNER 10   // clear gap between the body + the rays
-#define R5_PC_SUN_RAY_MIN   2
-#define R5_PC_SUN_RAY_MAX   6
+#define R5_PC_SUN_SCALE   60
 
 // Animation cadence (sun + rain share one timer). 80 ms tick = 12.5 fps; prv_sun_tick
 // advances 2 phase steps per tick so the VISUAL speed matches the old 40ms/25fps cadence
@@ -1504,22 +1574,91 @@ static void prv_draw_bottom_stats(GContext *ctx, const WeatherLocationForecast *
 // are unaffected either way.)
 #define WEATHER_ANIM_MONO_BLACK 1
 
-// Filled flat-top regular octagon centred at `c`, apothem `a` (centre→flat-edge). Matches the
-// static sun PDC's body (Pebble_80x80_Sunny_day: verts at (±d,±a)/(±a,±d), d = a·tan22.5°) so
-// the animated sun reads as the same jagged octagon rather than a circle.
-static void prv_fill_octagon(GContext *ctx, GPoint c, int a, GColor col) {
-  if (a < 1) return;
-  const int d = (a * 41 + 50) / 100;   // corner offset ≈ a·tan(22.5°) ≈ 0.414a
+// The sun's body, drawn the way the PDC draws it: the EXACT octagon polygon from
+// Pebble_50x50_Sunny_day.svg (points (+-4.5,+-11.5)/(+-11.5,+-4.5) about the body centre,
+// x0.8 for the 40px icon -> (+-4,+-9)/(+-9,+-4)), rendered as WHITE FILL + a stroke-3 BLACK
+// OUTLINE with round joins — NOT two nested filled octagons: an antialiased small filled
+// path smears its corners and reads as an oval; the stroked path keeps the flats crisp,
+// exactly like the static bitmap.
+static void prv_draw_sun_body(GContext *ctx, GPoint c, int scale_pct, GColor outline_col) {
+  const int a = (92 * scale_pct + 500) / 1000;   // apothem, from the art's 11.5 x 0.8
+  const int d = (36 * scale_pct + 500) / 1000;   // corner half-flat, from 4.5 x 0.8
   GPoint pts[8] = {
-    {-d, -a}, {-a, -d}, {-a, d}, {-d, a}, {d, a}, {a, d}, {a, -d}, {d, -a},
+    {(int16_t)-d, (int16_t)-a}, {(int16_t)-a, (int16_t)-d},
+    {(int16_t)-a, (int16_t)d},  {(int16_t)-d, (int16_t)a},
+    {(int16_t)d,  (int16_t)a},  {(int16_t)a,  (int16_t)d},
+    {(int16_t)a,  (int16_t)-d}, {(int16_t)d,  (int16_t)-a},
   };
-  GPath p = { .num_points = 8, .points = pts, .offset = c };
-  graphics_context_set_fill_color(ctx, col);
-  gpath_draw_filled(ctx, &p);
+  GPath path = { .num_points = 8, .points = pts, .offset = c };
+  graphics_context_set_fill_color(ctx, GColorWhite);
+  gpath_draw_filled(ctx, &path);
+  graphics_context_set_stroke_color(ctx, outline_col);
+  graphics_context_set_stroke_width(ctx, 3);     // the PDC body's own stroke width
+  gpath_draw_outline(ctx, &path);
 }
 
-static void prv_draw_animated_sun(GContext *ctx, GPoint c, int32_t phase,
-                                  int body_r, int ray_inner, int ray_min, int ray_max) {
+// Ray geometry lifted straight off Pebble_50x50_Sunny_day.svg (x0.8 for the 40px icon).
+// TWO things make the PDC's sun read right, and both are kept exactly:
+// 1) The rays are NOT uniformly spaced — they cluster (43/30/31/33/43-degree gaps,
+//    mirrored). The constellation below carries the PDC's own angular offsets and
+//    rotates as a rigid wheel.
+// 2) The lengths + inner radii are irregular: stubs up top, medium horizontals, the
+//    LONGEST rays on the lower diagonals, and per-ray inner radii that breathe.
+//    Each ray re-samples the profile at its CURRENT angle as it orbits, so the
+//    silhouette stays the PDC's composition while the glow lives.
+// Values in tenths of a pixel; inner radii carry +1px over the raw art so the stroke-2
+// round caps land where the PDC's ink starts — the gap around the body survives.
+static const uint16_t kSunRayAngles[10] = {   // the PDC's own ray positions (from top, cw)
+  0,
+  (uint16_t)(TRIG_MAX_ANGLE * 43 / 360),
+  (uint16_t)(TRIG_MAX_ANGLE * 73 / 360),
+  (uint16_t)(TRIG_MAX_ANGLE * 104 / 360),
+  (uint16_t)(TRIG_MAX_ANGLE * 137 / 360),
+  (uint16_t)(TRIG_MAX_ANGLE / 2),
+  (uint16_t)(TRIG_MAX_ANGLE * 223 / 360),
+  (uint16_t)(TRIG_MAX_ANGLE * 256 / 360),
+  (uint16_t)(TRIG_MAX_ANGLE * 287 / 360),
+  (uint16_t)(TRIG_MAX_ANGLE * 317 / 360),
+};
+static const struct { uint16_t ang; uint8_t len10; uint8_t inner10; } kSunRayProfile[] = {
+  { 0,                            24, 138 },   // top stub
+  { TRIG_MAX_ANGLE * 43 / 360,    34, 163 },   // upper diagonal stub (pushed out)
+  { TRIG_MAX_ANGLE * 73 / 360,    66, 144 },   // upper horizontal
+  { TRIG_MAX_ANGLE * 104 / 360,   66, 142 },   // lower horizontal
+  { TRIG_MAX_ANGLE * 137 / 360,  113, 152 },   // the long SE/SW diagonal
+  { TRIG_MAX_ANGLE / 2,          104, 138 },   // long bottom ray
+};
+
+// Piecewise-linear sample of the profile at `ang` (any angle; folded to 0..180deg).
+static void prv_sun_ray_at(int32_t ang, int *len10, int *inner10) {
+  int32_t f = ang % TRIG_MAX_ANGLE;
+  if (f < 0) f += TRIG_MAX_ANGLE;
+  if (f > TRIG_MAX_ANGLE / 2) f = TRIG_MAX_ANGLE - f;
+  const int n = (int)(sizeof(kSunRayProfile) / sizeof(kSunRayProfile[0]));
+  for (int i = 1; i < n; i++) {
+    if (f <= kSunRayProfile[i].ang) {
+      const int32_t a0 = kSunRayProfile[i - 1].ang, a1 = kSunRayProfile[i].ang;
+      const int32_t t = (a1 > a0) ? ((f - a0) * 256 / (a1 - a0)) : 0;
+      *len10 = kSunRayProfile[i - 1].len10 +
+               (int)((kSunRayProfile[i].len10 - kSunRayProfile[i - 1].len10) * t / 256);
+      *inner10 = kSunRayProfile[i - 1].inner10 +
+                 (int)((kSunRayProfile[i].inner10 - kSunRayProfile[i - 1].inner10) * t / 256);
+      return;
+    }
+  }
+  *len10 = kSunRayProfile[n - 1].len10;
+  *inner10 = kSunRayProfile[n - 1].inner10;
+}
+
+// Rounded projection of a tenths-of-a-px radius along (sin, -cos) — truncation was
+// eating a full pixel of the body gap on the axis-aligned rays.
+static int prv_sun_proj(int32_t r10, int32_t trig, int c) {
+  int32_t v = r10 * trig / TRIG_MAX_RATIO;   // tenths of a px, signed
+  v = (v >= 0) ? (v + 5) / 10 : (v - 5) / 10;
+  return c + (int)v;
+}
+
+static void prv_draw_animated_sun(GContext *ctx, GPoint c, int32_t phase, int scale_pct) {
 #if WEATHER_ANIM_MONO_BLACK
   const GColor sun_color = GColorBlack;
 #else
@@ -1528,26 +1667,27 @@ static void prv_draw_animated_sun(GContext *ctx, GPoint c, int32_t phase,
   const GColor sun_color = prv_weather_bg_color(WeatherType_PartlyCloudy);
 #endif
   graphics_context_set_antialiased(ctx, true);
-  // Octagonal body (white fill + a 1px-ish outline ring) instead of a circle, matching the
-  // static sun PDC. Outer octagon = sun_color, inner = white → the ring is the outline.
-  prv_fill_octagon(ctx, c, body_r + 1, sun_color);
-  prv_fill_octagon(ctx, c, body_r - 1, GColorWhite);
-  // Rays: each orbits clockwise; length depends only on its current angle.
+  // The PDC's own octagon, fill + stroked outline (see prv_draw_sun_body).
+  prv_draw_sun_body(ctx, c, scale_pct, sun_color);
+  // Rays: the PDC's clustered constellation rotates as one wheel; each ray samples the
+  // length/inner profile at its current angle.
   graphics_context_set_stroke_color(ctx, sun_color);
-  graphics_context_set_stroke_width(ctx, 2);
+  graphics_context_set_stroke_width(ctx, 2);   // the PDC rays' own stroke width
   for (int i = 0; i < R5_SUN_RAYS; i++) {
-    const int32_t ang = phase + (int32_t)i * (TRIG_MAX_ANGLE / R5_SUN_RAYS);
-    const int32_t cos_a = cos_lookup(ang);  // +max at top (ang 0), -max at bottom (ang 180)
+    const int32_t ang = phase + (int32_t)kSunRayAngles[i];
+    int len10, inner10;
+    prv_sun_ray_at(ang, &len10, &inner10);
+    len10 = R5_FADE(len10 * scale_pct / 100);    // rays retract as the icon fades to static
+    inner10 = inner10 * scale_pct / 100;
+    if (len10 < 8) continue;                     // sub-pixel nub: not worth a cap dot
+    const int32_t cos_a = cos_lookup(ang);
     const int32_t sin_a = sin_lookup(ang);
-    // (1 - cos)/2 : 0 at top → 1 at bottom.
-    const int len = R5_FADE(ray_min + (int)((int32_t)(ray_max - ray_min) *
-                    (TRIG_MAX_RATIO - cos_a) / (2 * TRIG_MAX_RATIO)));  // rays retract as it fades
     // Radial direction from the sun centre, clockwise from top = (sin, -cos).
-    const int ix = c.x + (int)((int32_t)ray_inner * sin_a / TRIG_MAX_RATIO);
-    const int iy = c.y - (int)((int32_t)ray_inner * cos_a / TRIG_MAX_RATIO);
-    const int ox = c.x + (int)((int32_t)(ray_inner + len) * sin_a / TRIG_MAX_RATIO);
-    const int oy = c.y - (int)((int32_t)(ray_inner + len) * cos_a / TRIG_MAX_RATIO);
-    graphics_draw_line(ctx, GPoint(ix, iy), GPoint(ox, oy));
+    const GPoint p0 = GPoint(prv_sun_proj(inner10, sin_a, c.x),
+                             prv_sun_proj(inner10, -cos_a, c.y));
+    const GPoint p1 = GPoint(prv_sun_proj(inner10 + len10, sin_a, c.x),
+                             prv_sun_proj(inner10 + len10, -cos_a, c.y));
+    graphics_draw_line(ctx, p0, p1);
   }
 }
 
@@ -1652,7 +1792,7 @@ static void prv_draw_animated_partly_cloudy(GContext *ctx, GPoint pdc_offset, in
   // Sun first (behind) at the PDC sun centre (33,16) scaled into the today box.
   prv_draw_animated_sun(ctx,
       GPoint(pdc_offset.x + 33 * R5_TODAY_ICON / 50, pdc_offset.y + 16 * R5_TODAY_ICON / 50),
-      phase, R5_PC_SUN_BODY_R, R5_PC_SUN_RAY_INNER, R5_PC_SUN_RAY_MIN, R5_PC_SUN_RAY_MAX);
+      phase, R5_PC_SUN_SCALE);
   // Floating cloud on top, its sun hidden (we drew our own animated one).
   if (s_list->today_pdc) {
     GDrawCommandProcessor proc = { .command = prv_hide_sun_proc };
@@ -1715,11 +1855,8 @@ static void prv_draw_flake(GContext *ctx, GPoint c, int r) {
 static void prv_draw_animated_precip(GContext *ctx, GPoint pdc_offset, int32_t phase,
                                      const PrecipStyle *st) {
 #if WEATHER_ANIM_MONO_BLACK
-  // Snow + heavy snow fall as WHITE flakes (crisp on the blue banner under the dark cloud);
-  // rain/storm/sleet stay black. Pointer-compare the two snow styles (defined just above).
-  const bool white_flakes = (st == &kLightSnowStyle || st == &kHeavySnowStyle);
-  const GColor main_col = white_flakes ? GColorWhite : GColorBlack;
-  const GColor pale_col = main_col;
+  const GColor main_col = GColorBlack;   // one ink for all precip — flakes included
+  const GColor pale_col = main_col;      // (white flakes vanished on the white page)
 #else
   const GColor main_col = st->main_col, pale_col = st->pale_col;
 #endif
@@ -1796,7 +1933,7 @@ static void prv_draw_today_anim(GContext *ctx, const WeatherLocationForecast *to
   switch (today->current_weather_type) {
     case WeatherType_Sun:
       prv_draw_animated_sun(ctx, GPoint(x + R5_TODAY_ICON / 2, y + R5_TODAY_ICON * 2 / 5),
-          s_list->sun_phase, R5_SUN_BODY_R, R5_SUN_RAY_INNER, R5_SUN_RAY_MIN, R5_SUN_RAY_MAX);
+          s_list->sun_phase, R5_SUN_SCALE);
       break;
     case WeatherType_PartlyCloudy:
       prv_draw_animated_partly_cloudy(ctx, GPoint(x, y), s_list->sun_phase); break;
@@ -1815,9 +1952,6 @@ static void prv_draw_today_anim(GContext *ctx, const WeatherLocationForecast *to
 // directly on the framebuffer.
 static void prv_fade_erase(GContext *ctx, GRect r, int keep, GColor bg) {
   if (keep >= R5_FADE_LEVELS) return;   // fully opaque — nothing to erase
-  static const uint8_t bayer[4][4] = {
-    {  0,  8,  2, 10 }, { 12,  4, 14,  6 }, {  3, 11,  1,  9 }, { 15,  7, 13,  5 },
-  };
   const int thr = keep * 4;             // erase any pixel whose dither value >= thr
   GBitmap *fb = graphics_capture_frame_buffer(ctx);
   if (!fb) return;
@@ -1827,7 +1961,7 @@ static void prv_fade_erase(GContext *ctx, GRect r, int keep, GColor bg) {
     GBitmapDataRowInfo ri = gbitmap_get_data_row_info(fb, (uint16_t)y);
     for (int x = r.origin.x; x < r.origin.x + r.size.w; x++) {
       if (x < (int)ri.min_x || x > (int)ri.max_x) continue;
-      if (bayer[y & 3][x & 3] >= thr) {
+      if (s_bayer4[y & 3][x & 3] >= thr) {
         ri.data[x] = bg.argb;
       }
     }
@@ -1896,23 +2030,11 @@ static void prv_canvas_draw_round_5day(Layer *layer, GContext *ctx) {
   int total = (int)s_list->num_days;
   if (total <= 0) return;
 #if !PBL_ROUND
-  // Blue "today" banner: fill the header region (screen top → hairline) with the same
-  // PictonBlue as the precipitation pill. It collapses upward with the header scroll — the
-  // bottom edge tracks the hairline (R5_HAIRLINE_Y - hs) — so the today content slides up and
-  // vanishes behind it. White header text + a white disc behind the today icon (both below)
-  // keep everything legible on the blue field.
-  {
-    const int band_bottom = R5_HAIRLINE_Y - hs;
-    if (band_bottom > 0) {
-      graphics_context_set_fill_color(ctx, GColorPictonBlue);
-      graphics_fill_rect(ctx, GRect(0, 0, W, band_bottom), 0, GCornerNone);
-    }
-  }
   // Current time at the very top, drawn exactly like the notification status-bar clock
   // (StatusBarLayerModeClock, status_bar_layer.c): white, centred, FONT_KEY_GOTHIC_18, and
   // bottom-aligned within the STATUS_BAR_LAYER_HEIGHT (20px on emery) band minus its 2px
   // separator padding. clock_copy_time_string is the same helper notifications use (same
-  // 12/24h format). It rides the header scroll (- hs) so it collapses up with the banner.
+  // 12/24h format). It rides the header scroll (- hs) so it collapses up with the header.
   // Cached per wall-clock minute: a per-frame localtime+strftime would starve the touch task
   // (see the day/date cache below), so refresh only when the minute changes.
   {
@@ -1927,9 +2049,26 @@ static void prv_canvas_draw_round_5day(Layer *layer, GContext *ctx) {
     const int sb_fh = fonts_get_font_height(sb_font);
     const int sb_ty = (STATUS_BAR_LAYER_HEIGHT - 2 * STATUS_BAR_LAYER_SEPARATOR_Y_OFFSET - sb_fh)
                       - hs;
-    graphics_context_set_text_color(ctx, GColorWhite);
-    graphics_draw_text(ctx, s_time_str, sb_font, GRect(0, sb_ty, W, sb_fh),
-                       GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
+    graphics_context_set_text_color(ctx, GColorBlack);
+    if (s_list->clock_loc_show || s_list->clock_swap_active) {
+      // First entry: the active location holds the slot, then swaps out exactly like
+      // the sunset card's status bar — location exits right, time trails from the left.
+      char loc[24] = "";
+      if (s_list->num_days > 0) {
+        prv_clock_loc_city(loc, sizeof(loc), s_list->days[0].location_name);
+      }
+      const int sx = s_list->clock_swap_active
+          ? (int)interpolate_moook_soft(s_list->clock_swap_p, 0, W, 3) : 0;
+      graphics_draw_text(ctx, loc, sb_font, GRect(sx, sb_ty, W, sb_fh),
+                         GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
+      if (s_list->clock_swap_active) {
+        graphics_draw_text(ctx, s_time_str, sb_font, GRect(sx - W, sb_ty, W, sb_fh),
+                           GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
+      }
+    } else {
+      graphics_draw_text(ctx, s_time_str, sb_font, GRect(0, sb_ty, W, sb_fh),
+                         GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
+    }
   }
 #endif
   int n = total - 1;                  // fan columns — today headlines the block above
@@ -2041,10 +2180,10 @@ static void prv_canvas_draw_round_5day(Layer *layer, GContext *ctx) {
     }
   } else {
     // Two-phase, NON-overlapping transition (mirrors the clock screen). First half: the
-    // colour animation drops down + dither-fades out into the banner. Second half: from that
+    // colour animation drops down + dither-fades out into the page. Second half: from that
     // blank frame, the static icon rises up into position + fades in. The dither erases to
-    // the banner colour (blue on emery) so only the bitmap fades — no white box on the blue.
-    const GColor icon_bg = PBL_IF_ROUND_ELSE(GColorWhite, GColorPictonBlue);
+    // the page white so only the bitmap fades — no box.
+    const GColor icon_bg = GColorWhite;
     const int half = R5_FADE_MAX / 2;
     if (fade > half) {
       // Outgoing colour animation: drop down + fade out into the banner.
@@ -2079,10 +2218,10 @@ static void prv_canvas_draw_round_5day(Layer *layer, GContext *ctx) {
       GRect(112, 22, 120, 44),
       GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
 #else
-  // Emery: FLAT white LECO on the blue — the same treatment as every other element on
-  // this banner (time, condition, date) and the Timeline card's own big-number grammar.
+  // Emery: FLAT BLACK LECO on the white page — the Timeline sloth-screen grammar: black
+  // type directly on the field, white reserved for fills inside the black-inked artwork.
   // Right margin equals the icon's left margin (R5_TODAY_X).
-  graphics_context_set_text_color(ctx, GColorWhite);
+  graphics_context_set_text_color(ctx, GColorBlack);
   graphics_draw_text(ctx, tnow, fonts_get_system_font(FONT_KEY_LECO_36_BOLD_NUMBERS),
       GRect(W - R5_TODAY_X - 120, R5_TODAY_Y - 2 - hs, 120, 44),   // -2: LECO parks low
       GTextOverflowModeTrailingEllipsis, GTextAlignmentRight, NULL);
@@ -2094,7 +2233,7 @@ static void prv_canvas_draw_round_5day(Layer *layer, GContext *ctx) {
   // Title-case (e.g. "Partly Cloudy") — Pebble reserves ALL CAPS for terse labels/units.
   // Condition matches the date: same font/size/weight, same baseline (date is on
   // the left under the icon, condition on the right under the temp).
-  graphics_context_set_text_color(ctx, PBL_IF_ROUND_ELSE(GColorBlack, GColorWhite));
+  graphics_context_set_text_color(ctx, GColorBlack);   // black on the page
   // Condition: right-anchored at x=230 (mirrors the left date, aligned to the fan's
   // 30/230 columns), growing LEFT as it lengthens down to x=110 (just clear of the
   // date). Length-dependent: measure the phrase + step the font down one size if even
@@ -2104,7 +2243,7 @@ static void prv_canvas_draw_round_5day(Layer *layer, GContext *ctx) {
   graphics_draw_text(ctx, cond, cond_font,
       GRect(cond_l, R5_DAYDATE_Y - hs, cond_r - cond_l, 16),
       GTextOverflowModeTrailingEllipsis, GTextAlignmentRight, NULL);
-  graphics_context_set_text_color(ctx, PBL_IF_ROUND_ELSE(GColorBlack, GColorWhite));
+  graphics_context_set_text_color(ctx, GColorBlack);   // black on the page
   // Date: left box, left-aligned (the today icon above is centred over this string).
   graphics_draw_text(ctx, daydate, day_font,   // day_font IS GOTHIC_14_BOLD — no re-lookup
       GRect(PBL_IF_ROUND_ELSE(30, R5_TODAY_X), R5_DAYDATE_Y - hs,
@@ -2230,8 +2369,15 @@ static void prv_canvas_draw_round_5day(Layer *layer, GContext *ctx) {
     prv_fold_minmax(yh, okh, n, &have_y, &yh_min, &yl_max);
     prv_fold_minmax(yl, okl, n, &have_y, &yh_min, &yl_max);
     const int dot_mid   = (yh_min + yl_max) / 2 + ss;                      // peak midpoint (section)
-    const int avail_mid = (R5_ICON_CY + R5_DISC_R + 143 + R5_SECTION_TRAVEL) / 2;  // discs..banner;
-                                                       // 143 = top stats banner pill top (prv_draw_bottom_stats)
+    // Band bounds in SCREEN coords, morphing with the section slide: at REST the peaks
+    // centre between the disc bottoms and the SCREEN BOTTOM (user-tuned); fully scrolled
+    // they centre between the lifted discs and the stats pill top (145,
+    // prv_draw_bottom_stats). avail_mid converts back to section coords (+ss) so gshift
+    // stays a per-frame constant the whole fan scrolls by.
+    const int H = layer_get_bounds(s_list->canvas).size.h;
+    const int band_top_scr = R5_ICON_CY + R5_DISC_R - ss;
+    const int band_bot_scr = H - (H - 145) * ss / R5_SECTION_TRAVEL;
+    const int avail_mid = (band_top_scr + band_bot_scr) / 2 + ss;
     const int gshift = avail_mid - dot_mid - 1;
     for (int i = 0; i < n; i++) { yh[i] += gshift; yl[i] += gshift; }
     graphics_context_set_antialiased(ctx, true);
@@ -2336,18 +2482,20 @@ static void prv_canvas_draw(Layer *layer, GContext *ctx) {
   if (!s_list) return;
 #if defined(PBL_PLATFORM_GABBRO)
   prv_canvas_draw_gabbro(layer, ctx);
+  prv_draw_splash_overlay(layer, ctx);
   return;
 #endif
 #if WEATHER_ANIM_5DAY
 #if !PBL_ROUND
   if (s_list->report_fx == 4) {
-    // Stage 4 — the paper's bow: white card + paper/caption at rest, then the whole
-    // frame jelly-squashes off the left (capture must run AFTER the paper is drawn).
+    // Stage 4 — the paper's bow: white card, the paper squash-stretching off the left
+    // (its own points deform — Timeline smiley exit), the caption sliding out with it.
     graphics_context_set_fill_color(ctx, GColorWhite);
     graphics_fill_rect(ctx, layer_get_bounds(layer), 0, GCornerNone);
-    prv_draw_unfolding_paper(ctx);
-    prv_draw_report_caption(ctx);
-    prv_render_squash_in(ctx);
+    prv_draw_exiting_paper(ctx);
+    const int dx = (int)prv_moook_full(s_list->report_p, 0,
+                                       -layer_get_bounds(layer).size.w);
+    prv_draw_report_caption(ctx, dx, true);
     return;
   }
   if (s_list->report_fx >= 2 && !s_list->squash_mode) {
@@ -2388,7 +2536,7 @@ static void prv_canvas_draw(Layer *layer, GContext *ctx) {
     prv_draw_report_ball(ctx);
   } else if (s_list->report_fx == 3) {
     prv_draw_unfolding_paper(ctx);
-    prv_draw_report_caption(ctx);
+    prv_draw_report_caption(ctx, 0, false);
   }
   // Hero icon-fly + the card's glance text ride ON TOP of the squashed screen (both excluded from
   // the squash), landing together as the mainscreen clears. On the reverse fly (card -> forecast,
@@ -2400,6 +2548,7 @@ static void prv_canvas_draw(Layer *layer, GContext *ctx) {
     }
   }
 #endif
+  prv_draw_splash_overlay(layer, ctx);   // topmost: the intro card over everything
   return;
 #endif
   GRect bounds = layer_get_bounds(layer);
@@ -2555,8 +2704,202 @@ static void prv_note_icon_interaction(void) {
 // ---- Button input ----
 // (The select-exit statics now live with the report-scene block above.)
 
+#if !PBL_ROUND
+// ---- First-entry clock-slot intro: location -> time (the sunset card's swap) ----
+// City-only copy (split at the comma, like the round location bar).
+static void prv_clock_loc_city(char *dst, size_t dst_size, const char *src) {
+  size_t i = 0;
+  for (; src && src[i] && src[i] != ',' && i < dst_size - 1; i++) dst[i] = src[i];
+  while (i > 0 && dst[i - 1] == ' ') i--;
+  dst[i] = '\0';
+}
+
+static void prv_clock_swap_update(Animation *anim, AnimationProgress progress) {
+  (void)anim;
+  if (!s_list) return;
+  s_list->clock_swap_p = progress;
+  if (s_list->canvas) layer_mark_dirty(s_list->canvas);
+}
+
+static void prv_clock_swap_stopped(Animation *anim, bool finished, void *context) {
+  (void)finished; (void)context;
+  if (s_list) {
+    if (s_list->clock_swap_anim == anim) s_list->clock_swap_anim = NULL;
+    s_list->clock_swap_active = false;
+    s_list->clock_loc_show = false;   // the slot now rests on the time
+    if (s_list->canvas) layer_mark_dirty(s_list->canvas);
+  }
+  animation_destroy(anim);
+}
+
+static const AnimationImplementation s_clock_swap_impl = { .update = prv_clock_swap_update };
+
+static void prv_clock_loc_timer_cb(void *ctx) {
+  (void)ctx;
+  if (!s_list) return;
+  s_list->clock_loc_timer = NULL;
+  if (!s_list->clock_loc_show || s_list->clock_swap_anim) return;
+  s_list->clock_swap_active = true;
+  s_list->clock_swap_p = 0;
+  s_list->clock_swap_anim = animation_create();
+  if (!s_list->clock_swap_anim) {   // OOM: hard cut to the time
+    s_list->clock_swap_active = false;
+    s_list->clock_loc_show = false;
+    if (s_list->canvas) layer_mark_dirty(s_list->canvas);
+    return;
+  }
+  animation_set_implementation(s_list->clock_swap_anim, &s_clock_swap_impl);
+  animation_set_duration(s_list->clock_swap_anim, interpolate_moook_soft_duration(3));
+  animation_set_curve(s_list->clock_swap_anim, AnimationCurveLinear);  // the moook shapes it
+  animation_set_handlers(s_list->clock_swap_anim,
+                         (AnimationHandlers){ .stopped = prv_clock_swap_stopped }, NULL);
+  animation_schedule(s_list->clock_swap_anim);
+}
+
+// Re-arm the intro (globe city commit): the next appear — the globe's self-pop lands
+// straight on this window — replays the location hold + swap with the NEW city.
+#endif  // !PBL_ROUND (clock-slot intro draws only on the rect mainscreen)
+
+void forecast_list_replay_location_intro(void) {
+#if PBL_ROUND
+  // Round's mainscreen has no clock-slot intro — the API stays for weather.c.
+#else
+  if (!s_list) return;
+  if (s_list->clock_loc_timer) {
+    app_timer_cancel(s_list->clock_loc_timer);
+    s_list->clock_loc_timer = NULL;
+  }
+  if (s_list->clock_swap_anim) {   // null-first: .stopped only destroys
+    Animation *a = s_list->clock_swap_anim;
+    s_list->clock_swap_anim = NULL;
+    animation_unschedule(a);
+  }
+  s_list->clock_swap_active = false;
+  s_list->clock_loc_show = false;
+  s_list->clock_loc_done = false;   // the appear-arming runs again
+#endif
+}
+
+// Start the 2s hold — called when the screen is actually VISIBLE (first appear when no
+// splash runs; end of the splash dissolve otherwise, so the intro doesn't eat the hold).
+#if !PBL_ROUND
+static void prv_clock_loc_hold(void) {
+  if (!s_list || !s_list->clock_loc_show || s_list->clock_loc_timer ||
+      s_list->clock_swap_active) {
+    return;
+  }
+  s_list->clock_loc_timer = app_timer_register(2000, prv_clock_loc_timer_cb, NULL);
+}
+#endif
+
+// ---- The Weather Channel splash overlay (the original app's intro, as a true
+// cross-dissolve): solid GColorBlue card + centred logo for the hold, then the
+// card dissolves on the 4x4 bayer grid INTO the live forecast beneath — the
+// dissolve snapshots the forecast frame (drawn first, under this overlay),
+// paints the card, then restores forecast pixels where the grid has opened.
+static void prv_draw_splash_overlay(Layer *layer, GContext *ctx) {
+  if (!s_list || s_list->splash_keep <= 0) return;
+  const GRect b = layer_get_bounds(layer);
+  const bool dissolving = (s_list->splash_keep < 16) && s_list->splash_scratch;
+  if (dissolving) {   // snapshot the forecast frame before the card lands on it
+    GBitmap *fb = graphics_capture_frame_buffer(ctx);
+    if (fb) {
+      for (int y = 0; y < b.size.h; y++) {
+        GBitmapDataRowInfo ri = gbitmap_get_data_row_info(fb, (uint16_t)y);
+        for (int x = ri.min_x; x <= ri.max_x; x++) {
+          s_list->splash_scratch[y * b.size.w + x] = ri.data[x];
+        }
+      }
+      graphics_release_frame_buffer(ctx, fb);
+    }
+  }
+  graphics_context_set_fill_color(ctx, GColorBlue);
+  graphics_fill_rect(ctx, b, 0, GCornerNone);
+  if (s_list->splash_logo) {
+    const GRect ib = gbitmap_get_bounds(s_list->splash_logo);
+    graphics_context_set_compositing_mode(ctx, GCompOpSet);
+    graphics_draw_bitmap_in_rect(ctx, s_list->splash_logo,
+        GRect((b.size.w - ib.size.w) / 2, (b.size.h - ib.size.h) / 2,
+              ib.size.w, ib.size.h));
+    graphics_context_set_compositing_mode(ctx, GCompOpAssign);
+  }
+  if (dissolving) {   // open the grid: forecast pixels return where bayer >= keep
+    GBitmap *fb = graphics_capture_frame_buffer(ctx);
+    if (fb) {
+      for (int y = 0; y < b.size.h; y++) {
+        GBitmapDataRowInfo ri = gbitmap_get_data_row_info(fb, (uint16_t)y);
+        for (int x = ri.min_x; x <= ri.max_x; x++) {
+          if (s_bayer4[y & 3][x & 3] >= s_list->splash_keep) {
+            ri.data[x] = s_list->splash_scratch[y * b.size.w + x];
+          }
+        }
+      }
+      graphics_release_frame_buffer(ctx, fb);
+    }
+  }
+}
+
+static void prv_splash_end(void) {
+  if (!s_list) return;
+  s_list->splash_keep = 0;
+  if (s_list->splash_logo)    { gbitmap_destroy(s_list->splash_logo); s_list->splash_logo = NULL; }
+  if (s_list->splash_scratch) { free(s_list->splash_scratch); s_list->splash_scratch = NULL; }
+#if !PBL_ROUND
+  prv_clock_loc_hold();   // the mainscreen is visible now — start the location's 2s
+#endif
+}
+
+static void prv_splash_tick(void *ctx) {
+  (void)ctx;
+  if (!s_list) return;
+  s_list->splash_timer = NULL;
+  s_list->splash_keep--;
+  if (s_list->splash_keep <= 0) {
+    prv_splash_end();
+  } else {
+    s_list->splash_timer = app_timer_register(25, prv_splash_tick, NULL);
+  }
+  if (s_list->canvas) layer_mark_dirty(s_list->canvas);
+}
+
+static void prv_splash_hold_done(void *ctx) {
+  (void)ctx;
+  if (!s_list) return;
+  s_list->splash_timer = NULL;
+  // The dissolve scratch is allocated HERE, not at begin: begin runs right after
+  // the push, before the window's .load has created the canvas. One second in,
+  // the canvas is long alive. Alloc failure = hard cut (skip the dissolve).
+  if (s_list->canvas && !s_list->splash_scratch) {
+    const GRect b = layer_get_bounds(s_list->canvas);
+    s_list->splash_scratch = malloc_try((size_t)b.size.w * (size_t)b.size.h);
+  }
+  if (!s_list->splash_scratch) {
+    prv_splash_end();
+    if (s_list->canvas) layer_mark_dirty(s_list->canvas);
+    return;
+  }
+  prv_splash_tick(NULL);   // begins the ~400ms dissolve (16 x 25ms)
+}
+
+void forecast_list_begin_splash(void) {
+  if (!s_list || s_list->splash_keep) return;   // canvas may not exist yet — that's fine,
+  s_list->splash_logo =                          // the overlay draws once the window loads
+      gbitmap_create_with_resource(RESOURCE_ID_WEATHER_CHANNEL_LOGO);
+  if (!s_list->splash_logo) return;   // resource missing: skip the intro
+  s_list->splash_keep = 16;           // solid through the hold
+  // The first appear may have armed the location hold already (begin runs after the
+  // push) — the splash owns the screen now; the hold restarts at the dissolve's end.
+  if (s_list->clock_loc_timer) {
+    app_timer_cancel(s_list->clock_loc_timer);
+    s_list->clock_loc_timer = NULL;
+  }
+  s_list->splash_timer = app_timer_register(1000, prv_splash_hold_done, NULL);
+  if (s_list->canvas) layer_mark_dirty(s_list->canvas);
+}
+
 static void prv_click_up_down(ClickRecognizerRef recognizer, void *context) {
   if (!s_list) return;
+  if (s_list->splash_keep > 0) return;   // the intro card owns the screen
   bool down = click_recognizer_get_button_id(recognizer) == BUTTON_ID_DOWN;
 #if WEATHER_ANIM_5DAY
   // Mirror prv_click_select: while an exclusive transition owns the screen (clock burst,
@@ -2696,6 +3039,7 @@ static void prv_click_select(ClickRecognizerRef recognizer, void *context) {
   (void)recognizer;
   (void)context;
   if (!s_list || !s_list->on_select_request_cb) return;
+  if (s_list->splash_keep > 0) return;   // the intro card owns the screen
 #if WEATHER_ANIM_5DAY && !PBL_ROUND
   // Only from the resting main view (State A, no transition in flight) — same condition as the
   // "select" marker that advertises this button.
@@ -2710,6 +3054,7 @@ static void prv_click_select(ClickRecognizerRef recognizer, void *context) {
 #define SWIPE_THRESHOLD 20   // px; same tap/swipe split as clock_face + the original app
 
 static void prv_touch_handler(const TouchEvent *event, void *context) {
+  if (s_list && s_list->splash_keep > 0) return;   // the intro card owns the screen
   (void)context;
   if (!s_list) return;
   if (event->type == TouchEvent_Touchdown) {
@@ -2930,6 +3275,17 @@ static void prv_window_load(Window *window) {
 
 static void prv_window_appear(Window *window) {
   (void)window;
+  // First-entry clock-slot intro: show the active location for 2s, then swap to the
+  // time (sunset-card swap). Latched once per app run; under the splash the hold
+  // starts when the dissolve ends (prv_splash_end) so the intro doesn't eat it.
+#if !PBL_ROUND
+  if (s_list && !s_list->clock_loc_done && s_list->num_days > 0 &&
+      s_list->days[0].location_name && s_list->days[0].location_name[0]) {
+    s_list->clock_loc_done = true;
+    s_list->clock_loc_show = true;
+    if (!s_list->splash_keep) prv_clock_loc_hold();
+  }
+#endif
 #if WEATHER_PLATFORM_TOUCH_COLOR
   // (Re)claim the touch slot — a popping child (condensed/card/clock) unsubscribed in its
   // unload, which runs BEFORE this appear (window_transition_context_appearance_call_all).
@@ -2976,6 +3332,21 @@ static void prv_window_unload(Window *window) {
 #if WEATHER_PLATFORM_TOUCH_COLOR
   touch_service_unsubscribe();
 #endif
+  if (s_list && s_list->splash_timer) {
+    app_timer_cancel(s_list->splash_timer);
+    s_list->splash_timer = NULL;
+  }
+  if (s_list && s_list->clock_loc_timer) {
+    app_timer_cancel(s_list->clock_loc_timer);
+    s_list->clock_loc_timer = NULL;
+  }
+  if (s_list && s_list->clock_swap_anim) {   // null-first: .stopped only destroys
+    Animation *a = s_list->clock_swap_anim;
+    s_list->clock_swap_anim = NULL;
+    animation_unschedule(a);
+  }
+  s_list->clock_loc_show = false;   // splash end below must not re-arm the hold
+  prv_splash_end();
   // Fire pop callback before tearing down so the main screen can start its return animation.
   if (s_list && s_list->on_pop_cb) {
     void (*cb)(void *) = s_list->on_pop_cb;

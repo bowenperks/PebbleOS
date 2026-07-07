@@ -120,12 +120,29 @@ static void prv_load_bitmaps(void) {
       s_cf->type_bitmaps[i] = NULL;
     }
   }
-  for (int i = WeatherType_PartlyCloudy; i <= WeatherType_RainAndSnow; i++) {
-    s_cf->type_bitmaps[i] =
-        gbitmap_create_with_resource(prv_icon_res((WeatherType)i));
+  // Load only the types this push can DRAW (the day set + the hourly reveal
+  // series), not all nine — the type set is fixed for the window's life (day
+  // flips re-push). Every consumer clamps out-of-range bytes to Generic, so
+  // the used-set applies the same clamp, and Generic is ALWAYS loaded (it is
+  // also the NULL-slot fallback at draw time). A few KB of session heap back.
+  bool used[NUM_TYPE_SLOTS] = { false };
+  used[WeatherType_Generic] = true;
+  for (size_t i = 0; i < s_cf->num_days; i++) {
+    uint8_t wt = (uint8_t)s_cf->days[i].current_weather_type;
+    used[wt <= WeatherType_RainAndSnow ? wt : (uint8_t)WeatherType_Generic] = true;
   }
-  // Ensure the generic/unknown slot is always loaded as fallback.
-  // Also load bitmaps for all hourly types — these may differ from daily.
+  if (s_cf->hourly_valid) {  // draw only samples hourly when the series is complete
+    for (int h = 0; h < 24; h++) {
+      uint8_t wt = s_cf->hourly_types[h];
+      used[wt <= WeatherType_RainAndSnow ? wt : (uint8_t)WeatherType_Generic] = true;
+    }
+  }
+  for (int i = WeatherType_PartlyCloudy; i <= WeatherType_RainAndSnow; i++) {
+    if (used[i]) {
+      s_cf->type_bitmaps[i] =
+          gbitmap_create_with_resource(prv_icon_res((WeatherType)i));
+    }
+  }
 }
 
 static void prv_clock_glow_timer_callback(void *context) {

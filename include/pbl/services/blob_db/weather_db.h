@@ -39,7 +39,7 @@
 // record length, and the trailing-strings offset is resolved per minor
 // (see weather_db_entry_get_strings).
 #define WEATHER_DB_CURRENT_VERSION (4)
-#define WEATHER_DB_CURRENT_MINOR_VERSION (2)
+#define WEATHER_DB_CURRENT_MINOR_VERSION (3)
 #define WEATHER_DB_LEGACY_VERSION (3)
 
 // Days of daily forecast a v4 record carries (today + 6).
@@ -141,6 +141,12 @@ typedef struct PACKED {
   // WEATHER_SERVICE_LOCATION_FORECAST_UNKNOWN_TEMP if unknown.
   int16_t daily_feels_like[WEATHER_DB_MAX_FORECAST_DAYS];
 
+  // --- v4.3 appended fields (dominant wind direction) ---
+  // Open-Meteo: hourly winddirection_10m (today, dominant) and daily
+  // winddirection_10m_dominant. Degrees 0..359; -1 if unknown.
+  int16_t today_wind_dir_deg;
+  int16_t daily_wind_dir_deg[WEATHER_DB_MAX_FORECAST_DAYS];
+
   // --- variable-length trailing strings (MUST stay last) ---
   SerializedArray pstring16s;
 } WeatherDBEntry;
@@ -156,7 +162,9 @@ typedef enum WeatherDbStringIndex {
 #define WEATHER_DB_V4_0_FIXED_SIZE (offsetof(WeatherDBEntry, location_utc_offset_min))
 // Fixed portion of a v4.1 record — where a minor-1 record's trailing strings start.
 #define WEATHER_DB_V4_1_FIXED_SIZE (offsetof(WeatherDBEntry, today_wmo_code))
-// Fixed portion of a current (v4.2) record, i.e. everything except the trailing
+// Fixed portion of a v4.2 record — where a minor-2 record's trailing strings start.
+#define WEATHER_DB_V4_2_FIXED_SIZE (offsetof(WeatherDBEntry, today_wind_dir_deg))
+// Fixed portion of a current (v4.3) record, i.e. everything except the trailing
 // pstring16s SerializedArray header/payload.
 #define WEATHER_DB_V4_FIXED_SIZE (offsetof(WeatherDBEntry, pstring16s))
 
@@ -172,12 +180,13 @@ static inline bool weather_db_version_is_supported(uint8_t version) {
 }
 
 //! @return the byte offset of the trailing pstring16s array for a record of the
-//! given version + minor. v3, v4.0, v4.1 and v4.2 place it differently.
+//! given version + minor. v3, v4.0, v4.1, v4.2 and v4.3 place it differently.
 static inline size_t weather_db_entry_strings_offset(uint8_t version, uint8_t minor_version) {
   if (version < WEATHER_DB_CURRENT_VERSION) {
     return offsetof(WeatherDBEntryV3, pstring16s);
   }
-  if (minor_version >= 2) return offsetof(WeatherDBEntry, pstring16s);
+  if (minor_version >= 3) return offsetof(WeatherDBEntry, pstring16s);
+  if (minor_version >= 2) return WEATHER_DB_V4_2_FIXED_SIZE;
   if (minor_version >= 1) return WEATHER_DB_V4_1_FIXED_SIZE;
   return WEATHER_DB_V4_0_FIXED_SIZE;
 }

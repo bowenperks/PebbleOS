@@ -25,6 +25,7 @@ typedef struct {
   uint8_t type;    // WeatherType (app + fw enum values are identical)
   int precip;      // % rain chance, -1 if unknown (real v4 schema is today-only)
   int wind;        // mph, -1 if unknown (real v4 schema is today-only)
+  int wind_dir;    // degrees 0..359, -1 if unknown (v4.3)
   int uv;          // UV index 0-11, -1 if unknown (real v4 schema is today-only)
   int feels;       // feels-like temp, WX_DS_UNKNOWN_TEMP if unknown (v4.2 daily_feels_like)
 } WxDsDaily;
@@ -43,6 +44,7 @@ typedef struct {
   int today_uv;            // UV index 0-11, -1 unknown (v4)
   int today_precip;        // % , -1 unknown (v4)
   int today_wind;          // mph, -1 unknown (v4)
+  int today_wind_dir;      // degrees 0..359, -1 unknown (v4.3)
   int today_feels;         // feels-like temp, 32767 (unknown-temp) if unknown (v4)
   int today_wmo;           // WMO weather code, -1 unknown (v4.2 — warnings)
   int today_humidity;      // relative humidity %, -1 unknown (v4.2)

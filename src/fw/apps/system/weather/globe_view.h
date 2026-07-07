@@ -32,11 +32,7 @@ typedef struct {
     uint8_t *starfield_data;
     size_t starfield_size;
     GDrawCommandSequence *bw_sequence;
-    GDrawCommandSequence *bw_highlight_sequence;
-    GDrawCommandSequence *bw_crumple_sequence;
     GDrawCommandImage *cradle_pdc;
-    int bw_crumple_amount;
-    int bw_crumple_frame;
     uint32_t bw_frame_count;
     uint32_t bw_sequence_duration_ms;
     uint32_t bw_elapsed_ms;
@@ -69,18 +65,13 @@ typedef struct {
     int saved_entry_count;
     int32_t current_location_latitude_e2;
     int32_t current_location_longitude_e2;
-    int32_t custom_location_latitude_e2;
-    int32_t custom_location_longitude_e2;
     int bounce_direction;
     char current_location_label[48];
-    char custom_location_label[48];
     char city_label_text[48];
     GlobeLocationSelectCallback location_select_callback;
     void *location_select_context;
     GlobeSavedLocationsCallback saved_locations_callback;
     void *saved_locations_context;
-    GlobeMainCallback main_callback;
-    void *main_context;
     GlobeMainCallback back_callback;   // cradle BACK -> weather card (reverse of the SELECT entrance)
     void *back_context;
     AppTimer *animation_timer;
@@ -136,10 +127,6 @@ void globe_view_set_saved_locations_callback(GlobeView *view,
                                              GlobeSavedLocationsCallback callback,
                                              void *context);
 
-void globe_view_set_main_callback(GlobeView *view,
-                                  GlobeMainCallback callback,
-                                  void *context);
-
 // Set the callback fired when BACK is pressed on the intro cradle: the globe slides out to the
 // RIGHT, then this fires so weather.c can bring the weather card back in from the LEFT. When unset,
 // cradle BACK keeps its default (exit the app).
@@ -171,6 +158,11 @@ void globe_view_start_animation(GlobeView *view);
 void globe_view_stop_animation(GlobeView *view);
 
 void globe_view_push_animated(GlobeView *view, bool animated);
+
+//! Snap the globe's hovered pin to the saved location nearest these coords (the
+//! ACTIVE location) — call before a push so the globe opens on the city the user
+//! last selected. INT16_MIN coords = no-op.
+void globe_view_focus_coords(GlobeView *view, int16_t lat_e2, int16_t lon_e2);
 
 // Push with the intro cradle sliding in from one screen-width to the RIGHT (same moook bounce;
 // rect only, falls back to a plain push on round). Pairs with the card's slide-out-left on

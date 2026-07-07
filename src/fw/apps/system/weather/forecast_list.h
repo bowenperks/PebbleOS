@@ -11,6 +11,14 @@
 // start_day_index: the day that was focused in the main view; list opens scrolled to it.
 // animated: true for normal push, false for instant cut (used after transition anim).
 // on_pop/on_pop_ctx: optional callback fired when the list window is dismissed.
+// The Weather Channel intro card: solid hold, then a cross-dissolve into the
+// live forecast (call once, right after the launch push).
+void forecast_list_begin_splash(void);
+
+// Re-arm the clock-slot location intro (2s city name -> sunset-swap to the time):
+// the next appear replays it — call on a globe city commit before the reveal.
+void forecast_list_replay_location_intro(void);
+
 void forecast_list_push(const WeatherLocationForecast *days, size_t num_days,
                         int start_day_index, bool animated,
                         void (*on_pop)(void *ctx), void *on_pop_ctx,

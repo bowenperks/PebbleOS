@@ -449,9 +449,6 @@ static GSize get_vector_or_bitmap_size(GlobeView *view) {
     if (view->bw_sequence) {
         return gdraw_command_sequence_get_bounds_size(view->bw_sequence);
     }
-    if (view->bw_crumple_sequence) {
-        return gdraw_command_sequence_get_bounds_size(view->bw_crumple_sequence);
-    }
     if (view->cradle_pdc) {
         return gdraw_command_image_get_bounds_size(view->cradle_pdc);
     }
@@ -519,14 +516,7 @@ static GPoint crumple_point(GPoint point, GPoint center, AnimationProgress amoun
     );
 }
 
-static void destroy_bw_crumple_sequence(GlobeView *view) {
-    if (view->bw_crumple_sequence) {
-        gdraw_command_sequence_destroy(view->bw_crumple_sequence);
-        view->bw_crumple_sequence = NULL;
-    }
-    view->bw_crumple_amount = -1;
-    view->bw_crumple_frame = -1;
-}
+// (bw_crumple_sequence machinery deleted — the field was only ever NULL)
 
 typedef struct {
     GContext *ctx;
@@ -673,50 +663,40 @@ static bool color_highlight_bw_command(GDrawCommand *command,
     return true;
 }
 
-static void destroy_bw_highlight_sequence(GlobeView *view) {
-    if (view->bw_highlight_sequence) {
-        gdraw_command_sequence_destroy(view->bw_highlight_sequence);
-        view->bw_highlight_sequence = NULL;
-    }
-}
-
-static bool prepare_bw_highlight_sequence(GlobeView *view) {
-    if (!view || !view->bw_sequence) return false;
-    if (view->bw_highlight_sequence) return true;
-
-    view->bw_highlight_sequence = gdraw_command_sequence_clone(view->bw_sequence);
-    if (!view->bw_highlight_sequence) return false;
-
-    uint32_t frame_count =
-        gdraw_command_sequence_get_num_frames(view->bw_highlight_sequence);
-    for (uint32_t i = 0; i < frame_count; i++) {
-        GDrawCommandFrame *frame =
-            gdraw_command_sequence_get_frame_by_index(view->bw_highlight_sequence, i);
-        if (!frame) continue;
-        GDrawCommandList *list = gdraw_command_frame_get_command_list(frame);
-        if (!list) continue;
-        gdraw_command_list_iterate(list, color_highlight_bw_command, NULL);
-    }
+// Restore pass for the in-place highlight below: the bw art is UNIFORMLY
+// stroke-Black / fill-White (byte-verified across all 60 frames, widths vary
+// but are never touched), so constant restore is exactly invertible.
+static bool restore_bw_command(GDrawCommand *command, uint32_t index,
+                               void *context) {
+    (void)index; (void)context;
+    gdraw_command_set_stroke_color(command, GColorBlack);
+    gdraw_command_set_fill_color(command, GColorWhite);
     return true;
 }
 
 static void draw_intro_world_frame(GContext *ctx, GlobeView *view,
                                    GPoint origin, GSize frame_size) {
-    if (view && view->intro_world_selected &&
-        prepare_bw_highlight_sequence(view)) {
+    // Highlight IN PLACE: recolor the single frame being drawn, draw, restore —
+    // this replaced an 18.7 KB full-sequence clone (size campaign 2). The
+    // sequence lives on the heap (prv_load_inflated), never in mmap'd flash.
+    if (view && view->intro_world_selected && view->bw_sequence) {
         uint32_t duration = bw_sequence_duration_for_view(view);
         uint32_t elapsed = duration > 0 ? view->bw_elapsed_ms % duration : 0;
         GDrawCommandFrame *frame =
-            gdraw_command_sequence_get_frame_by_elapsed(
-                view->bw_highlight_sequence, elapsed);
+            gdraw_command_sequence_get_frame_by_elapsed(view->bw_sequence, elapsed);
         if (!frame) {
             frame = gdraw_command_sequence_get_frame_by_index(
-                view->bw_highlight_sequence,
+                view->bw_sequence,
                 bw_frame_index_for_view(view, view->current_frame));
         }
         if (frame) {
-            gdraw_command_frame_draw(ctx, view->bw_highlight_sequence, frame, origin);
-            return;
+            GDrawCommandList *list = gdraw_command_frame_get_command_list(frame);
+            if (list) {
+                gdraw_command_list_iterate(list, color_highlight_bw_command, NULL);
+                gdraw_command_frame_draw(ctx, view->bw_sequence, frame, origin);
+                gdraw_command_list_iterate(list, restore_bw_command, NULL);
+                return;
+            }
         }
     }
     draw_bw_frame(ctx, view, origin, frame_size);
@@ -779,31 +759,15 @@ static int32_t trig_cos_q10(int angle) {
                      GLOBE_ROT_SCALE / TRIG_MAX_RATIO);
 }
 
-static int32_t globe_isqrt(int32_t value) {
-    if (value <= 0) return 0;
-    uint32_t x = (uint32_t)value;
-    uint32_t result = 0;
-    uint32_t bit = 1UL << 30;
-    while (bit > x) bit >>= 2;
-    while (bit != 0) {
-        if (x >= result + bit) {
-            x -= result + bit;
-            result = (result >> 1) + bit;
-        } else {
-            result >>= 1;
-        }
-        bit >>= 2;
-    }
-    return (int32_t)result;
-}
+// (globe_isqrt was token-identical to weather_isqrt — merged, size campaign 2)
 
 // floor(sqrt(value)) via integer Newton iteration from a seed known to be
 // >= the true root (the previous pixel's depth in a row scan). From such a
 // seed the iteration is strictly decreasing and lands exactly on the floor,
-// so results match globe_isqrt() bit-for-bit at a fraction of the cost.
+// so results match weather_isqrt() bit-for-bit at a fraction of the cost.
 static inline int32_t floor_sqrt_seeded(int32_t value, int32_t seed) {
     if (value <= 0) return 0;
-    if (seed <= 0) return globe_isqrt(value);
+    if (seed <= 0) return weather_isqrt(value);
     int32_t s = seed;
     for (;;) {
         int32_t next = (s + (value / s)) >> 1;
@@ -880,7 +844,7 @@ static void matrix_screen_rotation(int32_t matrix[9], int yaw_angle, int pitch_a
 }
 
 static void normalize_axis(int32_t *x, int32_t *y, int32_t *z) {
-    int32_t length = globe_isqrt((*x * *x) + (*y * *y) + (*z * *z));
+    int32_t length = weather_isqrt((*x * *x) + (*y * *y) + (*z * *z));
     if (length <= 0) return;
 
     *x = (*x * GLOBE_ROT_SCALE) / length;
@@ -1117,8 +1081,6 @@ static void release_visual_resources(GlobeView *view) {
         gdraw_command_sequence_destroy(view->bw_sequence);
         view->bw_sequence = NULL;
     }
-    destroy_bw_highlight_sequence(view);
-    destroy_bw_crumple_sequence(view);
     if (view->cradle_pdc) {
         gdraw_command_image_destroy(view->cradle_pdc);
         view->cradle_pdc = NULL;
@@ -1382,41 +1344,21 @@ static void draw_space_background(GContext *ctx, GRect bounds, GlobeView *view) 
     graphics_release_frame_buffer(ctx, fb);
 }
 
+// A filled circle IS a ring with inner radius 0 (d2 >= 0 is always true) —
+// one rasterizer serves both (size campaign 2). NOINLINE on the ring keeps
+// the sharing real; inlined, it would clone into every caller.
+static void framebuffer_draw_ring(GBitmap *fb, GPoint center, int outer_r,
+                                  int inner_r, uint8_t color, GRect clip_rect);
+
 static void framebuffer_fill_circle(GBitmap *fb, GPoint center, int radius,
                                     uint8_t color, GRect clip_rect) {
-    if (!fb || radius <= 0) return;
-
-    GRect fbb = gbitmap_get_bounds(fb);
-    GRect clipped = clip_rect_to_bounds(clip_rect, fbb);
-    int radius_sq = radius * radius;
-    int top = center.y - radius;
-    int bottom = center.y + radius;
-    int clip_left = clipped.origin.x;
-    int clip_top = clipped.origin.y;
-    int clip_right = clipped.origin.x + clipped.size.w - 1;
-    int clip_bottom = clipped.origin.y + clipped.size.h - 1;
-
-    for (int ay = top; ay <= bottom; ay++) {
-        if (ay < clip_top || ay > clip_bottom) continue;
-        int dy = ay - center.y;
-        GBitmapDataRowInfo ri = gbitmap_get_data_row_info(fb, (uint16_t)ay);
-        for (int ax = center.x - radius; ax <= center.x + radius; ax++) {
-            if (ax < clip_left || ax > clip_right ||
-                ax < (int)ri.min_x || ax > (int)ri.max_x) {
-                continue;
-            }
-            int dx = ax - center.x;
-            if ((dx * dx) + (dy * dy) <= radius_sq) {
-                ri.data[ax] = color;
-            }
-        }
-    }
+    framebuffer_draw_ring(fb, center, radius, 0, color, clip_rect);
 }
 
 // Ring (annulus) rasterizer for the lock pulse — framebuffer_fill_circle's
 // bbox scan with an inner-radius reject.
-static void framebuffer_draw_ring(GBitmap *fb, GPoint center, int outer_r,
-                                  int inner_r, uint8_t color, GRect clip_rect) {
+static NOINLINE void framebuffer_draw_ring(GBitmap *fb, GPoint center, int outer_r,
+                                           int inner_r, uint8_t color, GRect clip_rect) {
     if (!fb || outer_r <= 0) return;
     if (inner_r < 0) inner_r = 0;
 
@@ -1468,7 +1410,7 @@ static void framebuffer_draw_raised_pin(GBitmap *fb, GPoint globe_center,
     int raise = st->raise + g;
     int dx = surface.x - globe_center.x;
     int dy = surface.y - globe_center.y;
-    int distance = globe_isqrt((dx * dx) + (dy * dy));
+    int distance = weather_isqrt((dx * dx) + (dy * dy));
     GPoint head = surface;
     if (distance > 0) {
         head.x += (dx * raise) / distance;
@@ -1759,7 +1701,7 @@ static int fill_globe_ring_row(uint8_t *row_data, int cx, int dy_sq,
     int spans[GLOBE_RING_COUNT + 1];
     for (int r = 0; r <= GLOBE_RING_COUNT; r++) {
         int32_t rem = radii_sq[r] - dy_sq;
-        spans[r] = rem >= 0 ? (int)globe_isqrt(rem) : -1;
+        spans[r] = rem >= 0 ? (int)weather_isqrt(rem) : -1;
     }
     for (int r = 0; r < GLOBE_RING_COUNT; r++) {
         fill_row_span(row_data, cx - spans[r], cx - spans[r + 1] - 1,
@@ -1849,7 +1791,7 @@ static void draw_cubemap_globe_at_center(GContext *ctx, GlobeView *view,
         // monotonically as d grows, so the seeded Newton sqrt can reuse the
         // previous pixel's depth as its starting point; the row seed below
         // is the depth at d = 0, an upper bound for the whole row.
-        int32_t sz = globe_isqrt(plane_sq);
+        int32_t sz = weather_isqrt(plane_sq);
         for (int d = 0; d <= d_max; d++) {
             int32_t sx = ((int32_t)d * GLOBE_ROT_SCALE) / radius;
             sz = floor_sqrt_seeded(plane_sq - (sx * sx), sz);
@@ -2866,7 +2808,6 @@ static void reveal_anim_stopped(Animation *anim, bool finished, void *context) {
         view->reveal_anim = NULL;
     }
     view->is_revealing = false;
-    destroy_bw_crumple_sequence(view);
 
     if (owns_anim && finished) {
         view->is_revealed = view->reveal_direction > 0;
@@ -2934,7 +2875,6 @@ static void toggle_reveal(GlobeView *view) {
     view->reveal_direction = view->is_revealed ? -1 : 1;
     view->is_revealing = true;
     view->transition_bw_frame = view->current_frame;
-    destroy_bw_crumple_sequence(view);
     set_color_orientation(view, 0,
                           longitude_e2_for_bw_frame(view->current_frame));
     view->transition_color_start_latitude_e2 = view->color_latitude_e2;
@@ -3629,8 +3569,6 @@ GlobeView *globe_view_create(void) {
 
     // Initialize animation state (all-zero fields come from the memset above)
     matrix_identity(view->globe_rotation);
-    view->bw_crumple_amount = -1;
-    view->bw_crumple_frame = -1;
     view->bw_frame_count = NUM_BW_FRAMES;
     view->bw_sequence_duration_ms = NUM_BW_FRAMES * GLOBE_FRAME_INTERVAL_MS;
     view->reveal_direction = 1;
@@ -3717,13 +3655,7 @@ void globe_view_set_saved_locations_callback(GlobeView *view,
     view->saved_locations_context = context;
 }
 
-void globe_view_set_main_callback(GlobeView *view,
-                                  GlobeMainCallback callback,
-                                  void *context) {
-    if (!view) return;
-    view->main_callback = callback;
-    view->main_context = context;
-}
+// (main_callback chain deleted — registered but never invoked; size campaign 2)
 
 void globe_view_set_back_callback(GlobeView *view,
                                   GlobeMainCallback callback,
@@ -3844,7 +3776,6 @@ void globe_view_start_animation(GlobeView *view) {
     view->hover_lock_active = false;
 #endif
     cancel_all_view_animations(view);
-    destroy_bw_crumple_sequence(view);
     ensure_visual_resources(view);
 
     show_intro_canvas(view);
@@ -3975,6 +3906,62 @@ void globe_view_slide_out_right(GlobeView *view) {
     if (view && view->back_callback) view->back_callback(view->back_context);
 }
 #endif
+
+// Entry coords for the focus search — platform-neutral (the touch build's
+// saved_entry_globe_coords twin lives inside WEATHER_PLATFORM_TOUCH_COLOR).
+static bool prv_entry_coords_for_focus(GlobeView *view, SavedLocationEntry *e,
+                                       int32_t *lat, int32_t *lon) {
+  if (!e) return false;
+  if (e->kind == SavedLocationKindCurrent) {
+    if (!view->has_current_location) return false;
+    *lat = view->current_location_latitude_e2;
+    *lon = view->current_location_longitude_e2;
+    return true;
+  }
+  if (!e->has_coordinates) return false;
+  *lat = e->latitude_e2;
+  *lon = e->longitude_e2;
+  return true;
+}
+
+// Snap the globe's rest state onto the saved pin nearest (lat,lon) — the ACTIVE
+// location — so a re-opened globe hovers the city the user last selected. Call
+// BEFORE the push: the reveal intro targets selected_city_index, and the direct
+// orientation snap covers re-pushes that skip the intro. No-op without coords.
+void globe_view_focus_coords(GlobeView *view, int16_t lat_e2, int16_t lon_e2) {
+  if (!view || view->saved_entry_count <= 0) return;
+  if (lat_e2 == INT16_MIN || lon_e2 == INT16_MIN) return;
+  int best = -1;
+  int32_t best_d = 0;
+  for (int i = 0; i < view->saved_entry_count; i++) {
+    SavedLocationEntry *e = saved_entry_for_index(view, i);
+    int32_t elat, elon;
+    if (!prv_entry_coords_for_focus(view, e, &elat, &elon)) continue;
+    const int32_t dlat = elat - lat_e2;
+    const int32_t dlon = shortest_longitude_delta_e2(lon_e2, elon);
+    const int32_t d = dlat * dlat + dlon * dlon;
+    if (best < 0 || d < best_d) { best = i; best_d = d; }
+  }
+  if (best < 0) return;
+  cancel_city_animation(view);
+  cancel_bounce_animation(view);
+  view->selected_city_index = best;
+#if WEATHER_PLATFORM_TOUCH_COLOR
+  view->hover_city_index = best;
+  view->hover_lock_active = true;
+  set_free_roam_enabled(view, false);
+#endif
+  {
+    SavedLocationEntry *e = saved_entry_for_index(view, best);
+    int32_t elat, elon;
+    if (prv_entry_coords_for_focus(view, e, &elat, &elon)) {
+      view->color_latitude_e2 = elat;
+      view->color_longitude_e2 = elon;
+    }
+  }
+  update_city_label_layer(view);
+  mark_dynamic_globe_dirty(view);
+}
 
 void globe_view_push_animated(GlobeView *view, bool animated) {
     if (!view) return;

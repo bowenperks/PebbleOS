@@ -21,7 +21,7 @@ typedef enum {
 
 typedef struct {
   SavedLocationKind kind;
-  int preset_index;
+  int8_t preset_index;   // -1..CITY_PRESET_COUNT-1 (value-context only)
   char label[SAVED_LOCATION_LABEL_SIZE];
   char query[SAVED_LOCATION_QUERY_SIZE];
   int16_t latitude_e2;
@@ -49,6 +49,10 @@ void saved_locations_push(const SavedLocationsConfig *config);
 //! at app launch: delivery is best-effort, so this recovers requests lost
 //! while the phone was disconnected. The phone treats ADD idempotently.
 void saved_locations_send_pending_queries(void);
+
+//! Free the app-heap custom-location cache at app exit (the statics survive the
+//! app; the heap doesn't — see saved_locations_reset in the .c).
+void saved_locations_reset(void);
 int saved_locations_get_entries(SavedLocationEntry *entries,
                                 int max_entries,
                                 const char *current_location_label,

@@ -1839,14 +1839,14 @@
       "file": "normal/base/images/plus_dotted.png"
     },
     {
-      "type": "pdc",
+      "type": "raw",
       "name": "RESULT_SHREDDED_TINY",
-      "file": "normal/base/images/Pebble_25x25_Result_shredded.svg"
+      "file": "normal/base/raw/empty_stub.raw"
     },
     {
-      "type": "pdc",
+      "type": "raw",
       "name": "RESULT_SHREDDED_SMALL",
-      "file": "normal/base/images/Pebble_50x50_Result_shredded.svg"
+      "file": "normal/base/raw/empty_stub.raw"
     },
     {
       "type": "pdc",
@@ -2691,6 +2691,11 @@
       "type": "pdc",
       "name": "WEATHER_REPORT_PAPER",
       "file": "normal/base/images/Pebble_80x80_Weather_report.svg"
+    },
+    {
+      "type": "png",
+      "name": "WEATHER_CHANNEL_LOGO",
+      "file": "normal/base/images/weather_channel_logo.png"
     }
   ],
   "timeline": [
