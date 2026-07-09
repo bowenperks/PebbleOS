@@ -655,9 +655,10 @@ typedef struct {
 
 static void prv_draw_top_rows(const WeatherAppLayout *layout, GPoint *off, int cw,
                               GContext *ctx, const TopText *t, int label_temp_gap,
-                              AnimationProgress uv_reveal) {
+                              bool draw_uv_box) {
 #if PBL_ROUND
   (void)label_temp_gap;
+  (void)draw_uv_box;   // round has no UV box (metric row instead)
   const int day_y = off->y + WEATHER_APP_LAYOUT_DAY_Y_SHIFT;
   GPoint line_off = GPoint(off->x + WEATHER_APP_LAYOUT_DAY_X_SHIFT, day_y);
   prv_draw_text(line_off, cw - WEATHER_APP_LAYOUT_DAY_X_SHIFT, ctx, t->label,
@@ -730,8 +731,14 @@ static void prv_draw_top_rows(const WeatherAppLayout *layout, GPoint *off, int c
   // 10px tally squares (13px pitch) filled in the WHO severity color, and a
   // near-box-height LECO numeral on the right. The 40px box floats centred
   // between the description above and the y195 divider (box_top, computed
-  // per page) — riding the day slide via off->y. Hidden when UV is off the wire.
-  if (t->uv && t->uv[0] && t->uv[0] != '-') {
+  // per page). Hidden when UV is off the wire.
+  //
+  // Decoupled from the day-scroll slide: draw_uv_box is FALSE for every frame
+  // of the transition (outgoing snapshot + incoming text both pass false), so
+  // the box is absent while the page slides and the weather bitmaps arc into
+  // place, then simply APPEARS — fully drawn, no animation — on the first
+  // static render once the animation settles (text_anim.active == false).
+  if (draw_uv_box && t->uv && t->uv[0] && t->uv[0] != '-') {
     int uvv = 0;
     for (const char *c = t->uv; *c >= '0' && *c <= '9'; c++) {
       uvv = uvv * 10 + (*c - '0');
@@ -747,14 +754,9 @@ static void prv_draw_top_rows(const WeatherAppLayout *layout, GPoint *off, int c
     graphics_draw_text(ctx, "UV INDEX", layout->metrics_value_font,
                        GRect(off->x + 24, by + 2, 70, 20),
                        GTextOverflowModeFill, GTextAlignmentLeft, NULL);
-    // The tally ticks in left-to-right across the landing's back half.
-    int filled = uvv < 10 ? uvv : 10;
-    if (uv_reveal < ANIMATION_NORMALIZED_MAX) {
-      int32_t tt = ((int32_t)uv_reveal - (ANIMATION_NORMALIZED_MAX / 2)) * 2;
-      if (tt < 0) tt = 0;
-      filled = (int)(((int64_t)filled * tt + ANIMATION_NORMALIZED_MAX - 1) /
-                     ANIMATION_NORMALIZED_MAX);
-    }
+    // Fully filled the instant the box appears — no tick-in (the box no longer
+    // rides any animation; it just renders in once the transition settles).
+    const int filled = uvv < 10 ? uvv : 10;
     // Off the WHO scale (11+) the pitch tightens 13->12: the meter maxes out
     // and the freed lane takes a '+' after the last square (instead of an
     // eleventh box) with clean air on both sides — a 2-digit LECO numeral's
@@ -800,8 +802,8 @@ static void prv_draw_snapshot_top(const WeatherAppLayout *layout, GPoint *off,
     .desc = layout->text_anim.top_desc,
 #endif
   };
-  prv_draw_top_rows(layout, off, cw, ctx, &t, PBL_IF_RECT_ELSE(3, 0),
-                    ANIMATION_NORMALIZED_MAX);
+  // Outgoing (snapshot) frame is only ever drawn mid-transition -> never the box.
+  prv_draw_top_rows(layout, off, cw, ctx, &t, PBL_IF_RECT_ELSE(3, 0), false);
 }
 
 static void prv_draw_top_half_text(const WeatherAppLayout *layout, GPoint *current_offset,
@@ -837,10 +839,10 @@ static void prv_draw_top_half_text(const WeatherAppLayout *layout, GPoint *curre
     .desc = desc_buffer,
 #endif
   };
+  // The box draws only on the STATIC render (transition settled) — never while
+  // the page/text is sliding, so it appears in place rather than sliding with it.
   prv_draw_top_rows(layout, current_offset, content_width, context, &t,
-                    PBL_IF_RECT_ELSE(3, 0),
-                    layout->text_anim.active ? layout->text_anim.progress
-                                             : ANIMATION_NORMALIZED_MAX);
+                    PBL_IF_RECT_ELSE(3, 0), !layout->text_anim.active);
 }
 
 // Shared bottom-half rows (label + high/low), string-driven.
