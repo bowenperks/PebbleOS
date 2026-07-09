@@ -191,9 +191,9 @@ static void prv_note_clock_interaction(void) {
 }
 
 // Return the absolute 24h hour for a clock-face position.
-// Today (day 0): maps to the NEXT 12 hours from now:
-//   position P → the upcoming hour h where h%12 == P%12.
-//   At 10:00: pos 11→11, pos 12→12, pos 1→13, pos 2→14 ... pos 10→22.
+// Today (day 0): maps to the CURRENT hour + the next 11:
+//   position P → the current-or-upcoming hour h where h%12 == P%12.
+//   At 11:00: pos 11→11 (now), pos 12→12, pos 1→13, pos 2→14 ... pos 10→22.
 // Other days: a fixed daytime window so the morning reads as AM:
 //   pos 7→07, 8→08 ... 12→12, 1→13 ... 6→18 (07:00 through 18:00).
 // Current hour, localtime()d at most once per SECOND — this helper runs per icon per frame
@@ -216,7 +216,10 @@ static int prv_abs_hour_for_pos(int pos_1_to_12) {
   }
   int cur_h = prv_cur_hour();
   int target_mod = pos_1_to_12 % 12;  // pos 12→0, pos 1→1, ..., pos 11→11
-  for (int i = 1; i <= 12; i++) {
+  // i starts at 0 so the CURRENT hour lands on its own position (and is the
+  // one highlighted) — starting at 1 put the current hour off the dial and
+  // highlighted the NEXT hour, reading an hour ahead.
+  for (int i = 0; i <= 11; i++) {
     int h = (cur_h + i) % 24;
     if (h % 12 == target_mod) return h;
   }
@@ -450,9 +453,8 @@ static void prv_canvas_draw(Layer *layer, GContext *ctx) {
   int32_t angle_offset = -(int32_t)(TRIG_MAX_ANGLE / 4)
       * (int32_t)(ANIMATION_NORMALIZED_MAX - intro_p) / (int32_t)ANIMATION_NORMALIZED_MAX;
 
-  // Current hour — for highlighting the next upcoming hour on the dial.
+  // Current hour — the dial highlights the CURRENT hour's position ("now").
   int cur_h24 = prv_cur_hour();
-  int next_h24 = (cur_h24 + 1) % 24;  // the first upcoming hour to highlight
 
   // ---- 12 weather icons at hour positions (oval orbit on Emery) ----
   // During exit animation the icons fall downward and shrink away.
@@ -748,12 +750,12 @@ static void prv_canvas_draw(Layer *layer, GContext *ctx) {
     int dot_nudge = PBL_IF_ROUND_ELSE(0, (pos == 3 || pos == 9) ? 6 : 0);
     int ddx = cx + (int)((int32_t)sin_lookup(angle) * (DOT_ORBIT_RX - dot_nudge) / TRIG_MAX_RATIO);
     int ddy = cy - (int)((int32_t)cos_lookup(angle) * (DOT_ORBIT_RY - dot_nudge) / TRIG_MAX_RATIO);
-    // 24h hour number — next upcoming hour gets a blue bubble (and no dot).
-    // Only today's clock highlights "the next hour" — for other days "now" isn't
-    // on that day, so no hour is highlighted.
+    // 24h hour number — the CURRENT hour gets a blue bubble (and no dot).
+    // Only today's clock highlights "now" — for other days "now" isn't on that
+    // day, so no hour is highlighted.
     int abs_h = prv_abs_hour_for_pos(pos);
-    bool is_next = (s_cf->day_index == 0) && (abs_h == next_h24);
-    if (!is_next) {
+    bool is_now = (s_cf->day_index == 0) && (abs_h == cur_h24);
+    if (!is_now) {
       graphics_context_set_fill_color(ctx, label_color);
       graphics_fill_circle(ctx, GPoint(ddx, ddy), 2);
     }
@@ -789,7 +791,7 @@ static void prv_canvas_draw(Layer *layer, GContext *ctx) {
     // it settles, then stretches into the oval once the bitmaps have landed.
     int32_t pill_appear  = (ANIMATION_NORMALIZED_MAX * 70) / 100; // dot starts growing
     int32_t pill_settled = (ANIMATION_NORMALIZED_MAX * 78) / 100; // full circle, begins stretch
-    bool show_pill = is_next && (anim_done || p > pill_appear);
+    bool show_pill = is_now && (anim_done || p > pill_appear);
 
     if (show_pill) {
       int r = 9;   // final radius => diameter 19
