@@ -685,10 +685,17 @@ static void prv_draw_top_rows(const WeatherAppLayout *layout, GPoint *off, int c
   GPoint line = GPoint(off->x, off->y + 1);
   char caps[24];
   prv_upcase_into(caps, sizeof(caps), t->label);
+  // Day name in GOTHIC_28_BOLD (heavier/thicker caps to match the reference's
+  // chunky "PALO ALTO"; the original app's 18_BOLD reads chunky at 144px, and
+  // 24_BOLD's 2px stems looked thin scaled up). ADVANCE is pinned to the
+  // 24_BOLD height, NOT the 28_BOLD one, so the temp/hilo/phrase stack below
+  // keeps its calibrated positions — the bigger caps grow down into the
+  // existing 14px label→temp whitespace, they don't push the temp down.
   // Label→temp air: 17px ink gap minus the user's −3 trim = 14 (gap param 3);
   // the rows below stay reference-tight (9/4) and ride with the temp.
-  line.y += prv_draw_text(line, cw, ctx, caps, layout->location_font,
-                          GColorBlack, GTextAlignmentLeft);
+  prv_draw_text(line, cw, ctx, caps, layout->location_font,
+                GColorBlack, GTextAlignmentLeft);
+  line.y += fonts_get_font_height(fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD));
   line.y += label_temp_gap;
   line.y += prv_draw_text(line, cw, ctx, t->temp, layout->temperature_font,
                           GColorBlack, GTextAlignmentLeft);
@@ -1190,20 +1197,23 @@ static void prv_render_layout(Layer *layer, GContext *context) {
                            bounds.size.w - (2 * content_x_offset) - 2, 2),
                      0, GCornerNone);
 #else
-  // Divider (reference photo): light gray, small square dots — EXACTLY 45 of
-  // them (user counted the reference photo by hand), EVERY gap identical
-  // (user rejected the earlier "spans exactly edge to edge" version because
-  // 200px isn't divisible by 45, forcing a wobble between 4px/5px gaps).
-  // Fixed integer pitch instead — perfectly uniform — with the whole group
-  // centered (a few px of margin on each side beats uneven internal spacing).
-  graphics_context_set_fill_color(context, PBL_IF_COLOR_ELSE(GColorLightGray, GColorBlack));
+  // Divider (reference photo): dark gray, bigger dots — EXACTLY 45 of them
+  // (user counted the reference by hand), EVERY gap identical (fixed integer
+  // pitch, whole group centered — 200px isn't divisible by 45 so a true
+  // edge-to-edge span would wobble; margins beat uneven internal spacing).
+  // Darker to match the reference: DarkGray (#555, the only gray darker than
+  // #AAA the hardware offers). 2x2 dots (the darker tone alone carries the
+  // "bigger/heavier" read — the taller 3px version was reverted per user),
+  // pitch 4 keeps the reference's ~1:1 dot:gap rhythm.
+  graphics_context_set_fill_color(context, PBL_IF_COLOR_ELSE(GColorDarkGray, GColorBlack));
   const int divider_dot_y = separator_y - 1 - 3;
   const int dot_w = 2;
+  const int dot_h = 2;
   const int pitch = 4;   // dot + gap, IDENTICAL for every one of the 45 dots
   const int total_span = 44 * pitch + dot_w;
   const int start_x = (bounds.size.w - total_span) / 2;
   for (int i = 0; i < 45; i++) {
-    graphics_fill_rect(context, GRect(start_x + i * pitch, divider_dot_y, dot_w, 2),
+    graphics_fill_rect(context, GRect(start_x + i * pitch, divider_dot_y, dot_w, dot_h),
                        0, GCornerNone);
   }
 #endif
@@ -1699,8 +1709,10 @@ void weather_app_layout_init(WeatherAppLayout *layout, const GRect *frame) {
   // Rect = the ideal/a14 hierarchy (the original app's, scaled for emery):
   // G24B day label, LECO_36 hero, G24B hi/lo, G18 phrase (metrics_value_font
   // doubles as the phrase face on rect), G14B metrics, G18B next-day label.
-  layout->location_font        = fonts_get_system_font(
-      PBL_IF_RECT_ELSE(FONT_KEY_GOTHIC_24_BOLD, FONT_KEY_GOTHIC_28_BOLD));
+  // Day name: heavier on rect (28_BOLD) to match the reference's chunky caps;
+  // the flow advance is pinned to 24_BOLD in prv_draw_top_rows so the stack
+  // below is undisturbed. Round unchanged (28_BOLD).
+  layout->location_font        = fonts_get_system_font(FONT_KEY_GOTHIC_28_BOLD);
   layout->temperature_font     = fonts_get_system_font(FONT_KEY_LECO_36_BOLD_NUMBERS);
   layout->high_low_phrase_font = fonts_get_system_font(
       PBL_IF_RECT_ELSE(FONT_KEY_GOTHIC_24_BOLD, FONT_KEY_GOTHIC_18));
