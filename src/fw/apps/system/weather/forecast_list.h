@@ -52,4 +52,5 @@ void forecast_list_update_data(const WeatherLocationForecast *days, size_t num_d
 // The expanded card's glance data (sunset title + high/low° strings, UV + rain %). The UP-to-card
 // hero transition animates this identical content (time, text, meters) in from the left, synced to
 // the icon-fly landing.
-void forecast_list_set_glance(const char *sunset, const char *temp, int uv, int precip);
+void forecast_list_set_glance(const char *sunset, const char *temp, int uv, int precip,
+                              int wind);

@@ -185,14 +185,67 @@ static void prv_window_load(Window *window) {
   tick_timer_service_subscribe(MINUTE_UNIT, prv_minute_tick);
 }
 
-// (round slide-in machinery deleted — unreachable: arm_static_in is rect-only
-// and the dead select latch was removed; size campaign 2)
+// ---- Entrance: the scene's finale. The whole page slides in from the RIGHT on the FULL
+// Timeline moook — the exact grammar of Timeline's next-day text intro after the
+// smiley/day-separator animation (anticipation, fast travel, overshoot past rest, settle).
+// A rigid translate, deliberately NOT a jelly squash: Timeline's text intro doesn't deform,
+// and the squash grammar has already had its say in the four stages that precede this
+// (mainscreen squash-left -> ball -> newspaper unfold -> the paper's squash-left bow).
+// Restored 2026-07-28: this machinery was deleted in size campaign 2 as "unreachable",
+// which was true only while arm_static_in was rect-only. weather.c now arms it on BOTH
+// shapes, so round was landing on a hard cut. Mirrors the rect arm line for line.
+static Animation *s_slide_in_anim;
+
+static void prv_slide_in_update(Animation *anim, AnimationProgress progress) {
+  (void)anim;
+  if (!s_report) return;
+  Layer *root = s_report->layout.root_layer;
+  const int w = layer_get_bounds(root).size.w;
+  GRect f = layer_get_frame_by_value(root);
+  f.origin.x = (int)interpolate_moook(progress, w, 0);   // slide in from the right (+w -> 0)
+  layer_set_frame(root, f);
+}
+
+static void prv_slide_in_stopped(Animation *anim, bool finished, void *context) {
+  (void)anim; (void)finished; (void)context;
+  s_slide_in_anim = NULL;
+  if (s_report) {
+    Layer *root = s_report->layout.root_layer;
+    GRect f = layer_get_frame_by_value(root);
+    f.origin.x = 0;
+    layer_set_frame(root, f);
+    layer_mark_dirty(root);
+  }
+  animation_destroy(anim);
+}
+
+static const AnimationImplementation s_slide_in_impl = { .update = prv_slide_in_update };
+
+static void prv_start_slide_in(void) {
+  if (!s_report || s_slide_in_anim) return;
+  Layer *root = s_report->layout.root_layer;
+  const int w = layer_get_bounds(root).size.w;
+  GRect f = layer_get_frame_by_value(root);
+  f.origin.x = w;                 // start the whole page off the right edge
+  layer_set_frame(root, f);
+  s_slide_in_anim = animation_create();
+  animation_set_implementation(s_slide_in_anim, &s_slide_in_impl);
+  animation_set_duration(s_slide_in_anim, interpolate_moook_duration());   // full moook —
+                                        // Timeline's day-text intro length, bounce included
+  animation_set_curve(s_slide_in_anim, AnimationCurveLinear);
+  animation_set_handlers(s_slide_in_anim,
+                         (AnimationHandlers){ .stopped = prv_slide_in_stopped }, NULL);
+  animation_schedule(s_slide_in_anim);
+}
 
 static void prv_window_appear(Window *window) {
 #if WEATHER_PLATFORM_TOUCH_COLOR
   if (s_report) touch_service_subscribe(prv_touch_handler, s_report);
 #endif
-
+  if (s_report && s_pending_static_in) {
+    s_pending_static_in = false;
+    prv_start_slide_in();     // the scene's finale: Timeline moook slide from the right
+  }
 }
 
 static void prv_window_unload(Window *window) {
@@ -201,6 +254,14 @@ static void prv_window_unload(Window *window) {
 #endif
   tick_timer_service_unsubscribe();
   if (s_hold_timer) { app_timer_cancel(s_hold_timer); s_hold_timer = NULL; }
+  // Module-level animations: null-first, then unschedule (the synchronous .stopped
+  // handlers see nulled handles and only destroy) — so a re-push can't find stale
+  // handles or animate the next instance's layers. Mirrors the rect arm.
+  if (s_slide_in_anim) {
+    Animation *a = s_slide_in_anim;
+    s_slide_in_anim = NULL;
+    animation_unschedule(a);
+  }
   if (s_report) {
     weather_app_layout_deinit(&s_report->layout);   // cancels glow/icon/fin timers, frees layers+bitmaps
   }
@@ -212,6 +273,12 @@ static void prv_window_unload(Window *window) {
 }
 
 void weather_report_push(const WeatherLocationForecast *days, size_t num_days, int start_day_index) {
+  // Consume the entrance latch up front so NO early return (guard, alloc, window failure)
+  // can leave it armed for an unrelated future push; re-armed below just before the push.
+  // static_in also suppresses the compositor's own push animation, so the moook slide is
+  // the ONLY motion (two competing slides read as a stutter).
+  const bool static_in = s_pending_static_in;
+  s_pending_static_in = false;
   if (s_report || !days || num_days == 0) return;
   s_report = calloc(1, sizeof(WeatherReportData));
   if (!s_report) return;
@@ -232,7 +299,8 @@ void weather_report_push(const WeatherLocationForecast *days, size_t num_days, i
     .unload = prv_window_unload,
   });
   window_set_click_config_provider(s_report->window, prv_click_provider);
-  window_stack_push(s_report->window, true);
+  s_pending_static_in = static_in;   // re-arm for prv_window_appear (-> the moook slide-in)
+  window_stack_push(s_report->window, !static_in);
 }
 
 bool weather_report_is_showing(void) {

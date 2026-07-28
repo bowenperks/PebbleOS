@@ -45,7 +45,6 @@ void weather_draw_lava_ring(GContext *ctx, GPoint center, int outer_r,
                             GColor glow_color, uint32_t phase,
                             uint8_t idle_progress);
 
-#if !PBL_ROUND
 // Whole-screen Timeline jelly squash-stretch blit, shared by forecast_list and clock_face.
 // `scratch` = W*H one-shot framebuffer snapshot. Modes 1-3 match forecast_list's
 // SQUASH_DROP_IN/_DOWN_EXIT/_RISE_IN. Mode 4 is the clock's forward exit: geometrically the
@@ -65,4 +64,3 @@ void weather_draw_lava_ring(GContext *ctx, GPoint center, int outer_r,
 // Mode 7: the weather report's entrance — RISE_IN rotated 90°: the whole screen
 // jelly-stretches IN from the RIGHT (left edge leads into place, right trails).
 void weather_render_squash(GContext *ctx, uint8_t *scratch, AnimationProgress m, int mode);
-#endif

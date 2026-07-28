@@ -3,6 +3,7 @@
 
 #include "weather_app_layout.h"
 #include "weather_math.h"
+#include "applib/graphics/gdraw_command_transforms.h"
 #include "resource_ids.pin.h"
 
 #include <stdlib.h>
@@ -22,9 +23,12 @@
 // ideal / a14c2675, styled to the original Pebble weather app): no bar at all —
 // white page to the top edge, the flow text stack left, discs right, dotted
 // rule, next-day block, bottom-centre chevron. Content owns the whole screen.
-#define WEATHER_APP_LAYOUT_MAIN_CONTENT_TOP \
-  PBL_IF_ROUND_ELSE(WEATHER_APP_LAYOUT_ROUND_BAR_DEPTH, 0)
-#define WEATHER_APP_LAYOUT_CONTENT_Y_SHIFT PBL_IF_ROUND_ELSE(-5, 0)
+// 2026-07-27: ROUND lost its location bar too -- the report page is now a white
+// field to the bezel on BOTH shapes, exactly like emery. That reclaims the 53px
+// top inset, which is precisely the deficit emery's content set ran at on a
+// circle. (Both arms are 0 now; rect's arm was already 0.)
+#define WEATHER_APP_LAYOUT_MAIN_CONTENT_TOP 0
+#define WEATHER_APP_LAYOUT_CONTENT_Y_SHIFT  0
 #define WEATHER_APP_LAYOUT_ACTIVE_BAR_DEPTH \
   PBL_IF_ROUND_ELSE(WEATHER_APP_LAYOUT_ROUND_BAR_DEPTH, WEATHER_APP_LAYOUT_MAIN_BAR_HEIGHT)
 #define WEATHER_APP_LAYOUT_LOCATION_BAR_TEXT_INSET PBL_IF_ROUND_ELSE(50, 0)
@@ -54,8 +58,12 @@
 #define WEATHER_APP_LAYOUT_TODAY_ICON_Y_ADJUST PBL_IF_ROUND_ELSE(-28, -11)
 #define WEATHER_APP_LAYOUT_ICON_Y_ADJUST PBL_IF_ROUND_ELSE(-15, 0)
 #define WEATHER_APP_LAYOUT_TOMORROW_ICON_Y_ADJUST PBL_IF_ROUND_ELSE(15, 0)
-#define WEATHER_APP_LAYOUT_SEPARATOR_Y_ADJUST PBL_IF_ROUND_ELSE(-8, 44)
-#define WEATHER_APP_LAYOUT_BOTTOM_TEXT_X_SHIFT PBL_IF_ROUND_ELSE(30, 0)
+// Divider lands at screen y194 on round (separator_y 201, less the round-only 3px lift at the
+// draw site), y192 on emery.
+#define WEATHER_APP_LAYOUT_SEPARATOR_Y_ADJUST PBL_IF_ROUND_ELSE(28, 44)
+// Footer rail: content x2 + 28 -> screen 42, clear of min_x 37 at the
+// label's bottom ink row (221).
+#define WEATHER_APP_LAYOUT_BOTTOM_TEXT_X_SHIFT PBL_IF_ROUND_ELSE(39, 0)
 #define WEATHER_APP_LAYOUT_BOTTOM_LABEL_X_ADJUST PBL_IF_ROUND_ELSE(-18, 0)
 #define WEATHER_APP_LAYOUT_BOTTOM_TEMP_X_ADJUST PBL_IF_ROUND_ELSE(4, 0)
 // Arc animation: circle is off-screen to the RIGHT.
@@ -75,6 +83,145 @@
 #define TEXT_MOOOK_MID_FRAMES 3
 #define TEXT_MOOOK_BOUNCE_BACK 4
 #define ICON_ANIM_DURATION_MS 220
+
+// ---- ROUND report page: a FIXED row grid (screen y == content y; the content
+// layer's origin is (12,0)). Emery flows each row from its measured height,
+// which cannot be chord-checked at compile time; on a circle every ink band has
+// to be proven against BOTH edges of its own row, so round pins them instead.
+// Every band below was checked against display_getafix.c's real 260-row mask.
+#define WEATHER_APP_LAYOUT_ROUND_TEXT_RAIL   16   // + off->x (2) -> content 18 -> screen 30
+// 28_BOLD ink 46..63. This is as high as the day name can go: 'WEDNESDAY' is
+// 113px, and between the glass on its left and the today disc's white halo on
+// its right (the halo is drawn AFTER the text stack and erases it) the row only
+// has ~114px of clear width. Emery's 14px label->temp air is NOT reachable at
+// 28_BOLD -- it needs either a smaller day font or a smaller today disc.
+// 28_BOLD ink 42..59, CENTRED in the air between the city and the temp: 10px
+// above (city ink ends 31) and 10px below (temp ink starts 70). Emery's own
+// number is 14px, but emery has nothing above its day name -- matching 14 here
+// pushed the day up into the city and read as top-heavy.
+#define WEATHER_APP_LAYOUT_ROUND_LABEL_Y     32   // G28_BOLD  ink 42..59
+#define WEATHER_APP_LAYOUT_ROUND_TEMP_Y      55   // LECO_36   ink 66..90
+#define WEATHER_APP_LAYOUT_ROUND_HIGHLOW_Y   90   // G18_BOLD  ink 97..107
+#define WEATHER_APP_LAYOUT_ROUND_PHRASE_Y   107   // G18       ink 114..124
+// Rows 55..125 are spaced so the ink gaps between the day name and the UV bar
+// come out EVEN: 6,6,6,5,5 (day->temp->hi/lo->phrase->desc->UV). The region is
+// 100px holding 72px of ink, so 28px of air is all there is to share; it used
+// to fall 10,4,3,4,7, which read as cramped in the middle and loose at the ends.
+#define WEATHER_APP_LAYOUT_ROUND_DESC_Y     125   // G14_BOLD  ink 130..154 (2 lines)
+#define WEATHER_APP_LAYOUT_ROUND_DESC_H      32   // TWO G14_BOLD lines -- emery's full
+                                                  // sentence wraps, and the space the
+                                                  // glyph row used to hold is now its.
+#define WEATHER_APP_LAYOUT_ROUND_LABEL_W    114   // rail 36 + 114 = 150, halo left is 152.8
+#define WEATHER_APP_LAYOUT_ROUND_PHRASE_W   112   // emery's clamp
+#define WEATHER_APP_LAYOUT_ROUND_DESC_W     190   // emery's full-measure description rail
+
+// ---- The LEFT RAIL CURVES with the glass, the way official round Pebble apps
+// hug the bezel: every row starts further left as it nears the display's widest
+// point. Modelled as a parabola matched to the circle (x ~ dy^2/2R for small dy)
+// rather than a true chord -- a true chord sags ~10px between the hi/lo and
+// phrase rows and reads as a kink, where this stays continuous down the stack.
+// Each row is measured at its own INK TOP, which is the tightest row of that
+// band while the stack sits above the equator (the chord widens going down).
+// Resulting screen rails: label 36, temp 25, hi/lo 19, phrase 18, desc 18.
+// The label's rail moved OUT when it moved up -- that is the curve working:
+// the chord at its new ink row (42) starts at x34.3, so 37 clears by 2.7px.
+// K was retuned 265 -> 340 -> 300 as the day label moved up the curve.
+#define WEATHER_APP_LAYOUT_ROUND_RAIL_MIN     6   // content x -> screen 18
+#define WEATHER_APP_LAYOUT_ROUND_RAIL_PIVOT 118   // ink y where the rail bottoms out
+#define WEATHER_APP_LAYOUT_ROUND_RAIL_K     320   // 2 * effective radius
+
+// ---- ROUND UV bar: emery's grid, but its LEFT AND RIGHT EDGES ARE ARCS
+// CONCENTRIC WITH THE GLASS, so the bar leans with the bezel and keeps a
+// near-constant 15-17px margin down its whole height. A straight full-measure
+// box would clear at its top row and clip at its bottom -- the circle narrows
+// downward, which is exactly the trap that bit the UV box on the 5-day screen.
+#define WEATHER_APP_LAYOUT_ROUND_UV_BOX_Y   157   // nudged up 3 with the rule (was 160)
+#define WEATHER_APP_LAYOUT_ROUND_UV_BOX_H    34   // emery is 40
+#define WEATHER_APP_LAYOUT_ROUND_UV_ARC_R_OUT 116
+#define WEATHER_APP_LAYOUT_ROUND_UV_ARC_R_IN  114
+#define WEATHER_APP_LAYOUT_ROUND_UV_SQ_DX    (-90) // squares start, RELATIVE TO THE GLASS
+                                                   // CENTRE (was content x 28; the report's
+                                                   // content layer is inset 12, so its glass
+                                                   // centre sits at content x 118 -> 28-118)
+#define WEATHER_APP_LAYOUT_ROUND_UV_SQ_DY     21  // BY+21 (emery BY+25)
+#define WEATHER_APP_LAYOUT_ROUND_UV_SUN_DX   (-86) // sun-glyph centre (was content x 32)
+// Sun + 'UV INDEX' are centred in the band between the widget's top edge (BY)
+// and the top of the tally squares (BY+SQ_DY) -- rows 157..177, centre 167.
+// Sun glyph is centre-anchored (core r3 + rays to r7, so bbox 160..174); the
+// header is box-anchored, and G18 puts its cap ink at box_y+7 .. +17, so
+// box BY-2 lands ink 162..172. Both centre on 167. (All BY-relative: the whole
+// widget moved up 3 with the rule, so only these absolute rows changed.)
+#define WEATHER_APP_LAYOUT_ROUND_UV_SUN_DY    10  // BY+10 -> centre row 167
+#define WEATHER_APP_LAYOUT_ROUND_UV_HDR_DY    -2  // BY-2  -> ink 162..172
+#define WEATHER_APP_LAYOUT_ROUND_UV_HDR_DX   (-74) // 'UV INDEX' box (was content x 44)
+#define WEATHER_APP_LAYOUT_ROUND_UV_NUM_DX    (43) // LECO value box (was content x 161)
+#define WEATHER_APP_LAYOUT_ROUND_UV_NUM_DY    -6  // BY-6 (emery BY-5)
+
+// ---- ROUND icon rails (the 50px raster today icon + the bare 25px footer icon)
+// The coloured disc behind the today icon, in HUNDREDTHS. Rect keeps 1.40x
+// (50 -> 70, unchanged). Round's icon is 75px: 1.40x would be a 105px disc that
+// runs off the glass, so it takes 1.15x -> 86px. That is bounded on three sides
+// and 1.15 is the largest value that satisfies all of them:
+//   - glass:  dist((193,80),(130,130)) = 80.4, + halo 48 = 128.4 <= 130
+//   - label:  halo's left edge at the day label's bottom ink row (66) is 148.1,
+//             (147.1 at 1.18x) and 'WEDNESDAY' ends at 145 -- the rail curve
+//             was eased to buy that clearance
+//   - desc:   halo's bottom row is 128, meeting the description's first ink
+//             row at a single centre pixel
+// Round stepped 1.18x -> 1.07x (disc 88 -> 80, halo r48 -> r44) so the 28_BOLD
+// day name can sit at emery's 14px label->temp spacing: at 1.18x the halo
+// reached in to screen x146.7 on the label's bottom ink row and 'WEDNESDAY'
+// could not fit beside it; at 1.07x that edge is 155.1.
+#define WEATHER_APP_LAYOUT_DISC_RATIO_NUM PBL_IF_ROUND_ELSE(111, 140)   // 75*111/100 = 83
+// Where the outgoing disc has fully collapsed during the UP day-flip, as a raw
+// icon width. Rect 32 of 50 (64%); round 48 of 75 (the same 64%).
+#define WEATHER_APP_LAYOUT_DISC_COLLAPSE_W0 PBL_IF_ROUND_ELSE(48, 32)
+#define WEATHER_APP_LAYOUT_ROUND_TODAY_ICON_X_INSET    18  // 236-75-18 = 143 -> screen 155
+#define WEATHER_APP_LAYOUT_ROUND_TODAY_ICON_Y          42  // disc centre (193,80) r44 halo 48
+// The PDC's native viewbox is 75x75 and gdraw_command_frame_draw ignores
+// sequence->size, so the ONLY way to shrink the art is to scale its command
+// lists in place -- done once at init against the RAM clone. The icon LAYER
+// stays 75px, which is what the disc diameter is derived from, so the circle is
+// unchanged and only the artwork inside it gets smaller.
+#define WEATHER_APP_LAYOUT_ROUND_PDC_NATIVE 75
+#define WEATHER_APP_LAYOUT_ROUND_PDC_ART    65
+#define WEATHER_APP_LAYOUT_ROUND_PDC_INSET \
+  ((WEATHER_APP_LAYOUT_ROUND_PDC_NATIVE - WEATHER_APP_LAYOUT_ROUND_PDC_ART) / 2)
+
+// ---- ROUND chin: the classic bottom affordance -- a grey segment across the
+// chin with a black chevron, shown while there IS another day below. The fin
+// owns the footer on the last day, so the two can never coexist.
+// Proportions read off the reference: the band is a shallow strip (~7.7% of the
+// 260px diameter, not the 10% first tried) and the chevron is nearly as wide as
+// the band is tall, where the first pass had it at half that.
+// The CITY at the crown, as in the reference. Sits above the today disc's halo
+// (whose top row is 32) -- the halo is drawn after the label and would erase it.
+// Footer icon disc (round only): a plain 35px filled circle, no white halo.
+// The disc, the day label and the hi/lo are ONE GROUP, vertically centred in the
+// band between the dotted rule and the chin: rule ends 195, chin starts 240, so
+// the free band is rows 196..239 (44) and the group's ink extent is the disc's
+// 35 rows -- the label (ink 203..213) and temps (ink 220..230) sit inside it.
+// 44-35 leaves 9px of odd slack, so exact centring is impossible: 4 above / 5
+// below puts the group centre on 217 against the band's 217.5, and the spare
+// pixel goes to the heavy chin side so the group doesn't read as crowded by it.
+// Disc centre (193,217) -> rows 200..234, still exactly 5 clear of the rule
+// (both moved up 3 together). Moving the group UP is safe against the round
+// mask -- higher rows have a WIDER chord -- but if it ever moves DOWN, check the
+// bitmap's bottom-right corner first: it is the tightest margin on the page.
+#define WEATHER_APP_LAYOUT_ROUND_FOOT_DISC 35
+#define WEATHER_APP_LAYOUT_ROUND_FOOT_LABEL_DY  -5
+#define WEATHER_APP_LAYOUT_ROUND_FOOT_TEMP_DY   12
+#define WEATHER_APP_LAYOUT_ROUND_CITY_X   57   // (city removed; kept for reference)
+#define WEATHER_APP_LAYOUT_ROUND_CITY_Y    8   // G24_BOLD ink 18..31; halo top row is 32
+#define WEATHER_APP_LAYOUT_ROUND_CITY_W  122   // chord at row 18 is x 64..196; 'LOS ANGELES'
+                                               // measures ~119px in 24_BOLD, so it just fits
+
+#define WEATHER_APP_LAYOUT_ROUND_CHIN_Y  240   // band rows 240..259 = 20px
+#define WEATHER_APP_LAYOUT_ROUND_CHEV_W   19   // odd width -> 19,17,...,1 scanlines
+#define WEATHER_APP_LAYOUT_ROUND_CHEV_Y  249   // rows 249..258, sitting on the band's
+                                               // lower edge as in the reference
+#define WEATHER_APP_LAYOUT_ROUND_CHEV_H   10
+#define WEATHER_APP_LAYOUT_ROUND_TOMORROW_ICON_X_INSET 42  // 236-25-42 = 169 -> screen 181
 
 // Round bar layer height keeps the (removed) pull-to-refresh drawer's sizing so the
 // round location bar renders unchanged: ROUND_BAR_DEPTH + 40 (old PULL_TRIGGER_PX) + 6.
@@ -168,77 +315,6 @@ static void prv_fill_high_low_buffer(int high, int low, bool tight,
 #define prv_fill_high_low_temp_buffer(h, l, b, n) \
   prv_fill_high_low_buffer((h), (l), false, (b), (n))
 
-#if PBL_ROUND
-static void prv_fill_rain_value_buffer(const WeatherLocationForecast *forecast,
-                                       char *buffer,
-                                       const size_t buffer_size) {
-  if (!buffer || buffer_size == 0) return;
-
-  if (forecast && forecast->today_precip_mm >= 0) {
-    snprintf(buffer, buffer_size, "%d%%", forecast->today_precip_mm);
-  } else {
-    snprintf(buffer, buffer_size, "--");
-  }
-}
-
-static void prv_fill_wind_value_buffer(const WeatherLocationForecast *forecast,
-                                       char *buffer,
-                                       const size_t buffer_size) {
-  if (!buffer || buffer_size == 0) return;
-
-  if (forecast && forecast->today_wind_mph >= 0) {
-    snprintf(buffer, buffer_size, "%dmph", forecast->today_wind_mph);
-  } else {
-    snprintf(buffer, buffer_size, "--");
-  }
-}
-
-#if PBL_ROUND
-static void prv_draw_raindrop_icon(GContext *context, GPoint origin) {
-  graphics_context_set_stroke_color(context, GColorBlack);
-  graphics_context_set_fill_color(context, GColorBlack);
-  graphics_context_set_stroke_width(context, 1);
-
-  // Keep this allocation-free; the metrics row is redrawn repeatedly while
-  // finger-scrubbing between days.
-  graphics_fill_circle(context, GPoint(origin.x + 5, origin.y + 8), 4);
-  graphics_draw_circle(context, GPoint(origin.x + 5, origin.y + 8), 4);
-  graphics_fill_rect(context, GRect(origin.x + 3, origin.y + 5, 5, 4), 0, GCornerNone);
-  graphics_draw_line(context, GPoint(origin.x + 5, origin.y),
-                     GPoint(origin.x + 9, origin.y + 6));
-  graphics_draw_line(context, GPoint(origin.x + 5, origin.y),
-                     GPoint(origin.x + 1, origin.y + 6));
-  graphics_draw_line(context, GPoint(origin.x + 1, origin.y + 6),
-                     GPoint(origin.x + 1, origin.y + 9));
-  graphics_draw_line(context, GPoint(origin.x + 9, origin.y + 6),
-                     GPoint(origin.x + 9, origin.y + 9));
-  // Fill the apex triangle: the two Bresenham edges alone leave a white
-  // notch inside the tip at 1x (system glyphs are always solid fills).
-  for (int dy = 1; dy <= 6; dy++) {
-    int half = dy * 4 / 6;
-    graphics_draw_line(context, GPoint(origin.x + 5 - half, origin.y + dy),
-                       GPoint(origin.x + 5 + half, origin.y + dy));
-  }
-}
-
-static void prv_draw_wind_icon(GContext *context, GPoint origin) {
-  graphics_context_set_stroke_color(context, GColorBlack);
-  graphics_context_set_stroke_width(context, 2);
-  // Decaying gust lengths (13/10/7) with a staggered leading edge — the
-  // firmware motion-line vocabulary — instead of three equal hamburger bars.
-  graphics_draw_line(context, GPoint(origin.x, origin.y + 3),
-                     GPoint(origin.x + 13, origin.y + 3));
-  graphics_draw_line(context, GPoint(origin.x + 2, origin.y + 7),
-                     GPoint(origin.x + 12, origin.y + 7));
-  graphics_draw_line(context, GPoint(origin.x, origin.y + 11),
-                     GPoint(origin.x + 7, origin.y + 11));
-  graphics_context_set_stroke_width(context, 1);
-}
-#endif
-
-#endif
-
-#if !PBL_ROUND
 static void prv_fill_uv_value_buffer(const WeatherLocationForecast *forecast,
                                      char *buffer, const size_t buffer_size) {
   if (!buffer || buffer_size == 0) return;
@@ -248,7 +324,6 @@ static void prv_fill_uv_value_buffer(const WeatherLocationForecast *forecast,
     snprintf(buffer, buffer_size, "--");
   }
 }
-#endif
 
 // (Feels-like removed 2026-07-04 by request: the wind-derived "feels 21°" whisper
 // cell and the round "Feels like" metric row are gone. today_feels_like_temp stays
@@ -256,37 +331,39 @@ static void prv_fill_uv_value_buffer(const WeatherLocationForecast *forecast,
 
 
 #if PBL_ROUND
-static int prv_draw_metric_row(GPoint offset, int max_width, GContext *context,
-                               const GFont font,
-                               const char *rain, const char *wind) {
-  const int row_h = PBL_IF_RECT_ELSE(16, 14);
-  const int y = offset.y + WEATHER_APP_LAYOUT_METRIC_TEXT_Y_INSET;
-  // Rows on one uniform pitch: precip + wind, then the UV tally. One rhythm
-  // and one shared left rail keep the whole block on the same grid as the
-  // day/temp/high-low stack above it.
-  const int row_pitch = PBL_IF_RECT_ELSE(19, 18);
-  const int y_top = y - 16;
-  const int y_bot = y_top + row_pitch;   // precip / wind
+// Left rail x (CONTENT coords) for a row whose ink starts at ink_top_y.
+static int prv_round_rail(int ink_top_y) {
+  const int dy = ink_top_y - WEATHER_APP_LAYOUT_ROUND_RAIL_PIVOT;
+  return WEATHER_APP_LAYOUT_ROUND_RAIL_MIN + (dy * dy) / WEATHER_APP_LAYOUT_ROUND_RAIL_K;
+}
 
-  // Value rail: precip value + UV squares share x+20 (one label column at
-  // the left rail, one value column, wind justified to the right rail).
-  const int rain_text_x = offset.x + PBL_IF_RECT_ELSE(20, 14);
-
-  graphics_context_set_text_color(context, GColorBlack);
-
-  prv_draw_raindrop_icon(context, GPoint(offset.x, y_bot + 2));
-  const int wind_x = offset.x + 50;
-  graphics_draw_text(context, rain, font, GRect(rain_text_x, y_bot, wind_x - rain_text_x - 2, row_h + 2),
-                     GTextOverflowModeFill, GTextAlignmentLeft, NULL);
-  prv_draw_wind_icon(context, GPoint(wind_x, y_bot + 2));
-  graphics_draw_text(context, wind, font,
-                     GRect(wind_x + 17, y_bot, max_width - (wind_x + 17 - offset.x), row_h + 2),
-                     GTextOverflowModeFill, GTextAlignmentLeft, NULL);
-  return row_h;
+// The UV bar's frame. Emery draws two concentric rectangles; round draws two
+// concentric ARCS OF THE DISPLAY ITSELF -- top and bottom rails stay straight,
+// but the left and right edges follow the bezel (r=116 outer, r=114 inner about
+// the glass centre). The bar leans with the glass and keeps a near-constant
+// 15-17px margin down its whole 34px height, where a straight full-measure box
+// would clear at its top row and clip at its bottom (the circle narrows down).
+static void prv_draw_uv_bar_frame(GContext *ctx, GPoint gc, int by, int h,
+                                  int r_out, int r_in) {
+  graphics_context_set_fill_color(ctx, GColorBlack);
+  for (int y = by; y < by + h; y++) {
+    const int dy = y - gc.y;
+    const int ho = (int)weather_isqrt(
+        r_out * r_out - dy * dy);
+    const int hi = (int)weather_isqrt(
+        r_in * r_in - dy * dy);
+    if (y < by + 2 || y >= by + h - 2) {
+      graphics_fill_rect(ctx, GRect(gc.x - ho, y, 2 * ho + 1, 1), 0, GCornerNone);
+    } else {
+      graphics_fill_rect(ctx, GRect(gc.x - ho, y, ho - hi, 1), 0, GCornerNone);
+      // +1 so the right band lands FLUSH with the rails above/below it; without
+      // it the rails overhang the arc by a pixel at every intermediate row.
+      graphics_fill_rect(ctx, GRect(gc.x + hi + 1, y, ho - hi, 1), 0, GCornerNone);
+    }
+  }
 }
 #endif
 
-#if !PBL_ROUND
 // (WHO UV ramp now shared: weather_uv_severity_color in weather_math.c)
 #define prv_uv_severity_color weather_uv_severity_color
 
@@ -398,7 +475,7 @@ static void prv_build_forecast_desc(const WeatherLocationForecast *f,
   prv_build_alert(f, alert, sizeof(alert));
   int n = snprintf(buf, buf_size, "%s.", alert);
   if (n < 0) return;
-  // A wind-flavored warning already said "winds" — the wind sentence then
+  // A wind-flavored warning already said "winds" -- the wind sentence then
   // drops its prefix ("Light winds. SW at 12mph.", not "...Winds SW at...").
   const bool wind_alert = (strstr(alert, "wind") != NULL) ||
                           (strstr(alert, "Wind") != NULL) ||
@@ -433,7 +510,119 @@ static void prv_draw_sun_glyph(GContext *ctx, GPoint c) {
     graphics_draw_line(ctx, GPoint(x0, y0), GPoint(x1, y1));
   }
 }
+
+#if PBL_ROUND
+// These MUST track the two fonts weather_app_layout_init resolves for this board, and its gate
+// is `PBL_DISPLAY_HEIGHT >= 200` — NOT shape. Gabbro is 260 tall so it takes the tall branch
+// (metrics_value_font = GOTHIC_18, temperature_font = LECO_36). Assuming the short branch here
+// silently shifted the report's UV value up ~13px and out to x217; caught by a row-signature
+// diff of the report page against its pre-refactor capture.
+// Compact preset — the sunset card's bar (rows 189..220), which hangs BELOW that card's centred
+// group where the glass chord is much shorter than at the report's rows 157..190.
+//
+// SAME STACK ORDER AS THE REPORT: sun + "UV INDEX" on top, the ten squares beneath, the LECO
+// value up the right. The squares stay FULL SIZE (10px); only the pitch tightens 13 -> 12, the
+// same pitch the report itself uses for uv>10.
+//
+// The one real difference is HORIZONTAL: every element is pushed toward the centre column,
+// because down here the chord clips the corners. The squares' bottom row (219) has a half-chord
+// of only 74px, so a left-railed row at x42 (what the report uses) would hang outside the arc —
+// at SQ_DX -72 they start at x58. Nothing needed to be reordered; the earlier squares-on-top
+// version was solving the wrong problem.
+//
+// DEPTH: h=36 (vs the report's 34). The frame paints 2px rails top AND bottom, so at h=32 the
+// squares' last row landed INSIDE the bottom rail and read as touching it; h=36 leaves 3 clear
+// rows beneath them. The bar also sits 5px lower now (EV_UV_BAR_Y 194), which costs chord width
+// — hence the compact-only arcs at r=124/122 instead of 116/114. That is still well inside the
+// glass (7-10px) and still narrower than the report's bar, which is 225px at its top row.
+#define WX_UVC_H         36
+#define WX_UVC_R_OUT    124
+#define WX_UVC_R_IN     122
+#define WX_UVC_SQ_SIZE   10
+#define WX_UVC_SQ_PITCH  12
+#define WX_UVC_SQ_DX   (-72)
+#define WX_UVC_SQ_DY     21
+#define WX_UVC_NUM_DX    32
+#define WX_UVC_NUM_W     46
+#define WX_UVC_NUM_DY   (-6)
+#define WX_UVC_SUN_DX  (-78)
+#define WX_UVC_SUN_DY    10
+#define WX_UVC_HDR_DX  (-68)
+#define WX_UVC_HDR_DY   (-2)
+
+#if PBL_DISPLAY_HEIGHT >= 200
+#define WX_UV_HDR_FONT FONT_KEY_GOTHIC_18
+#define WX_UV_NUM_FONT FONT_KEY_LECO_36_BOLD_NUMBERS
+#else
+#define WX_UV_HDR_FONT FONT_KEY_GOTHIC_14_BOLD
+#define WX_UV_NUM_FONT FONT_KEY_LECO_26_BOLD_NUMBERS_AM_PM
 #endif
+
+// The UV bar as a shared component (declared in weather_app_layout.h). The weather report and
+// the sunset card both call this, so there is ONE implementation.
+//
+// Every element hangs off `gc` — the glass centre in the CALLER'S coordinate space — so the bar
+// renders identically whether it is drawn into the report's content layer (inset 12px, glass
+// centre at content x 118) or the card's full-screen canvas (glass centre 130). The fonts are
+// looked up here rather than taken from a layout so a caller without one can use it; they are
+// the same two the report's layout resolves to on round.
+int weather_app_layout_uv_bar_height(WeatherUvBarSize size) {
+  return (size == WeatherUvBarCompact) ? WX_UVC_H : WEATHER_APP_LAYOUT_ROUND_UV_BOX_H;
+}
+
+void weather_app_layout_draw_uv_bar(GContext *ctx, GPoint gc, int by,
+                                    int uv_value, const char *uv_text, WeatherUvBarSize size,
+                                    const char *label) {
+  const bool c = (size == WeatherUvBarCompact);
+  const int h       = c ? WX_UVC_H       : WEATHER_APP_LAYOUT_ROUND_UV_BOX_H;
+  const int r_out   = c ? WX_UVC_R_OUT   : WEATHER_APP_LAYOUT_ROUND_UV_ARC_R_OUT;
+  const int r_in    = c ? WX_UVC_R_IN    : WEATHER_APP_LAYOUT_ROUND_UV_ARC_R_IN;
+  const int sun_dx  = c ? WX_UVC_SUN_DX  : WEATHER_APP_LAYOUT_ROUND_UV_SUN_DX;
+  const int hdr_dx  = c ? WX_UVC_HDR_DX  : WEATHER_APP_LAYOUT_ROUND_UV_HDR_DX;
+  const int hdr_dy  = c ? WX_UVC_HDR_DY  : WEATHER_APP_LAYOUT_ROUND_UV_HDR_DY;
+  const int sq_dx   = c ? WX_UVC_SQ_DX   : WEATHER_APP_LAYOUT_ROUND_UV_SQ_DX;
+  const int sq_dy   = c ? WX_UVC_SQ_DY   : WEATHER_APP_LAYOUT_ROUND_UV_SQ_DY;
+  const int sq_sz   = c ? WX_UVC_SQ_SIZE : 10;
+  const int num_dx  = c ? WX_UVC_NUM_DX  : WEATHER_APP_LAYOUT_ROUND_UV_NUM_DX;
+  const int num_dy  = c ? WX_UVC_NUM_DY  : WEATHER_APP_LAYOUT_ROUND_UV_NUM_DY;
+  const int num_w   = c ? WX_UVC_NUM_W   : 46;
+  const char *hdr_font = WX_UV_HDR_FONT;   // both sizes use the report's label font
+
+  graphics_context_set_stroke_color(ctx, GColorBlack);
+  graphics_context_set_stroke_width(ctx, 1);
+  prv_draw_uv_bar_frame(ctx, gc, by, h, r_out, r_in);
+  prv_draw_sun_glyph(ctx, GPoint(gc.x + sun_dx,
+                                 by + (c ? WX_UVC_SUN_DY : WEATHER_APP_LAYOUT_ROUND_UV_SUN_DY)));
+  graphics_context_set_text_color(ctx, GColorBlack);
+  graphics_draw_text(ctx, label, fonts_get_system_font(hdr_font),
+                     GRect(gc.x + hdr_dx, by + hdr_dy, c ? 96 : 70, 20),
+                     GTextOverflowModeFill, GTextAlignmentLeft, NULL);
+  const int filled = uv_value < 10 ? uv_value : 10;
+  const int pitch = c ? WX_UVC_SQ_PITCH : ((uv_value > 10) ? 12 : 13);
+  for (int i = 0; i < 10; i++) {
+    const GRect sq = GRect(gc.x + sq_dx + i * pitch, by + sq_dy, sq_sz, sq_sz);
+    if (i < filled) {
+      graphics_context_set_fill_color(ctx, prv_uv_severity_color(uv_value));
+      graphics_fill_rect(ctx, sq, 0, GCornerNone);
+    }
+    graphics_draw_rect(ctx, sq);
+  }
+  if (uv_value > 10 && filled >= 10) {   // "10+" tick past the last square
+    const int px = gc.x + sq_dx + 9 * pitch + sq_sz + 3;
+    const int py = by + sq_dy + sq_sz / 2;
+    graphics_context_set_stroke_width(ctx, 2);
+    graphics_draw_line(ctx, GPoint(px, py), GPoint(px + 6, py));
+    graphics_draw_line(ctx, GPoint(px + 3, py - 3), GPoint(px + 3, py + 3));
+    graphics_context_set_stroke_width(ctx, 1);
+  }
+  graphics_context_set_fill_color(ctx, GColorBlack);
+  // The VALUE stays LECO_36 in both sizes — the compact bar shrinks its squares and pulls the
+  // value box in, never the digit itself.
+  graphics_draw_text(ctx, uv_text, fonts_get_system_font(WX_UV_NUM_FONT),
+                     GRect(gc.x + num_dx, by + num_dy, num_w, 44),
+                     GTextOverflowModeFill, GTextAlignmentRight, NULL);
+}
+#endif  // PBL_ROUND
 
 static int prv_interpolate_text_moook(AnimationProgress progress, int from, int to) {
   static const int8_t frames_in[] = {0, 1, 20};
@@ -589,42 +778,23 @@ static void prv_snapshot_text(WeatherAppLayout *layout) {
     prv_fill_high_low_temp_buffer(f->today_high, f->today_low,
                                   layout->text_anim.top_highlow,
                                   sizeof(layout->text_anim.top_highlow));
+#endif
     strncpy(layout->text_anim.top_phrase,
             f->current_weather_phrase ? f->current_weather_phrase : "",
             sizeof(layout->text_anim.top_phrase) - 1);
     layout->text_anim.top_phrase[sizeof(layout->text_anim.top_phrase) - 1] = '\0';
     prv_build_forecast_desc(f, layout->text_anim.top_desc,
                             sizeof(layout->text_anim.top_desc));
-#endif
-#if PBL_ROUND
-    // Round's metric row reads rain+wind; its UV plumbing was dead ((void)uv).
-    prv_fill_rain_value_buffer(f,
-                               layout->text_anim.top_rain,
-                               sizeof(layout->text_anim.top_rain));
-    prv_fill_wind_value_buffer(f,
-                               layout->text_anim.top_wind,
-                               sizeof(layout->text_anim.top_wind));
-#else
-    // Rect's page reads uv (the UV bar) — rain/wind left the layout with the
-    // metrics row (the forecast description carries them now).
     prv_fill_uv_value_buffer(f,
                              layout->text_anim.top_uv,
                              sizeof(layout->text_anim.top_uv));
-#endif
   } else {
     layout->text_anim.top_label[0] = '\0';
     layout->text_anim.top_temp[0]  = '\0';
-#if !PBL_ROUND
     layout->text_anim.top_phrase[0] = '\0';
     layout->text_anim.top_desc[0] = '\0';
-#endif
     layout->text_anim.top_highlow[0] = '\0';
-#if PBL_ROUND
-    layout->text_anim.top_rain[0] = '\0';
-    layout->text_anim.top_wind[0] = '\0';
-#else
     layout->text_anim.top_uv[0] = '\0';
-#endif
   }
 
   const WeatherLocationForecast *n = layout->next_forecast;
@@ -633,7 +803,7 @@ static void prv_snapshot_text(WeatherAppLayout *layout) {
     strncpy(layout->text_anim.bot_label, lbl, sizeof(layout->text_anim.bot_label) - 1);
     layout->text_anim.bot_label[sizeof(layout->text_anim.bot_label) - 1] = '\0';
     prv_fill_high_low_buffer(n->today_high, n->today_low,
-                             PBL_IF_RECT_ELSE(true, false) /* tight on rect */,
+                             true /* tight on both shapes now */,
                              layout->text_anim.bot_highlow,
                              sizeof(layout->text_anim.bot_highlow));
     layout->text_anim.bot_valid = true;
@@ -646,11 +816,7 @@ static void prv_snapshot_text(WeatherAppLayout *layout) {
 // snapshot pass and the live pass — the row geometry lives here exactly once.
 typedef struct {
   const char *label, *temp, *highlow;
-#if PBL_ROUND
-  const char *rain, *wind;   // the metric row
-#else
   const char *uv, *phrase, *desc;   // UV bar, condition line, forecast description
-#endif
 } TopText;
 
 static void prv_draw_top_rows(const WeatherAppLayout *layout, GPoint *off, int cw,
@@ -658,24 +824,69 @@ static void prv_draw_top_rows(const WeatherAppLayout *layout, GPoint *off, int c
                               bool draw_uv_box) {
 #if PBL_ROUND
   (void)label_temp_gap;
-  (void)draw_uv_box;   // round has no UV box (metric row instead)
-  const int day_y = off->y + WEATHER_APP_LAYOUT_DAY_Y_SHIFT;
-  GPoint line_off = GPoint(off->x + WEATHER_APP_LAYOUT_DAY_X_SHIFT, day_y);
-  prv_draw_text(line_off, cw - WEATHER_APP_LAYOUT_DAY_X_SHIFT, ctx, t->label,
-                layout->location_font, GColorBlack, GTextAlignmentLeft);
-  line_off = GPoint(off->x + WEATHER_APP_LAYOUT_TEMP_X_SHIFT,
-                    day_y + WEATHER_APP_LAYOUT_TEXT_STACK_STEP);
-  prv_draw_text(line_off, cw - WEATHER_APP_LAYOUT_TEMP_X_SHIFT, ctx, t->temp,
-                layout->temperature_font, GColorBlack, GTextAlignmentLeft);
-  line_off = GPoint(off->x + WEATHER_APP_LAYOUT_HIGHLOW_X_SHIFT,
-                    day_y + WEATHER_APP_LAYOUT_TEXT_STACK_STEP * 2);
-  prv_draw_text(line_off, cw - WEATHER_APP_LAYOUT_HIGHLOW_X_SHIFT, ctx, t->highlow,
-                layout->high_low_phrase_font, GColorBlack, GTextAlignmentLeft);
-  line_off = GPoint(off->x + WEATHER_APP_LAYOUT_METRICS_X_SHIFT,
-                    day_y + WEATHER_APP_LAYOUT_TEXT_STACK_STEP * 3 -
-                        WEATHER_APP_LAYOUT_METRIC_TEXT_Y_INSET);
-  prv_draw_metric_row(line_off, cw - WEATHER_APP_LAYOUT_METRICS_X_SHIFT, ctx,
-                      layout->metrics_font, t->rain, t->wind);
+  // ROUND (2026-07-27 port): emery's page, on a FIXED grid. Same rows, same
+  // fonts, same order -- day label, hero temp, hi/lo, condition phrase, the
+  // forecast sentence, the rain/wind glyphs, then the UV bar. Every box is an
+  // explicit graphics_draw_text with TrailingEllipsis rather than prv_draw_text,
+  // because prv_draw_text measures into a 1000px-tall box and WRAPS: a long
+  // phone-supplied phrase would spill a second line straight through the
+  // description below it, which a fixed grid cannot absorb the way a flow can.
+  // Ink-top offsets per font (box y -> first ink row): G24_BOLD/G28_BOLD +10,
+  // LECO_36 +11, G18_BOLD/G18 +7, G14_BOLD +5. Label ink 42..55 then leaves a
+  // 14px gap to the temp's ink at 70 -- emery's exact label->temp air. The rail is solved from the ink, not the
+  // box, so the curve follows what the eye actually sees.
+  graphics_context_set_text_color(ctx, GColorBlack);
+
+  char caps[24];
+  prv_upcase_into(caps, sizeof(caps), t->label);
+  graphics_draw_text(ctx, caps, layout->location_font,
+                     GRect(off->x + prv_round_rail(WEATHER_APP_LAYOUT_ROUND_LABEL_Y + 10),
+                           off->y + WEATHER_APP_LAYOUT_ROUND_LABEL_Y,
+                           WEATHER_APP_LAYOUT_ROUND_LABEL_W, 30),
+                     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+  graphics_draw_text(ctx, t->temp, layout->temperature_font,
+                     GRect(off->x + prv_round_rail(WEATHER_APP_LAYOUT_ROUND_TEMP_Y + 11),
+                           off->y + WEATHER_APP_LAYOUT_ROUND_TEMP_Y,
+                           WEATHER_APP_LAYOUT_ROUND_LABEL_W, 38),
+                     GTextOverflowModeFill, GTextAlignmentLeft, NULL);
+  graphics_draw_text(ctx, t->highlow, layout->high_low_phrase_font,
+                     GRect(off->x + prv_round_rail(WEATHER_APP_LAYOUT_ROUND_HIGHLOW_Y + 7),
+                           off->y + WEATHER_APP_LAYOUT_ROUND_HIGHLOW_Y,
+                           WEATHER_APP_LAYOUT_ROUND_LABEL_W, 20),
+                     GTextOverflowModeFill, GTextAlignmentLeft, NULL);
+  if (t->phrase && t->phrase[0]) {
+    graphics_draw_text(ctx, t->phrase, layout->metrics_value_font,
+                       GRect(off->x + prv_round_rail(WEATHER_APP_LAYOUT_ROUND_PHRASE_Y + 7),
+                             off->y + WEATHER_APP_LAYOUT_ROUND_PHRASE_Y,
+                             WEATHER_APP_LAYOUT_ROUND_PHRASE_W, 20),
+                       GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+  }
+  // Emery's sentence, verbatim -- "Light winds. SW at 12mph. Precipitation 20%."
+  // It wraps to two lines at this measure, which is why it gets DESC_H and the
+  // row the rain/wind glyphs used to occupy.
+  if (t->desc && t->desc[0]) {
+    graphics_draw_text(ctx, t->desc, layout->metrics_font,
+                       GRect(off->x + prv_round_rail(WEATHER_APP_LAYOUT_ROUND_DESC_Y + 5),
+                             off->y + WEATHER_APP_LAYOUT_ROUND_DESC_Y,
+                             WEATHER_APP_LAYOUT_ROUND_DESC_W,
+                             WEATHER_APP_LAYOUT_ROUND_DESC_H),
+                       GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+  }
+
+  // The UV bar. Same gate as emery: it draws only on the STATIC render, so it
+  // appears in place once the day-flip settles instead of sliding with the text.
+  if (draw_uv_box && t->uv && t->uv[0] && t->uv[0] != '-') {
+    int uvv = 0;
+    for (const char *ch = t->uv; *ch >= '0' && *ch <= '9'; ch++) {
+      uvv = uvv * 10 + (*ch - '0');
+    }
+    const int by = off->y + WEATHER_APP_LAYOUT_ROUND_UV_BOX_Y;
+    // Glass centre in CONTENT coords -- derived, never hard-coded, so the bar
+    // stays concentric if the content layer ever moves.
+    const GPoint gc = GPoint(PBL_DISPLAY_WIDTH / 2 - layout->content_layer_origin.x,
+                             PBL_DISPLAY_HEIGHT / 2 - layout->content_layer_origin.y);
+    weather_app_layout_draw_uv_bar(ctx, gc, by, uvv, t->uv, WeatherUvBarFull, "UV INDEX");
+  }
 #else
   // Rect: the ORIGINAL flow layout (bowens ideal / a14c2675, styled to the
   // original Pebble weather app): each line advances by its measured height
@@ -800,14 +1011,9 @@ static void prv_draw_snapshot_top(const WeatherAppLayout *layout, GPoint *off,
     .label = layout->text_anim.top_label,
     .temp = layout->text_anim.top_temp,
     .highlow = layout->text_anim.top_highlow,
-#if PBL_ROUND
-    .rain = layout->text_anim.top_rain,
-    .wind = layout->text_anim.top_wind,
-#else
     .uv = layout->text_anim.top_uv,
     .phrase = layout->text_anim.top_phrase,
     .desc = layout->text_anim.top_desc,
-#endif
   };
   // Outgoing (snapshot) frame is only ever drawn mid-transition -> never the box.
   prv_draw_top_rows(layout, off, cw, ctx, &t, PBL_IF_RECT_ELSE(3, 0), false);
@@ -819,17 +1025,10 @@ static void prv_draw_top_half_text(const WeatherAppLayout *layout, GPoint *curre
 
   char temp_buffer[15] = {0};
   char highlow_buffer[15] = {0};
-#if PBL_ROUND
-  char rain_buffer[12] = {0};
-  char wind_buffer[16] = {0};
-  prv_fill_rain_value_buffer(forecast, rain_buffer, sizeof(rain_buffer));
-  prv_fill_wind_value_buffer(forecast, wind_buffer, sizeof(wind_buffer));
-#else
-  char uv_buffer[12] = {0};
   char desc_buffer[72] = {0};
+  char uv_buffer[12] = {0};
   prv_build_forecast_desc(forecast, desc_buffer, sizeof(desc_buffer));
   prv_fill_uv_value_buffer(forecast, uv_buffer, sizeof(uv_buffer));
-#endif
   prv_fill_featured_temp_buffer(forecast, temp_buffer, sizeof(temp_buffer));
   prv_fill_high_low_temp_buffer(forecast->today_high, forecast->today_low,
                                 highlow_buffer, sizeof(highlow_buffer));
@@ -837,14 +1036,9 @@ static void prv_draw_top_half_text(const WeatherAppLayout *layout, GPoint *curre
     .label = (forecast->label && forecast->label[0]) ? forecast->label : "TODAY",
     .temp = temp_buffer,
     .highlow = highlow_buffer,
-#if PBL_ROUND
-    .rain = rain_buffer,
-    .wind = wind_buffer,
-#else
     .uv = uv_buffer,
     .phrase = forecast->current_weather_phrase,
     .desc = desc_buffer,
-#endif
   };
   // The box draws only on the STATIC render (transition settled) — never while
   // the page/text is sliding, so it appears in place rather than sliding with it.
@@ -857,23 +1051,32 @@ static void prv_draw_bottom_rows(const WeatherAppLayout *layout, GPoint *off, in
                                  GContext *ctx, const char *label, const char *highlow,
                                  const char *phrase, int gap) {
 #if PBL_ROUND
-  (void)phrase;
+  // ROUND: the reference's STACKED block -- the day name bold on its own line
+  // with the high/low beneath it, bare icon railed right. The rail is pushed in
+  // to content 41 (screen 53) because the lower line's ink reaches row 233,
+  // where the glass only starts at x50.7 -- the single-row footer could sit at
+  // screen 42 precisely because it never went that deep.
+  (void)gap; (void)phrase;
   off->x += WEATHER_APP_LAYOUT_BOTTOM_TEXT_X_SHIFT;
-  cw -= WEATHER_APP_LAYOUT_BOTTOM_TEXT_X_SHIFT;
-  off->y += gap;
-  GPoint label_off = GPoint(off->x + WEATHER_APP_LAYOUT_BOTTOM_LABEL_X_ADJUST, off->y);
-  off->y += prv_draw_text(label_off, cw, ctx, label,
-                          layout->tomorrow_font, GColorBlack, GTextAlignmentLeft);
-  GPoint temp_off = GPoint(off->x + WEATHER_APP_LAYOUT_BOTTOM_TEMP_X_ADJUST, off->y);
-  prv_draw_text(temp_off, cw, ctx, highlow,
-                layout->high_low_phrase_font, GColorBlack, GTextAlignmentLeft);
+  char rcaps[24];
+  prv_upcase_into(rcaps, sizeof(rcaps), label);
+  graphics_context_set_text_color(ctx, GColorBlack);
+  const int r_icon_left = layout->tomorrow_icon_rest_frame.origin.x;
+  const int r_w = r_icon_left - 4 - off->x;
+  graphics_draw_text(ctx, rcaps, layout->tomorrow_font,
+                     GRect(off->x, off->y + WEATHER_APP_LAYOUT_ROUND_FOOT_LABEL_DY, r_w, 20),
+                     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+  graphics_draw_text(ctx, highlow, layout->tomorrow_font,
+                     GRect(off->x, off->y + WEATHER_APP_LAYOUT_ROUND_FOOT_TEMP_DY, r_w, 20),
+                     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
 #else
-  // Rect: the NEWSPAPER FOOTER SLOT (brought back from the front-page-spread
+  // The NEWSPAPER FOOTER SLOT (rect)  // Rect: the NEWSPAPER FOOTER SLOT (brought back from the front-page-spread
   // version): one compact row under the rule — next-day label + tight temps on
   // the left, the bare 25px bitmap right-railed by its rest frame. Fixed
   // anchors so nothing jumps between pages; temps ellipsize before they can
   // reach the icon (double-negative winters).
   (void)gap; (void)phrase;
+  off->x += WEATHER_APP_LAYOUT_BOTTOM_TEXT_X_SHIFT;   // 0 on rect
   const int row_y = off->y + 3;
   char caps[24];
   prv_upcase_into(caps, sizeof(caps), label);
@@ -884,8 +1087,11 @@ static void prv_draw_bottom_rows(const WeatherAppLayout *layout, GPoint *off, in
   graphics_draw_text(ctx, caps, layout->tomorrow_font,
                      GRect(off->x, row_y, lsz.w + 2, 20),
                      GTextOverflowModeFill, GTextAlignmentLeft, NULL);
-  const int icon_left = cw + WEATHER_APP_LAYOUT_CONTENT_LAYER_HORIZONTAL_INSET - 25;
-  const int tx = off->x + lsz.w + 10;
+  // Derived from the frame the bitmap actually rests in, so the ellipsis point
+  // can never drift away from the icon. On rect this is 190-25-3 = 162, exactly
+  // what the old cw-based formula produced; on round it self-syncs to 177.
+  const int icon_left = layout->tomorrow_icon_rest_frame.origin.x;
+  const int tx = off->x + lsz.w + PBL_IF_RECT_ELSE(10, 5);
   graphics_draw_text(ctx, highlow, layout->tomorrow_font,
                      GRect(tx, row_y, icon_left - 4 - tx, 20),
                      GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
@@ -906,7 +1112,7 @@ static void prv_draw_bottom_half_text(const WeatherAppLayout *layout, GPoint *cu
   if (!next) return;
   char text_buffer[15] = {0};
   prv_fill_high_low_buffer(next->today_high, next->today_low,
-                           PBL_IF_RECT_ELSE(true, false) /* tight on rect */,
+                           true /* tight on both shapes now */,
                            text_buffer, sizeof(text_buffer));
   prv_draw_bottom_rows(layout, current_offset, content_width, context,
                        (next->label && next->label[0]) ? next->label : "TOMORROW",
@@ -914,11 +1120,28 @@ static void prv_draw_bottom_half_text(const WeatherAppLayout *layout, GPoint *cu
                        PBL_IF_RECT_ELSE(2, 10));
 }
 
+#if PBL_ROUND
+// Round's day-flip disc size for the SCALER layer. Gabbro now rests a 35px
+// circle in the footer slot, so the travelling disc must land on it: it lerps
+// between the footer disc and the today disc across the icon's own width range.
+// (Emery keeps collapsing to zero -- its footer bitmap is bare, so there is
+// nothing there for the disc to become.)
+static int prv_round_scaler_disc(int w) {
+  const int lo = WEATHER_APP_LAYOUT_ROUND_FOOT_DISC;
+  const int hi = s_today_icon_size.w * WEATHER_APP_LAYOUT_DISC_RATIO_NUM / 100;
+  const int w0 = s_tomorrow_icon_size.w;
+  const int w1 = s_today_icon_size.w;
+  if (w <= w0 || w1 <= w0) return lo;
+  if (w >= w1) return hi;
+  return lo + (hi - lo) * (w - w0) / (w1 - w0);
+}
+#endif
+
 static void prv_draw_circle_at_layer(Layer *icon_layer, GContext *context,
                                      WeatherType weather_type) {
   GRect frame = layer_get_frame(icon_layer);
   const GSize sz = frame.size;
-  const int diam = (int)(sz.w * 14 / 10);
+  const int diam = (int)(sz.w * WEATHER_APP_LAYOUT_DISC_RATIO_NUM / 100);
   GRect bg_circle = (GRect){
     .origin = GPoint(frame.origin.x + sz.w / 2 - diam / 2,
                      frame.origin.y + sz.h / 2 - diam / 2),
@@ -942,12 +1165,13 @@ static void prv_draw_weather_pdc_frame(const WeatherAppLayout *layout,
       gdraw_command_sequence_get_frame_by_index(layout->weather_icon_pdc_sequence,
                                                 frame_index);
   gdraw_command_frame_draw(ctx, layout->weather_icon_pdc_sequence, frame,
-                           frame_rect.origin);
+                           GPoint(frame_rect.origin.x + WEATHER_APP_LAYOUT_ROUND_PDC_INSET,
+                                  frame_rect.origin.y + WEATHER_APP_LAYOUT_ROUND_PDC_INSET));
 }
 
 static GRect prv_icon_background_frame_for_icon(GRect icon_frame) {
   const GSize sz = icon_frame.size;
-  const int diam = (int)(sz.w * 14 / 10);
+  const int diam = (int)(sz.w * WEATHER_APP_LAYOUT_DISC_RATIO_NUM / 100);
   return (GRect){
     .origin = GPoint(icon_frame.origin.x + sz.w / 2 - diam / 2,
                      icon_frame.origin.y + sz.h / 2 - diam / 2),
@@ -1015,7 +1239,6 @@ static void prv_draw_weather_icon_backgrounds(const WeatherAppLayout *layout,
   bool animating = !layer_get_hidden(layout->outgoing_weather_icon_layer);
 
   if (animating) {
-#if !PBL_ROUND
     if (!layout->anim_params.animate_down) {
       // UP only: the outgoing today icon lands in the BARE newspaper footer
       // slot, so the colored disc collapses into the art mid-flight (gone by
@@ -1028,21 +1251,46 @@ static void prv_draw_weather_icon_backgrounds(const WeatherAppLayout *layout,
       const GRect f = layer_get_frame(layout->outgoing_weather_icon_layer);
       const int w = f.size.w;                       // 50 -> 25 (moook rebound: 26)
       const GPoint c = GPoint(f.origin.x + w / 2, f.origin.y + f.size.h / 2);
-      // Disc/icon ratio falls linearly 1.4x -> 0 over w = 50 -> 32, hard 0
-      // below (zero-at-32 also clamps the rebound's w=26 flicker to nothing):
-      //   diam(w) = 14*w*(w-32) / (10*(50-32)) == 7*w*(w-32)/90
-      const int diam = (w > 32) ? (7 * w * (w - 32) / 90) : 0;
+      // Disc/icon ratio falls linearly RATIO -> 0 over w = <rest size> -> W0,
+      // hard 0 below (zero-at-W0 also clamps the moook rebound's undershoot to
+      // nothing). Derived from s_today_icon_size rather than a baked-in 50:
+      //   diam(w) = RATIO*w*(w - W0) / (100 * (rest - W0))
+      // On rect that is still exactly 7*w*(w-32)/90. It MUST be derived: with
+      // the 50 hard-coded, round's 75px icon produced a 250px disc on the first
+      // frame -- a full-screen colour flash before it collapsed.
+#if PBL_ROUND
+      const int diam = prv_round_scaler_disc(w);
+#else
+      const int w0 = WEATHER_APP_LAYOUT_DISC_COLLAPSE_W0;
+      const int wrest = s_today_icon_size.w;
+      const int diam = (w > w0 && wrest > w0)
+          ? (WEATHER_APP_LAYOUT_DISC_RATIO_NUM * w * (w - w0) / (100 * (wrest - w0)))
+          : 0;
+#endif
       const GColor bg =
           weather_type_get_bg_color(layout->anim_params.outgoing_weather_type);
       if (diam >= 4 && !gcolor_equal(bg, GColorClear)) {   // skip sub-dot residue
         graphics_context_set_fill_color(context, bg);
         graphics_fill_circle(context, c, (uint16_t)(diam / 2));
       }
-    } else
-#endif
-    {
+    } else {
+#if PBL_ROUND
+      // Mirror of the UP case: the incoming disc grows OUT of the footer circle.
+      // prv_draw_circle_at_layer would size it from the frame at 1.11x, which
+      // starts at 27px and visibly pops against the 35px circle it leaves.
+      {
+        const GRect gf = layer_get_frame(layout->outgoing_weather_icon_layer);
+        const int gd = prv_round_scaler_disc(gf.size.w);
+        graphics_context_set_fill_color(context,
+            weather_type_get_bg_color(layout->anim_params.outgoing_weather_type));
+        graphics_fill_circle(context,
+                             GPoint(gf.origin.x + gf.size.w / 2, gf.origin.y + gf.size.h / 2),
+                             (uint16_t)(gd / 2));
+      }
+#else
       prv_draw_circle_at_layer(layout->outgoing_weather_icon_layer,
                                context, layout->anim_params.outgoing_weather_type);
+#endif
     }
 #if WEATHER_APP_LAYOUT_USE_PDC_WEATHER_ICONS
     if (layout->text_anim.active && !layout->outgoing_weather_icon) {
@@ -1072,18 +1320,20 @@ static void prv_draw_weather_icon_backgrounds(const WeatherAppLayout *layout,
     // content-layer coordinates so the circle is drawn correctly in this context.
     // This must be done here (after white text-animation fills) so it is not erased.
 #if PBL_ROUND
+    // ROUND: the footer icon's disc TRAVELS with it. The layer is reparented to
+    // root_layer for the flight, so its frame is in ROOT coords -- convert back
+    // to content coords for this context. Drawing the disc only in the static
+    // branch below is what made it pop in after the icon had already settled.
+    // Plain filled circle, no halo: the arc passes the dotted rule and a halo
+    // would bite a white gap out of it (the same reason the resting disc is bare).
     if (layout->anim_params.tomorrow_reparented || layout->anim_params.tomorrow_incoming) {
-      Layer *tmr = bitmap_layer_get_layer(layout->tomorrow_weather_icon_layer);
-      GRect f_root = layer_get_frame(tmr);
-      GSize sz = f_root.size;
-      int diam = (int)(sz.w * 14 / 10);
-      GRect bg_circle = {
-        GPoint(f_root.origin.x - layout->content_layer_origin.x + sz.w / 2 - diam / 2,
-               f_root.origin.y - layout->content_layer_origin.y + sz.h / 2 - diam / 2),
-        GSize(diam, diam)
-      };
-      prv_draw_weather_background(&bg_circle, context,
+      const GRect fr = layer_get_frame(bitmap_layer_get_layer(layout->tomorrow_weather_icon_layer));
+      graphics_context_set_fill_color(context,
           weather_type_get_bg_color(layout->anim_params.tomorrow_exit_weather_type));
+      graphics_fill_circle(context,
+          GPoint(fr.origin.x - layout->content_layer_origin.x + fr.size.w / 2,
+                 fr.origin.y - layout->content_layer_origin.y + fr.size.h / 2),
+          WEATHER_APP_LAYOUT_ROUND_FOOT_DISC / 2);
     }
 #endif
     // Rect: the 25px footer bitmap flies BARE — no disc AND no halo (the old
@@ -1099,11 +1349,21 @@ static void prv_draw_weather_icon_backgrounds(const WeatherAppLayout *layout,
 #endif
     }
     if (layout->next_forecast) {
-      // Rect: the footer bitmap sits BARE (newspaper footer slot — no disc);
-      // round keeps the classic disc.
 #if PBL_ROUND
-      prv_draw_circle_at_layer(bitmap_layer_get_layer(layout->tomorrow_weather_icon_layer),
-                               context, layout->next_forecast->current_weather_type);
+      // ROUND: the footer bitmap gets its own coloured disc. It canNOT use
+      // DISC_RATIO_NUM -- that 1.11x is calibrated for the today icon, whose
+      // 65px art sits in a 75px layer; the footer art fills its 25px box, so
+      // 1.11x would leave a 27px disc barely wider than the icon. Fixed 35px.
+      // NOT prv_draw_weather_background: that paints a WHITE halo 4px proud of
+      // the disc before filling it, and up here the halo reached back over the
+      // dotted rule and bit a white gap out of it. The footer disc is a plain
+      // filled circle -- nothing above it needs erasing.
+      GRect fi = layer_get_frame(bitmap_layer_get_layer(layout->tomorrow_weather_icon_layer));
+      graphics_context_set_fill_color(context,
+          weather_type_get_bg_color(layout->next_forecast->current_weather_type));
+      graphics_fill_circle(context,
+                           GPoint(fi.origin.x + fi.size.w / 2, fi.origin.y + fi.size.h / 2),
+                           WEATHER_APP_LAYOUT_ROUND_FOOT_DISC / 2);
 #endif
     }
   }
@@ -1138,9 +1398,9 @@ static void prv_render_layout(Layer *layer, GContext *context) {
     // Fill white first so it acts as a clip: any text drawn outside is invisible.
     graphics_context_set_fill_color(context, GColorWhite);
     graphics_fill_rect(context, GRect(0, 0, bounds.size.w, separator_y), 0, GCornerNone);
-    GPoint top_out = GPoint(content_x_offset, PBL_IF_RECT_ELSE(0, 1) + out_dy);
+    GPoint top_out = GPoint(content_x_offset, 0 + out_dy);
     prv_draw_snapshot_top(layout, &top_out, content_width, context);
-    GPoint top_in = GPoint(content_x_offset, PBL_IF_RECT_ELSE(0, 1) + in_dy);
+    GPoint top_in = GPoint(content_x_offset, 0 + in_dy);
     prv_draw_top_half_text(layout, &top_in, content_width, context);
 
     // ---- BOTTOM HALF (region separator_y → full_h) ----
@@ -1175,7 +1435,7 @@ static void prv_render_layout(Layer *layer, GContext *context) {
 
   } else {
     // Static (no text animation active)
-    GPoint current_offset = GPoint(content_x_offset, PBL_IF_RECT_ELSE(0, 1));
+    GPoint current_offset = GPoint(content_x_offset, 0);
     prv_draw_top_half_text(layout, &current_offset, content_width, context);
 
     if (layout->next_forecast) {
@@ -1190,13 +1450,6 @@ static void prv_render_layout(Layer *layer, GContext *context) {
   // draw) but BEFORE the discs — the white halo under each disc
   // (prv_draw_weather_background) then erases it locally, so crossing icons
   // always read as IN FRONT of the rule.
-#if PBL_ROUND
-  graphics_context_set_fill_color(context, GColorBlack);
-  graphics_fill_rect(context,
-                     GRect(content_x_offset + 1, separator_y - 1,
-                           bounds.size.w - (2 * content_x_offset) - 2, 2),
-                     0, GCornerNone);
-#else
   // Divider (reference photo): dark gray, bigger dots — EXACTLY 45 of them
   // (user counted the reference by hand), EVERY gap identical (fixed integer
   // pitch, whole group centered — 200px isn't divisible by 45 so a true
@@ -1206,7 +1459,10 @@ static void prv_render_layout(Layer *layer, GContext *context) {
   // "bigger/heavier" read — the taller 3px version was reverted per user),
   // pitch 4 keeps the reference's ~1:1 dot:gap rhythm.
   graphics_context_set_fill_color(context, PBL_IF_COLOR_ELSE(GColorDarkGray, GColorBlack));
-  const int divider_dot_y = separator_y - 1 - 3;
+  // Round sits the rule 3px higher than the region split (and the UV widget moved with it).
+  // The split itself is deliberately NOT moved: separator_y also anchors the bottom-half fill
+  // and the footer's content offset, so shifting it would carry the TOMORROW block up too.
+  const int divider_dot_y = separator_y - 1 - 3 - PBL_IF_ROUND_ELSE(3, 0);
   const int dot_w = 2;
   const int dot_h = 2;
   const int pitch = 4;   // dot + gap, IDENTICAL for every one of the 45 dots
@@ -1216,73 +1472,35 @@ static void prv_render_layout(Layer *layer, GContext *context) {
     graphics_fill_rect(context, GRect(start_x + i * pitch, divider_dot_y, dot_w, dot_h),
                        0, GCornerNone);
   }
-#endif
 
   prv_draw_weather_icon_backgrounds(layout, context);
 
-}
-
-// Draw the standard location + time content at x/y offsets (for sliding).
 #if PBL_ROUND
-static void prv_draw_location_bar_content(GContext *ctx, const WeatherAppLayout *layout,
-                                          GRect bounds, GFont font, int x_off, int y_off) {
-  const int safe = WEATHER_APP_LAYOUT_LOCATION_BAR_TEXT_INSET;
-  char time_str[8];
-  time_t now = time(NULL);
-  struct tm *t = localtime(&now);
-  if (clock_is_24h_style()) {
-    strftime(time_str, sizeof(time_str), "%H:%M", t);
-  } else {
-    strftime(time_str, sizeof(time_str), "%I:%M", t);
-    if (time_str[0] == '0') memmove(time_str, time_str + 1, sizeof(time_str) - 1);
-  }
-
-#if PBL_ROUND
-  char city_name[sizeof(layout->location_name)];
-  size_t city_len = 0;
-  while (layout->location_name[city_len]
-      && layout->location_name[city_len] != ','
-      && city_len < sizeof(city_name) - 1) {
-    city_name[city_len] = layout->location_name[city_len];
-    city_len++;
-  }
-  while (city_len > 0 && city_name[city_len - 1] == ' ') {
-    city_len--;
-  }
-  city_name[city_len] = '\0';
-
-  graphics_draw_text(ctx, time_str, font,
-                     GRect(safe + x_off, WEATHER_APP_LAYOUT_ROUND_TIME_TEXT_Y + y_off,
-                           bounds.size.w - (safe * 2), 19),
-                     GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
-  if (city_name[0]) {
-    graphics_draw_text(ctx, city_name, font,
-                       GRect(safe + x_off, WEATHER_APP_LAYOUT_ROUND_LOCATION_TEXT_Y + y_off,
-                             bounds.size.w - (safe * 2), 19),
-                       GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
+  // Drawn LAST so it sits over the footer row and the icon rail. The condition
+  // mirrors the fin's exactly (prv_fin_* draws only when !next_forecast), so
+  // stepping onto the final day swaps the chevron out for the fin.
+  if (layout->next_forecast) {
+    const int chin_x = -layout->content_layer_origin.x;   // content coords -> screen 0
+    graphics_context_set_fill_color(context, GColorLightGray);
+    graphics_fill_rect(context,
+                       GRect(chin_x, WEATHER_APP_LAYOUT_ROUND_CHIN_Y, PBL_DISPLAY_WIDTH,
+                             PBL_DISPLAY_HEIGHT - WEATHER_APP_LAYOUT_ROUND_CHIN_Y),
+                       0, GCornerNone);
+    // Solid chevron, built a scanline at a time so it stays a crisp odd-width
+    // triangle at any size (13,11,9,...,1) rather than an antialiased path.
+    graphics_context_set_fill_color(context, GColorBlack);
+    const int cx = PBL_DISPLAY_WIDTH / 2 + chin_x;
+    for (int i = 0; i < WEATHER_APP_LAYOUT_ROUND_CHEV_H; i++) {
+      const int half = WEATHER_APP_LAYOUT_ROUND_CHEV_W / 2 - i;
+      if (half < 0) break;
+      graphics_fill_rect(context,
+                         GRect(cx - half, WEATHER_APP_LAYOUT_ROUND_CHEV_Y + i,
+                               2 * half + 1, 1),
+                         0, GCornerNone);
+    }
   }
 #endif
 }
-
-#if PBL_ROUND
-static void prv_draw_location_bar_background(GContext *ctx, GRect bounds) {
-  graphics_context_set_fill_color(ctx, PBL_IF_COLOR_ELSE(GColorDarkGray, GColorBlack));
-  const int radius = WEATHER_APP_LAYOUT_ROUND_BAR_RADIUS;
-  const int center_y = WEATHER_APP_LAYOUT_ROUND_BAR_DEPTH - radius +
-                       WEATHER_APP_LAYOUT_ROUND_BAR_Y_ADJUST;
-  graphics_fill_circle(ctx, GPoint(bounds.size.w / 2, center_y), radius);
-}
-#endif
-
-static void prv_draw_location_bar(Layer *layer, GContext *ctx) {
-  const WeatherAppLayout *layout = *(WeatherAppLayout **)layer_get_data(layer);
-  GRect bounds = layer_get_bounds(layer);
-  prv_draw_location_bar_background(ctx, bounds);
-  graphics_context_set_text_color(ctx, GColorWhite);
-  GFont font = fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD);
-  prv_draw_location_bar_content(ctx, layout, bounds, font, 0, 0);
-}
-#endif  // PBL_ROUND (rect has no bar at all — white page to the top edge)
 
 // ---- Arc animation ----
 
@@ -1565,7 +1783,7 @@ static void prv_animate_fin_in(WeatherAppLayout *layout, uint32_t total_ms) {
            // Rect: rest in the footer zone — the PDC's ink (rows 12..32 of its
            // 50px box) vertically centred between the y195 divider and the
            // screen bottom; round keeps the classic centred rest.
-           cl.origin.y + cl.size.h - fin_size.h + PBL_IF_RECT_ELSE(11, -12)),
+           cl.origin.y + cl.size.h - fin_size.h + PBL_IF_RECT_ELSE(11, -16)),
     fin_size
   };
   GRect from = to;
@@ -1673,6 +1891,24 @@ static void prv_draw_outgoing_icon_scaled(Layer *layer, GContext *ctx) {
   GRect root_frame = layer_get_frame(layer);
   root_frame.origin.x += layout->content_layer_origin.x;
   root_frame.origin.y += layout->content_layer_origin.y;
+#if PBL_ROUND
+  // The RESTING today icon is the PDC drawn at ROUND_PDC_ART (65) inside a 75px
+  // layer, but this scaler fills the layer frame -- so on the DOWN entrance the
+  // bitmap grew all the way to 75 and then visibly snapped back to 65 the
+  // instant the static render took over. Inset the ART by the same ratio the
+  // PDC is scaled by, so it lands exactly where the PDC will draw it.
+  //
+  // The FRAME is deliberately left alone: the coloured disc is derived from it
+  // (prv_draw_circle_at_layer), so shrinking the frame would shrink the disc too
+  // and just move the snap from the icon onto the circle.
+  const int art_w = root_frame.size.w * WEATHER_APP_LAYOUT_ROUND_PDC_ART /
+                    WEATHER_APP_LAYOUT_ROUND_PDC_NATIVE;
+  const int art_h = root_frame.size.h * WEATHER_APP_LAYOUT_ROUND_PDC_ART /
+                    WEATHER_APP_LAYOUT_ROUND_PDC_NATIVE;
+  root_frame.origin.x += (root_frame.size.w - art_w) / 2;
+  root_frame.origin.y += (root_frame.size.h - art_h) / 2;
+  root_frame.size = GSize(art_w, art_h);
+#endif
   prv_draw_bitmap_scaled_to_root(ctx, layout->outgoing_weather_icon, root_frame);
 }
 
@@ -1685,7 +1921,7 @@ static GRect prv_fin_rest_frame(WeatherAppLayout *layout) {
            // Rect: rest in the footer zone — the PDC's ink (rows 12..32 of its
            // 50px box) vertically centred between the y195 divider and the
            // screen bottom; round keeps the classic centred rest.
-           cl.origin.y + cl.size.h - fin_size.h + PBL_IF_RECT_ELSE(11, -12)),
+           cl.origin.y + cl.size.h - fin_size.h + PBL_IF_RECT_ELSE(11, -16)),
     fin_size
   };
 }
@@ -1715,11 +1951,11 @@ void weather_app_layout_init(WeatherAppLayout *layout, const GRect *frame) {
   layout->location_font        = fonts_get_system_font(FONT_KEY_GOTHIC_28_BOLD);
   layout->temperature_font     = fonts_get_system_font(FONT_KEY_LECO_36_BOLD_NUMBERS);
   layout->high_low_phrase_font = fonts_get_system_font(
-      PBL_IF_RECT_ELSE(FONT_KEY_GOTHIC_24_BOLD, FONT_KEY_GOTHIC_18));
+      PBL_IF_RECT_ELSE(FONT_KEY_GOTHIC_24_BOLD, FONT_KEY_GOTHIC_18_BOLD));
   layout->metrics_font         = fonts_get_system_font(
-      PBL_IF_RECT_ELSE(FONT_KEY_GOTHIC_14_BOLD, FONT_KEY_GOTHIC_14));
+      FONT_KEY_GOTHIC_14_BOLD);
   layout->metrics_value_font   = fonts_get_system_font(
-      PBL_IF_RECT_ELSE(FONT_KEY_GOTHIC_18, FONT_KEY_GOTHIC_18_BOLD));
+      FONT_KEY_GOTHIC_18);
   layout->tomorrow_font        = fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD);
 #else
   layout->location_font        = fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD);
@@ -1754,19 +1990,10 @@ void weather_app_layout_init(WeatherAppLayout *layout, const GRect *frame) {
   // Location bar: full-width strip at the very top of the screen.
   // Taller than the forecast-list bar (MAIN_BAR_HEIGHT vs LOCATION_BAR_HEIGHT)
   // for better readability on the main screen.
-#if PBL_ROUND
-  const GRect location_bar_frame = GRect(
-      frame->origin.x,
-      frame->origin.y + WEATHER_APP_LAYOUT_BAR_LAYER_Y,
-      frame->size.w,
-      PBL_IF_ROUND_ELSE(WEATHER_APP_LAYOUT_ROUND_PULL_LAYER_HEIGHT,
-                        WEATHER_APP_LAYOUT_BAR_LAYER_HEIGHT));
-  layout->location_bar_layer = layer_create_with_data(location_bar_frame, sizeof(WeatherAppLayout *));
-  *(WeatherAppLayout **)layer_get_data(layout->location_bar_layer) = layout;
-  layer_set_update_proc(layout->location_bar_layer, prv_draw_location_bar);
-#else
-  layout->location_bar_layer = NULL;   // rect: no bar — content owns the whole screen
-#endif
+  layout->city_layer = NULL;
+  layout->location_bar_layer = NULL;   // no bar on either shape -- content owns
+                                       // the whole screen (round joined rect
+                                       // in the 2026-07-27 report-page port)
   // Added to root_layer last (after fin_layer) so it renders on top of everything.
 
   // Down-arrow removed — location bar provides sufficient bottom UI.
@@ -1799,16 +2026,6 @@ void weather_app_layout_init(WeatherAppLayout *layout, const GRect *frame) {
       frame->origin.x + content_layer_frame.origin.x,
       frame->origin.y + content_layer_frame.origin.y);
 
-#if PBL_ROUND
-  // Weather icon layers — right-aligned, nudged inward by an extra 8px
-  const int icon_layer_margin_top = 8;
-  const int icon_x_inset = WEATHER_APP_LAYOUT_CONTENT_LAYER_HORIZONTAL_INSET + 8;
-  const int icon_y_adjust = WEATHER_APP_LAYOUT_ICON_Y_ADJUST;
-  const int today_icon_x_adjust = WEATHER_APP_LAYOUT_TODAY_ICON_X_ADJUST;
-  const int today_icon_y_adjust = WEATHER_APP_LAYOUT_TODAY_ICON_Y_ADJUST;
-  const int tomorrow_icon_x_adjust = WEATHER_APP_LAYOUT_TOMORROW_ICON_X_ADJUST;
-  const int tomorrow_icon_y_adjust = WEATHER_APP_LAYOUT_TOMORROW_ICON_Y_ADJUST;
-#endif
   const int content_separator_y = content_layer_frame.size.h * 2 / 3 +
                                   WEATHER_APP_LAYOUT_SEPARATOR_Y_ADJUST;
 
@@ -1822,10 +2039,12 @@ void weather_app_layout_init(WeatherAppLayout *layout, const GRect *frame) {
         // (2026-07-07, user request) -> y 36.
         GPoint(content_layer_frame.size.w - s_today_icon_size.w -
                (WEATHER_APP_LAYOUT_CONTENT_LAYER_HORIZONTAL_INSET + 11), 36),
-        GPoint(content_layer_frame.size.w - s_today_icon_size.w - icon_x_inset -
-               today_icon_x_adjust,
-               content_layer_frame.origin.y + icon_layer_margin_top + icon_y_adjust +
-               today_icon_y_adjust)),
+        // Round: same 50px raster as emery, right-railed. Disc centre lands at
+        // screen (190,82); the r=39 halo's furthest point is 115.8px from the
+        // glass centre, so it is contained with 14px to spare.
+        GPoint(content_layer_frame.size.w - s_today_icon_size.w -
+                   WEATHER_APP_LAYOUT_ROUND_TODAY_ICON_X_INSET,
+               WEATHER_APP_LAYOUT_ROUND_TODAY_ICON_Y)),
     .size = s_today_icon_size,
   };
   layout->today_icon_rest_frame = today_icon_frame;
@@ -1853,9 +2072,12 @@ void weather_app_layout_init(WeatherAppLayout *layout, const GRect *frame) {
         GPoint(content_layer_frame.size.w - s_tomorrow_icon_size.w -
                WEATHER_APP_LAYOUT_CONTENT_LAYER_HORIZONTAL_INSET,
                content_separator_y + 3),
-        GPoint(content_layer_frame.size.w - s_tomorrow_icon_size.w - icon_x_inset -
-               tomorrow_icon_x_adjust,
-               content_separator_y + 16 + icon_y_adjust + tomorrow_icon_y_adjust)),
+        // Round: the bare 25px footer bitmap. Its BOTTOM-right corner is the
+        // tightest margin on the page (x213 vs mask max_x 215 at row 228) --
+        // check that corner first on any screendump.
+        GPoint(content_layer_frame.size.w - s_tomorrow_icon_size.w -
+                   WEATHER_APP_LAYOUT_ROUND_TOMORROW_ICON_X_INSET,
+               content_separator_y + 4)),   // disc centre (193,217), r17 -> rows 200..234
     .size = s_tomorrow_icon_size,
   };
   layout->tomorrow_icon_rest_frame = tomorrow_icon_frame;
@@ -1876,6 +2098,24 @@ void weather_app_layout_init(WeatherAppLayout *layout, const GRect *frame) {
       pdc_raw ? gdraw_command_sequence_clone(pdc_raw) : NULL;
   if (pdc_raw) {
     gdraw_command_sequence_destroy(pdc_raw);  // munmaps the read-only flash mapping
+  }
+  // Shrink the art inside its unchanged 75px layer. gdraw_command_list_scale
+  // scales toward the list's origin, so the draw origin is nudged by
+  // ROUND_PDC_INSET to keep it centred (see prv_draw_weather_pdc_frame).
+  if (layout->weather_icon_pdc_sequence &&
+      WEATHER_APP_LAYOUT_ROUND_PDC_ART != WEATHER_APP_LAYOUT_ROUND_PDC_NATIVE) {
+    const int nframes =
+        gdraw_command_sequence_get_num_frames(layout->weather_icon_pdc_sequence);
+    for (int i = 0; i < nframes; i++) {
+      GDrawCommandFrame *f =
+          gdraw_command_sequence_get_frame_by_index(layout->weather_icon_pdc_sequence, i);
+      if (!f) continue;
+      gdraw_command_list_scale(gdraw_command_frame_get_command_list(f),
+                               GSize(WEATHER_APP_LAYOUT_ROUND_PDC_NATIVE,
+                                     WEATHER_APP_LAYOUT_ROUND_PDC_NATIVE),
+                               GSize(WEATHER_APP_LAYOUT_ROUND_PDC_ART,
+                                     WEATHER_APP_LAYOUT_ROUND_PDC_ART));
+    }
   }
   layout->current_weather_escape_layer =
       layer_create_with_data(GRect(0, 0, 1, 1), sizeof(WeatherAppLayout *));
@@ -1898,11 +2138,6 @@ void weather_app_layout_init(WeatherAppLayout *layout, const GRect *frame) {
     layer_set_hidden(layout->fin_layer, true);
     layer_add_child(layout->root_layer, layout->fin_layer);
   }
-
-  // Location bar added last — always renders above animations and fin ribbon.
-#if PBL_ROUND
-  layer_add_child(layout->root_layer, layout->location_bar_layer);
-#endif
 }
 
 void weather_app_layout_set_data(WeatherAppLayout *layout,
@@ -1988,6 +2223,7 @@ void weather_app_layout_deinit(WeatherAppLayout *layout) {
 #endif
   if (layout->fin_pdc) gdraw_command_image_destroy(layout->fin_pdc);
   if (layout->fin_layer) layer_destroy(layout->fin_layer);
+  if (layout->city_layer) layer_destroy(layout->city_layer);
   bitmap_layer_destroy(layout->current_weather_icon_layer);
   layer_destroy(layout->outgoing_weather_icon_layer);
   bitmap_layer_destroy(layout->tomorrow_weather_icon_layer);
@@ -2001,7 +2237,7 @@ void weather_app_layout_set_location(WeatherAppLayout *layout, const char *name)
   strncpy(layout->location_name, name, sizeof(layout->location_name) - 1);
   layout->location_name[sizeof(layout->location_name) - 1] = '\0';
 #if PBL_ROUND
-  if (layout->location_bar_layer) layer_mark_dirty(layout->location_bar_layer);
+  if (layout->city_layer) layer_mark_dirty(layout->city_layer);
 #endif
 }
 
@@ -2120,8 +2356,7 @@ static bool prv_prepare_day_transition(WeatherAppLayout *layout,
     };
     layer_set_frame(tmr, tmr_root);
     layer_remove_from_parent(tmr);
-    PBL_IF_ROUND_ELSE(layer_insert_below_sibling(tmr, layout->location_bar_layer),
-                      layer_add_child(layout->root_layer, tmr));
+    layer_add_child(layout->root_layer, tmr);
     layer_set_hidden(tmr, false);
     layout->anim_params.tomorrow_reparented = true;
     layout->anim_params.tomorrow_incoming = false;
@@ -2129,8 +2364,7 @@ static bool prv_prepare_day_transition(WeatherAppLayout *layout,
     // Entrance: reparent but start frame will be set after circle_center is computed below.
     Layer *tmr = bitmap_layer_get_layer(layout->tomorrow_weather_icon_layer);
     layer_remove_from_parent(tmr);
-    PBL_IF_ROUND_ELSE(layer_insert_below_sibling(tmr, layout->location_bar_layer),
-                      layer_add_child(layout->root_layer, tmr));
+    layer_add_child(layout->root_layer, tmr);
     layer_set_hidden(tmr, false);
     layout->anim_params.tomorrow_reparented = false;
     layout->anim_params.tomorrow_incoming = true;

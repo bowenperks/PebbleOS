@@ -10,7 +10,7 @@
 // GLOBE_* resource ids come from the real resource_ids.auto.h (via
 // pebble_compat.h); the stored-app pinned header is not used in the system app.
 
-#include "city_presets.h"
+#include "weather_data_source.h"   // WX_DS_UNKNOWN_TEMP
 #include "weather_math.h"
 #include "weather.h"
 #include "applib/ui/app_window_stack.h"
@@ -297,7 +297,7 @@ static SavedLocationEntry *selected_saved_entry(GlobeView *view) {
 static int find_current_saved_entry_index(GlobeView *view) {
     if (!view) return -1;
     for (int i = 0; i < view->saved_entry_count; i++) {
-        if (view->saved_entries[i].kind == SavedLocationKindCurrent) {
+        if (view->saved_entries[i].is_current_location) {
             return i;
         }
     }
@@ -306,23 +306,11 @@ static int find_current_saved_entry_index(GlobeView *view) {
 
 static bool saved_entry_matches(const SavedLocationEntry *a,
                                 const SavedLocationEntry *b) {
-    if (!a || !b || a->kind != b->kind) return false;
-    switch (a->kind) {
-        case SavedLocationKindCurrent:
-            return true;
-        case SavedLocationKindPreset:
-            return a->preset_index == b->preset_index;
-        case SavedLocationKindCustom:
-            if (a->query[0] && b->query[0]) {
-                return strcmp(a->query, b->query) == 0;
-            }
-            if (a->label[0] && b->label[0]) {
-                return strcmp(a->label, b->label) == 0;
-            }
-            return a->latitude_e2 == b->latitude_e2 &&
-                   a->longitude_e2 == b->longitude_e2;
-    }
-    return false;
+    if (!a || !b) return false;
+    // A re-sync can renumber records, so fall back to the name when the index
+    // no longer lines up.
+    if (a->ds_index == b->ds_index) return true;
+    return a->label[0] && b->label[0] && strcmp(a->label, b->label) == 0;
 }
 
 static int find_saved_entry_index(GlobeView *view,
@@ -347,7 +335,7 @@ static void globe_view_reload_saved_locations(GlobeView *view);
 
 static bool selected_city_is_current_location(GlobeView *view) {
     SavedLocationEntry *entry = selected_saved_entry(view);
-    return entry && entry->kind == SavedLocationKindCurrent;
+    return entry && entry->is_current_location;
 }
 
 static int globe_max_selector_index(GlobeView *view) {
@@ -367,7 +355,13 @@ static int32_t selected_city_longitude_e2(GlobeView *view) {
 }
 
 static bool selected_city_is_valid(GlobeView *view, int city_index) {
-    return saved_entry_for_index(view, city_index) != NULL;
+    SavedLocationEntry *e = saved_entry_for_index(view, city_index);
+    if (!e) return false;
+    // A location the phone sent WITHOUT coordinates cannot be placed on the
+    // globe (the watch has no geocoder), so skip it while cycling rather than
+    // rotating to (0,0). The caller already retries and falls back to a bounce.
+    return e->has_coordinates ||
+           (e->is_current_location && view && view->has_current_location);
 }
 
 #if WEATHER_PLATFORM_TOUCH_COLOR
@@ -375,13 +369,13 @@ static bool saved_entry_has_globe_coordinates(GlobeView *view,
                                               SavedLocationEntry *entry) {
     if (!entry) return false;
     if (entry->has_coordinates) return true;
-    return entry->kind == SavedLocationKindCurrent &&
+    return entry->is_current_location &&
            view && view->has_current_location;
 }
 
 static int16_t saved_entry_latitude_e2(GlobeView *view,
                                        SavedLocationEntry *entry) {
-    if (entry && entry->kind == SavedLocationKindCurrent &&
+    if (entry && entry->is_current_location &&
         view && view->has_current_location) {
         return (int16_t)view->current_location_latitude_e2;
     }
@@ -390,7 +384,7 @@ static int16_t saved_entry_latitude_e2(GlobeView *view,
 
 static int16_t saved_entry_longitude_e2(GlobeView *view,
                                         SavedLocationEntry *entry) {
-    if (entry && entry->kind == SavedLocationKindCurrent &&
+    if (entry && entry->is_current_location &&
         view && view->has_current_location) {
         return (int16_t)view->current_location_longitude_e2;
     }
@@ -403,7 +397,7 @@ static bool saved_entry_globe_coords(GlobeView *view, SavedLocationEntry *entry,
                                      int32_t *latitude_e2_out,
                                      int32_t *longitude_e2_out) {
     if (!saved_entry_has_globe_coordinates(view, entry)) return false;
-    if (entry->kind == SavedLocationKindCurrent &&
+    if (entry->is_current_location &&
         view && view->has_current_location) {
         *latitude_e2_out = (int16_t)view->current_location_latitude_e2;
         *longitude_e2_out = (int16_t)view->current_location_longitude_e2;
@@ -1615,7 +1609,7 @@ static void draw_saved_location_pins(GBitmap *fb, GlobeView *view,
     for (int i = 0; i <= max_index && n < (int)(sizeof(pins) / sizeof(pins[0])); i++) {
         SavedLocationEntry *entry = saved_entry_for_index(view, i);
         if (!saved_entry_has_globe_coordinates(view, entry)) continue;
-        if (entry->kind == SavedLocationKindCurrent) continue;
+        if (entry->is_current_location) continue;
 
         GPoint pin;
         int depth = 255;
@@ -2049,10 +2043,7 @@ static void notify_city_selected(GlobeView *view, bool force) {
 
     SavedLocationEntry *entry = selected_saved_entry(view);
     if (entry && view->location_select_callback) {
-        view->location_select_callback(entry->kind,
-                                       entry->preset_index,
-                                       entry->query,
-                                       force,
+        view->location_select_callback(entry->ds_index, force,
                                        view->location_select_context);
     }
 }
@@ -2098,10 +2089,8 @@ static void format_selected_label(GlobeView *view, char *buffer, size_t buffer_s
     const char *label = "Saved Location";
     if (entry && entry->label[0]) {
         label = entry->label;
-    } else if (entry && entry->kind == SavedLocationKindCurrent) {
+    } else if (entry && entry->is_current_location) {
         label = "Current Location";
-    } else if (entry && entry->kind == SavedLocationKindCustom) {
-        label = "Dictated Location";
     }
 
 #if PBL_ROUND
@@ -3599,30 +3588,26 @@ static void globe_view_reload_saved_locations(GlobeView *view) {
         had_previous_entry = true;
     }
 
+    // The phone's synced records ARE the pin list.
     view->saved_entry_count = saved_locations_get_entries(
-        view->saved_entries,
-        SAVED_LOCATIONS_MAX_ENTRIES,
-        view->current_location_label,
-        (int16_t)view->current_location_latitude_e2,
-        (int16_t)view->current_location_longitude_e2,
-        view->has_current_location);
+        view->saved_entries, SAVED_LOCATIONS_MAX_ENTRIES);
 
     if (view->saved_entry_count <= 0) {
+        // Nothing synced yet: keep one entry so the globe still has a subject.
         view->saved_entry_count = 1;
         view->saved_entries[0] = (SavedLocationEntry) {
-            .kind = SavedLocationKindCurrent,
-            .preset_index = -1,
+            .ds_index = -1,
+            .is_current_location = true,
             .latitude_e2 = (int16_t)view->current_location_latitude_e2,
             .longitude_e2 = (int16_t)view->current_location_longitude_e2,
             .has_coordinates = view->has_current_location,
+            .temp = (int16_t)WX_DS_UNKNOWN_TEMP,
         };
         snprintf(view->saved_entries[0].label,
-                 sizeof(view->saved_entries[0].label),
-                 "%s",
+                 sizeof(view->saved_entries[0].label), "%s",
                  view->current_location_label[0]
                      ? view->current_location_label
                      : "Current Location");
-        view->saved_entries[0].query[0] = '\0';
     }
 
     int next_index = had_previous_entry
@@ -3912,7 +3897,7 @@ void globe_view_slide_out_right(GlobeView *view) {
 static bool prv_entry_coords_for_focus(GlobeView *view, SavedLocationEntry *e,
                                        int32_t *lat, int32_t *lon) {
   if (!e) return false;
-  if (e->kind == SavedLocationKindCurrent) {
+  if (e->is_current_location) {
     if (!view->has_current_location) return false;
     *lat = view->current_location_latitude_e2;
     *lon = view->current_location_longitude_e2;

@@ -126,6 +126,7 @@ typedef struct {
   char               fly_temp[16];          // (synced to the icon landing) so the card can then
   int                fly_uv;                // appear static — see forecast_list_set_glance
   int                fly_precip;
+  int                fly_wind;
   // DOWN/UP "header scroll" transition (emery / !PBL_ROUND only): today header slides UP off
   // the top while the 5-day section rises to take over the top, driven by the SAME 330ms
   // interpolate_moook_soft curve Pebble Timeline uses for its card slide (identical bounce).
@@ -154,15 +155,13 @@ typedef struct {
   int       fx_ball_x;                     // ball centre x (rolls W+14 -> W/2, y = R5_SCREEN_CY)
   AnimationProgress report_p;              // raw stage-3 progress (unfold_p = clip(p*6/5))
   int32_t   report_angle;                  // frozen unfold fan start-ray (picked at stage-3 arm)
-#if !PBL_ROUND
-  // ---- Return from clock (UP): the forecast jelly-drops in from above, mirroring the clock's
-  // downward squash-stretch exit. Same whole-screen capture + two-moook-edge scale. Rect only
-  // (full-width framebuffer rows); the round 5-day keeps the plain reveal. ----
+  // ---- Whole-screen jelly squash-stretch (clock exit/return, card, SELECT exit). Shared:
+  // weather_render_squash addresses rows absolutely and clamps to each row's chord, so it
+  // is correct on the round framebuffer too. ----
   AnimationProgress squash_in_p;     // 0 → MAX
   Animation        *squash_in_anim;
   int               squash_mode;     // 0 = inactive; else SQUASH_DROP_IN / _DOWN_EXIT / _RISE_IN
   uint8_t          *squash_scratch;  // full-screen snapshot, re-sampled while overwriting the fb
-#endif
 #endif
 #if WEATHER_PLATFORM_TOUCH_COLOR
   int16_t  touch_start_x, touch_start_y;   // Touchdown origin for swipe detection
@@ -566,7 +565,11 @@ static void prv_canvas_draw_gabbro(Layer *layer, GContext *ctx) {
 // Column tiers. Round fans them inward as they descend to inscribe the circle; emery
 // is a rectangle, so its three tiers share one uniform step (dots sit straight under
 // the icons) and pack tighter to fit the 200px width.
-#define R5_COL_STEP_ICON PBL_IF_ROUND_ELSE(50, 38)  // icon / day-name row
+// Round step is 42, not 50: scrolled, the row rises to where the circle narrows, and at
+// 50 the outer day-name ink (x=30) falls outside the glass (which starts at x=36 that far
+// up). 42 pulls the outer columns to x=46 — the widest 5-column spacing that reaches the
+// top intact. Emery's rectangle has no such limit, so it keeps 38.
+#define R5_COL_STEP_ICON PBL_IF_ROUND_ELSE(42, 38)  // icon / day-name row
 #define R5_COL_STEP_HIGH PBL_IF_ROUND_ELSE(45, 38)  // high temps
 #define R5_COL_STEP_LOW  PBL_IF_ROUND_ELSE(42, 38)  // low temps
 #define R5_HEADER_Y     14    // header pinned at top; everything below is centred
@@ -601,9 +604,59 @@ static void prv_canvas_draw_gabbro(Layer *layer, GContext *ctx) {
 // Extra lift past today's old slot, applied uniformly to the whole scrolled 5-day section
 // (day names, discs, graph, icon rest + its stretch travel all key off SECTION_TRAVEL, so they
 // stay in lockstep) to free more room at the bottom of the scrolled screen for the new stats.
-#define R5_SCROLL_EXTRA_LIFT 19   // scrolled day-name ink tops at y6 = the mainscreen
-                                  // clock's ink line (user-tuned); was 10
+// Emery lifts PAST today's old slot (+19) so the day names top out at y6. Round cannot:
+// at y6 the circle is only ~100px wide. Round lifts 14px SHORT instead, landing the day
+// names at y40 and the discs at cy76 — the highest the 4-column row fits uncut.
+// Round's scrolled column is SOLVED, not nudged: every element is placed against the
+// circle's actual chord at its own top AND bottom edge. Lift 11px short of today's slot
+// puts day names at y37 (outer, bowed: 47) and discs at cy73 (outer 83) — the outer ink
+// clears the glass by 2px at its tightest point.
+#define R5_SCROLL_EXTRA_LIFT PBL_IF_ROUND_ELSE(-8, 19)
 #define R5_SECTION_TRAVEL ((R5_DAYNAME_Y - R5_TODAY_Y) + R5_SCROLL_EXTRA_LIFT)  // 82
+
+// Round stops its section lift 14px short (above), so the graph lands lower than on
+// emery and the stats band must follow it down or the two collide. Constant, not
+// scaled: the band only exists on the scrolled screen (at rest it is off the bottom).
+#define R5_BAND_DY PBL_IF_ROUND_ELSE(26, 0)
+// Emery packs the values 1px under the pill because it has no spare height. Round does —
+// open it to 8px so the percentages read as their own row, not a caption on the pill.
+#define R5_BAND_ROW_GAP PBL_IF_ROUND_ELSE(4, 0)
+// Scrolled, round's graph must sit LOWER (the bowed outer discs drop into where the high
+// labels were — this is what made the temps overlap the icons) and SHORTER (the circle
+// closes in below). Both scale with the lift, so the mainscreen graph is untouched.
+#define R5_GRAPH_SCROLL_TOP_DY PBL_IF_ROUND_ELSE(-7, 0)
+#define R5_GRAPH_SCROLL_BOT_DY PBL_IF_ROUND_ELSE(1, 0)
+// How the graph's height splits: each series gets 1/DIV, the air between them gets the
+// rest. Emery's /3 leaves only a third between the lines; on round's shorter scrolled
+// band that read as one bunched blob, so round gives each series a QUARTER and the gap
+// a HALF — the two rows separate without needing height the circle doesn't have.
+#define R5_GRAPH_BAND_DIV PBL_IF_ROUND_ELSE(4, 3)
+// Round drops the MON/TUE/... labels as the page scrolls: the mainscreen has just named
+// the columns, and on the scrolled screen that 16px band is the most expensive real
+// estate there is. Stop drawing them once the lift is underway — the rising discs are
+// arriving in that band anyway, so the labels are gone before they could be orphaned.
+// (Explicit, not relying on the discs to paint over them: a weather type whose disc is
+// GColorClear draws no fill, and the labels would show through.)
+#define R5_DAYNAME_SCROLL_HIDE PBL_IF_ROUND_ELSE(1, 0)
+// The room the vanished labels free, handed to the discs: they rise this much FURTHER
+// than the section as it scrolls (0 at rest, so the mainscreen is untouched).
+#define R5_DISC_SCROLL_UP PBL_IF_ROUND_ELSE(18, 0)
+
+#if PBL_ROUND
+// A SLIGHT bow so the row echoes the glass above it. The circle's true sagitta at the
+// 42px column step is 0 / 7 / 31px — using it whole fans the row out hard, so it is
+// damped to ~45%: a curve you feel rather than read. Precomputed (no sqrt per frame);
+// index is the column's distance from centre, so n<=R5_MAX_COLS keeps it in range.
+static const uint8_t s_round_col_bow[3] = { 0, 2, 10 };
+// Scaled by the section lift: flat at rest (the row sits at the circle's widest), fully
+// bowed once scrolled to the top where the glass actually curves away.
+#define R5_BOW_DY(i, n, ss) \
+  ((int)s_round_col_bow[(i) < (n) / 2 ? (n) / 2 - (i) : (i) - (n) / 2] \
+   * (ss) / R5_SECTION_TRAVEL)
+#else
+// Rect is a rectangle — no bow. (Round's draw path still compiles here, so this must exist.)
+#define R5_BOW_DY(i, n, ss) 0
+#endif
 
 // ---- DOWN/UP header transition: the SAME 330ms moook-soft curve Pebble Timeline uses for
 // its card slide, applied to one integer "header scroll offset" that the draw proc subtracts
@@ -650,14 +703,37 @@ static Animation *prv_start_anim(uint32_t dur_ms, AnimationCurve curve,
   return a;
 }
 
-#if WEATHER_ANIM_5DAY && !PBL_ROUND
-// ---- Return-from-clock: whole-screen Timeline squash-stretch IN -------------------------
-// Squash directions (s_list->squash_mode; 0 = inactive).
+// Shared: round's report stage 3 reuses the same fly slot for the paper clone.
+static void prv_clear_fly(void) {
+  if (!s_list) return;
+  s_list->flying_icon = false;
+  if (s_list->fly_pdc) {
+    gdraw_command_image_destroy(s_list->fly_pdc);
+    s_list->fly_pdc = NULL;
+  }
+  if (s_list->fly_lookup) {
+    applib_free(s_list->fly_lookup);
+    s_list->fly_lookup = NULL;
+  }
+}
+
+// Squash directions (s_list->squash_mode; 0 = inactive). Shared: the renderer is
+// chord-clamped, so round drives the same modes.
 #define SQUASH_DROP_IN   1   // fall in from above   (returning from the clock)
 #define SQUASH_DOWN_EXIT 2   // swoosh down off-bottom (heading up to the expanded card)
 #define SQUASH_RISE_IN   3   // rise up from below   (returning from above)
-#define SQUASH_UP_EXIT   5   // clock-burst stage-1: jelly-stretch up off the top (= WEATHER_SQUASH_UP_EXIT)
-#define SQUASH_LEFT_EXIT 6   // select-exit stage-1: jelly-stretch off the LEFT (= WEATHER_SQUASH_LEFT_EXIT)
+#define SQUASH_UP_EXIT   5   // clock-burst stage-1: jelly-stretch up off the top
+#define SQUASH_LEFT_EXIT 6   // select-exit stage-1: jelly-stretch off the LEFT
+
+static void prv_render_squash_in(GContext *ctx) {
+  if (!s_list || !s_list->squash_scratch) return;
+  weather_render_squash(ctx, s_list->squash_scratch, s_list->squash_in_p,
+                        s_list->squash_mode);
+}
+
+#if WEATHER_ANIM_5DAY
+// ---- Return-from-clock: whole-screen Timeline squash-stretch IN -------------------------
+// Squash directions (s_list->squash_mode; 0 = inactive).
 
 // Entry squash armed by weather.c (0 = none) just before the covering window dismisses; consumed
 // by prv_window_appear so the very first revealed frame is already off-screen (no rest flash).
@@ -671,25 +747,8 @@ static bool s_pending_return_fly;
 // shared with clock_face's forward exit. Modes: SQUASH_DROP_IN falls down from above into
 // rest (returning from the clock); SQUASH_DOWN_EXIT swooshes down off the bottom, hasted
 // into its first ~75% for the sunset-card text staging; SQUASH_RISE_IN is its reverse.
-static void prv_render_squash_in(GContext *ctx) {
-  if (!s_list || !s_list->squash_scratch) return;
-  weather_render_squash(ctx, s_list->squash_scratch, s_list->squash_in_p,
-                        s_list->squash_mode);
-}
 
 // Tear down the hero icon-fly state (idempotent).
-static void prv_clear_fly(void) {
-  if (!s_list) return;
-  s_list->flying_icon = false;
-  if (s_list->fly_pdc) {
-    gdraw_command_image_destroy(s_list->fly_pdc);
-    s_list->fly_pdc = NULL;
-  }
-  if (s_list->fly_lookup) {
-    applib_free(s_list->fly_lookup);
-    s_list->fly_lookup = NULL;
-  }
-}
 
 static void prv_squash_in_update(Animation *anim, AnimationProgress progress) {
   if (!s_list) return;
@@ -744,6 +803,9 @@ static void prv_start_squash(int mode) {
 // scale-segment "zooms" (Timeline pin->card icon animation) from its header rect to the card's
 // 80x80 icon rect. On completion the card is revealed with its static icon exactly where the flown
 // icon landed. Falls back to a plain squash if the hero icon can't be set up.
+#endif  // WEATHER_ANIM_5DAY && !PBL_ROUND
+
+// Shared: the hero icon-fly + DOWN_EXIT squash now work on round too.
 static void prv_start_up_to_card(void) {
   if (!s_list || !s_list->canvas || s_list->flying_icon || s_list->squash_mode) return;
   if (!s_list->header_shown || s_list->num_days == 0) { prv_start_squash(SQUASH_DOWN_EXIT); return; }
@@ -762,7 +824,6 @@ static void prv_start_up_to_card(void) {
   prv_start_squash(SQUASH_DOWN_EXIT);
   if (!s_list->squash_mode) prv_clear_fly();   // squash couldn't start (OOM); cb already fired
 }
-#endif  // WEATHER_ANIM_5DAY && !PBL_ROUND
 
 // Free the cached jelly lookups (on transition start — the travel direction can flip — on
 // transition stop, and at unload). The rect-only jelly draw is the only writer; on round these
@@ -840,9 +901,22 @@ static void prv_start_header_transition(bool to_scrolled) {
 // the scrolled section rides header_scroll PAST its rest (84) so header/fan/graph/stats all exit up
 // in lockstep, while the bottom dot decouples and flies to screen centre. STAGE 2 (ported from the
 // original burst): the centred dot does the orbital shake, then hands off to the clock. ----
-#define R5_CLOCK_EXIT  (R5_HEADER_TRAVEL + 200)   // header_scroll value that clears all content off-top
-#define R5_SCREEN_CY   114                        // 228/2 — the dot's centred destination
-#define R5_DOT_REST_Y  198                        // dot's resting y on the scrolled screen
+// header_scroll value that clears ALL content off the top. The lift must be shape-specific:
+// round's scrolled content sits ~35px lower than emery's (dot rest 233 vs 198), so emery's
+// fixed 200 left the low-temp graph line, its labels and the precip %-row stranded at rows
+// 3..37 (measured) for the whole of stage 2 — the "graph pops in at the top" bug. It was
+// invisible until the stranded-squash_mode fix, because a permanently-squashed frame had been
+// masking it. Round uses a FULL SCREEN HEIGHT of lift, which is the robust statement of intent:
+// anything drawn inside the visible frame at scrolled rest is guaranteed off-top, whatever the
+// temperature spread does to the graph's height. Emery's 200 is untouched.
+#define R5_CLOCK_EXIT  (R5_HEADER_TRAVEL + PBL_IF_ROUND_ELSE(PBL_DISPLAY_HEIGHT, 200))
+// Screen centre-y — the destination for the burst dot AND the whole report entry scene
+// (ball + unfolding paper). Was hardcoded to rect's 228/2, which put round's animation
+// 16px high and off the SELECT nub it is supposed to grow out of.
+#define R5_SCREEN_CY   PBL_IF_ROUND_ELSE(130, 114)
+// Dot's resting y on the scrolled screen. Round: the precip values end at y216 and the
+// glass ends at 260, so 238 centres it in that gap (the circle is still 145px wide there).
+#define R5_DOT_REST_Y  PBL_IF_ROUND_ELSE(233, 198)
 
 static void prv_start_clock_stage2(void);
 
@@ -853,15 +927,14 @@ static void prv_clock_stage1_update(Animation *anim, AnimationProgress progress)
   // rises the whole second half alone: the focal point the transition is about.
   AnimationProgress pm = (progress > ANIMATION_NORMALIZED_MAX / 2)
                              ? ANIMATION_NORMALIZED_MAX : progress * 2;
-#if !PBL_ROUND
   if (s_list->squash_mode == SQUASH_UP_EXIT) {
-    // Squash path: the scene keeps drawing at the scrolled rest (header_scroll pinned at
-    // R5_HEADER_TRAVEL by prv_start_clock_stage1) and the whole frame — precip pill
-    // included — jelly-stretches up off the top in prv_render_squash_in.
+    // Squash path (BOTH shapes): the scene keeps drawing at the scrolled rest
+    // (header_scroll pinned at R5_HEADER_TRAVEL by prv_start_clock_stage1) and the whole
+    // frame — precip pill included — jelly-stretches up off the top in
+    // prv_render_squash_in. Round used to be forced down the fallback below, which
+    // TRANSLATES the content instead of stretching it, so nothing ever squashed.
     s_list->squash_in_p = pm;
-  } else
-#endif
-  {
+  } else {
     // Fallback (round / squash scratch OOM): plain translated exit. CLAMPED at rest:
     // moook_soft3's anticipation frames dip header_scroll below R5_HEADER_TRAVEL,
     // which shoved the pill/%/graph DOWN into the burst dot for a beat — the content
@@ -880,20 +953,21 @@ static void prv_clock_stage1_update(Animation *anim, AnimationProgress progress)
   layer_mark_dirty(s_list->canvas);
 }
 
-#if !PBL_ROUND
+// BOTH shapes — must match the SQUASH_UP_EXIT arm in prv_clock_stage1_update above. This was
+// rect-only while round still took the translate fallback; leaving it gated once round started
+// driving UP_EXIT stranded squash_mode at 5 forever, which (a) leaked the full-screen scratch on
+// every clock visit and (b) made prv_start_squash refuse the return DROP_IN, so the forecast came
+// back permanently squashed off the top — a blank white screen.
 static void prv_clock_stage1_end_squash(void) {
   if (s_list->squash_mode != SQUASH_UP_EXIT) return;
   s_list->squash_mode = 0;
   if (s_list->squash_scratch) { free(s_list->squash_scratch); s_list->squash_scratch = NULL; }
 }
-#endif
 
 static void prv_clock_stage1_stopped(Animation *anim, bool finished, void *context) {
   if (!s_list) return;
   s_list->clock_anim = NULL;
-#if !PBL_ROUND
   prv_clock_stage1_end_squash();
-#endif
   if (!finished) {                                 // BACK cancelled — snap back to the scrolled screen
     s_list->clock_fx = 0;
     s_list->header_scroll = R5_HEADER_TRAVEL;
@@ -957,10 +1031,9 @@ static void prv_start_clock_stage1(void) {
     animation_unschedule(old);
     animation_destroy(old);
   }
-#if !PBL_ROUND
   // Whole-frame squash-stretch exit (Timeline jelly): the scene stays drawn at the scrolled
   // rest and SQUASH_UP_EXIT sweeps it — precip pill and all — up off the top. On scratch
-  // OOM the update falls back to the plain translated exit.
+  // OOM the update falls back to the plain translated exit. Both shapes.
   if (!s_list->squash_mode && s_list->canvas) {
     GRect bounds = layer_get_bounds(s_list->canvas);
     s_list->squash_scratch = malloc_try((size_t)bounds.size.w * (size_t)bounds.size.h);
@@ -969,12 +1042,19 @@ static void prv_start_clock_stage1(void) {
       s_list->squash_in_p = 0;
     }
   }
-#endif
   // 330ms — Timeline feel. LINEAR like every other squash driver: the jelly edges (and the
   // fallback's moook) carry ALL the shaping, so the curve must not pre-ease the progress.
-  s_list->clock_anim = prv_start_anim(interpolate_moook_soft_duration(3),
-                                      AnimationCurveLinear, &s_clock_stage1_impl,
-                                      prv_clock_stage1_stopped);
+  // The DOUBLE-TIME page exit (pm = 2*progress — everything off by the 50% mark) spends its
+  // whole visible run in the first ~165ms of a 330ms stage 1. At the framework's 33ms target
+  // that is only ~6 frames, and round has to cover 260px of travel in them (emery 228), so the
+  // steps land coarser: measured pm went 25% -> 53% in ONE frame and the graph read as blinking
+  // out rather than flying. Round is NOT slow — it renders ~27.5ms/frame, inside the target;
+  // the budget is simply too few frames for the taller screen. Lengthening stage 1 on round
+  // (330 -> 561ms) buys the visible half ~11 frames, measured. The STAGING RATIO is untouched
+  // on both shapes — content is still clear of the dot's climb path by the halfway mark.
+  s_list->clock_anim = prv_start_anim(
+      interpolate_moook_soft_duration(PBL_IF_ROUND_ELSE(10, 3)),
+      AnimationCurveLinear, &s_clock_stage1_impl, prv_clock_stage1_stopped);
 }
 
 // ===================================================================================
@@ -992,7 +1072,7 @@ static Animation *s_select_exit_anim;
 static void (*s_select_exit_done)(void *ctx);
 static void *s_select_exit_ctx;
 
-#if WEATHER_ANIM_5DAY && !PBL_ROUND
+#if WEATHER_ANIM_5DAY
 static Animation *s_report_anim;               // stages 2-4 (stage 2 overlaps stage 1's tail)
 #define R5_REPORT_BALL_R      13                                  // = the SELECT nub's radius
 // The SELECT nub is fill_oval(GRect(W-5, (H-26)/2, 26, 26)) — a r13 circle centred at
@@ -1125,12 +1205,15 @@ static void prv_report_stage4_stopped(Animation *anim, bool finished, void *cont
   (void)anim; (void)context;
   s_report_anim = NULL;
   if (!s_list) return;
+  // BOTH shapes: round drives the same squash now, so it must also be torn down here —
+  // leaving squash_mode set makes the entry guard reject every later SELECT (and leaks
+  // the full-screen scratch, 67.6 KB on round, every time).
   if (s_list->squash_mode == SQUASH_LEFT_EXIT) {
     s_list->squash_mode = 0;
     if (s_list->squash_scratch) { free(s_list->squash_scratch); s_list->squash_scratch = NULL; }
   }
-  s_list->report_fx = 0;
   prv_clear_fly();
+  s_list->report_fx = 0;
   void (*done)(void *) = s_select_exit_done;
   void *dctx = s_select_exit_ctx;
   s_select_exit_done = NULL;
@@ -1271,7 +1354,7 @@ static void prv_draw_exiting_paper(GContext *ctx) {
   gdraw_command_image_draw(ctx, clone, origin);
   gdraw_command_image_destroy(clone);
 }
-#endif  // WEATHER_ANIM_5DAY && !PBL_ROUND
+#endif  // WEATHER_ANIM_5DAY
 
 // ===================================================================================
 // Timeline up/down icon transition: a real TRAVEL scale-segment (NOT an in-place squash).
@@ -1283,7 +1366,7 @@ static void prv_draw_exiting_paper(GContext *ctx) {
 // points at the midframe, then snaps to the destination. No manual intermediate, no deflate/bounce
 // (Timeline calls neither, so its prv_apply_transform takes the single-stage path).
 // ===================================================================================
-#if !PBL_ROUND
+// Shared: round plays the same card transition (hero icon-fly + jelly squash).
 
 // Timeline's POINT_DURATION = 5/6 (timeline_layout_create_up_down_animation). EFFECT_DURATION (2/3)
 // is only needed for the two-edge disc capsule envelope below (the icon move is single-stage).
@@ -1301,7 +1384,7 @@ static void prv_draw_exiting_paper(GContext *ctx) {
 // delay_by_distance lookup pulls from middle-x + the leading edge (top when going up-screen, bottom
 // when going down), so as fx_progress advances the leading points reach `to` first while the
 // trailing points still lag near `from` — that gap IS the across-the-travel stretch.
-static bool prv_draw_jelly_icon(GContext *ctx, GDrawCommandImage *src, GPoint end_origin,
+__attribute__((unused)) static bool prv_draw_jelly_icon(GContext *ctx, GDrawCommandImage *src, GPoint end_origin,
                                 GSize isz, int travel, GPointIndexLookup **lookup_cache) {
   if (!src) return false;
   GDrawCommandImage *clone = gdraw_command_image_clone(src);
@@ -1419,12 +1502,18 @@ static void prv_draw_flying_content(GContext *ctx) {
   local = (int32_t)((int64_t)local * 5 / 3);
   if (local > MAXN) local = MAXN;
   const int tdx = (int)prv_moook_soft3(local, -W, 0);
-  char updated[24] = "";   // status bar starts on "Last updated ..." (matches the card's first 3s)
-  if (s_list->num_days > 0) {
+  // This preview must match what the card will REST on, or the status line visibly changes
+  // in the first frames after the hand-off.
+  char updated[24] = "";
+#if PBL_ROUND
+  clock_copy_time_string(updated, sizeof(updated));   // round's card shows the time only
+#else
+  if (s_list->num_days > 0) {   // rect starts on "Last updated ..." for its first 2s
     expanded_view_format_updated(&s_list->days[0], updated, sizeof(updated));
   }
+#endif
   expanded_view_draw_glance_content(ctx, W, tdx, updated, s_list->fly_sunset, s_list->fly_temp,
-                                    s_list->fly_uv, s_list->fly_precip);
+                                    s_list->fly_uv, s_list->fly_precip, s_list->fly_wind);
 }
 
 // The disc behind each 5-day icon must stretch across the SAME travel as its icon: a capsule whose
@@ -1435,7 +1524,7 @@ static void prv_draw_flying_content(GContext *ctx) {
 // (R5_ICON_CY - R5_SECTION_TRAVEL). At rest / at the destination the two edges coincide => circle.
 //
 // Returns the capsule rect for column centre-x `cx`; *is_capsule_out is true while stretched.
-static GRect prv_fx_disc_capsule(int cx, bool *is_capsule_out) {
+__attribute__((unused)) static GRect prv_fx_disc_capsule(int cx, bool *is_capsule_out) {
   if (is_capsule_out) *is_capsule_out = false;
   const bool going_up = (s_list->header_to == R5_HEADER_TRAVEL);  // DOWN press -> section travels up
   const int cy_a = R5_ICON_CY;                      // header-shown row centre
@@ -1464,6 +1553,8 @@ static GRect prv_fx_disc_capsule(int cx, bool *is_capsule_out) {
   if (is_capsule_out) *is_capsule_out = (bottom - top > 2 * R5_DISC_R);
   return GRect(cx - R5_DISC_R, top, 2 * R5_DISC_R, bottom - top);
 }
+
+// (the bottom-gap stats below are shared too)
 
 // ---- Bottom-gap stats (revealed by scrolling DOWN): a Pebble-Health-style "PRECIPITATION"
 // banner pill (the Health "TYPICAL" pill — rounded-rect, bold centred label — made thinner),
@@ -1518,8 +1609,8 @@ static void prv_draw_bottom_stats(GContext *ctx, const WeatherLocationForecast *
   // scrolled column's air splits evenly — solved for disc->graph = graph->pill =
   // %-row->dot (~10-11px each; the graph auto-centres in its band, so the split
   // holds for any temp spread).
-  prv_draw_stat_pill(ctx, "PRECIPITATION", 145 + slide, W, GColorPictonBlue);
-  prv_draw_stat_row (ctx, fan, n, col_x,   164 + slide);
+  prv_draw_stat_pill(ctx, "PRECIPITATION", 145 + slide + R5_BAND_DY, W, GColorPictonBlue);
+  prv_draw_stat_row (ctx, fan, n, col_x,   164 + slide + R5_BAND_DY + R5_BAND_ROW_GAP);
   if (!s_list->clock_fx) {
     // Timeline's day-separator peek dot (the one that unwinds into "Tomorrow"/"Tuesday"): a 12px
     // black circle, horizontally centred, the same 30px above the bottom edge as Timeline. On emery
@@ -1529,8 +1620,6 @@ static void prv_draw_bottom_stats(GContext *ctx, const WeatherLocationForecast *
     graphics_fill_circle(ctx, GPoint(W / 2, R5_DOT_REST_Y + slide), 6);
   }
 }
-
-#endif  // !PBL_ROUND
 
 // ---- Animated sun: 10 rays orbit the sun clockwise, each ray's length recomputed
 // from its CURRENT angle to the sun's natural profile (short at top, long at bottom)
@@ -2008,17 +2097,11 @@ static void prv_canvas_draw_round_5day(Layer *layer, GContext *ctx) {
   graphics_context_set_fill_color(ctx, GColorWhite);
   graphics_fill_rect(ctx, bounds, 0, GCornerNone);
 
-  // DOWN/UP header transition offsets (emery / !PBL_ROUND only). hs = px the today header is
-  // translated UP this frame; ss = the synced 5-day-section lift (a scaled copy of the same
-  // moook curve, so header (84) and section (72) bounce frame-for-frame in lockstep). On
-  // round the offsets stay 0 (the transition is rectangular-only).
-#if PBL_ROUND
-  const int hs = 0, ss = 0;
-  (void)hs; (void)ss;
-#else
+  // DOWN/UP header transition offsets (BOTH boards). hs = px the today header is translated
+  // UP this frame; ss = the synced 5-day-section lift (a scaled copy of the same moook curve,
+  // so header and section bounce frame-for-frame in lockstep).
   const int hs = s_list->header_scroll;
   const int ss = hs * R5_SECTION_TRAVEL / R5_HEADER_TRAVEL;
-#endif
 
   int total = (int)s_list->num_days;
   if (total <= 0) return;
@@ -2208,7 +2291,7 @@ static void prv_canvas_draw_round_5day(Layer *layer, GContext *ctx) {
 #if PBL_ROUND
   graphics_context_set_text_color(ctx, GColorBlack);
   graphics_draw_text(ctx, tnow, fonts_get_system_font(FONT_KEY_LECO_36_BOLD_NUMBERS),
-      GRect(112, 22, 120, 44),
+      GRect(112, 22 - hs, 120, 44),   // -hs: ride the header scroll off the top
       GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
 #else
   // Emery: FLAT BLACK LECO on the white page — the Timeline sloth-screen grammar: black
@@ -2256,12 +2339,17 @@ static void prv_canvas_draw_round_5day(Layer *layer, GContext *ctx) {
 
     const char *weekday = s_list->weekday_cache[i];   // built in the date-cache block above
     graphics_context_set_text_color(ctx, GColorBlack);
-    graphics_draw_text(ctx, weekday, day_font,
-        GRect(cx - box_w / 2, R5_DAYNAME_Y - ss, box_w, 22),
-        GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
+    const int bow = R5_BOW_DY(i, n, ss);   // slight follow-the-glass curve (round only)
+    if (!R5_DAYNAME_SCROLL_HIDE || ss * 4 < R5_SECTION_TRAVEL) {
+      graphics_draw_text(ctx, weekday, day_font,
+          GRect(cx - box_w / 2, R5_DAYNAME_Y - ss + bow, box_w, 22),
+          GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
+    }
 
     GColor bg = prv_weather_bg_color(f->current_weather_type);
-    const int dcy = R5_ICON_CY - ss;            // disc centre-y after the slide (rest / round)
+    // Discs claim the vanished label band on top of the section lift.
+    const int dsc = R5_DISC_SCROLL_UP * ss / R5_SECTION_TRAVEL;
+    const int dcy = R5_ICON_CY - ss + bow - dsc;  // disc centre-y after the slide
 #if !PBL_ROUND
     // Disc capsule: leading edge races to the destination, trailing edge lags — both edges from
     // the SAME two-segment timing the icon move uses, so the disc stretches across the whole
@@ -2293,7 +2381,7 @@ static void prv_canvas_draw_round_5day(Layer *layer, GContext *ctx) {
 #endif
     if (s_list->pdc_icons[i + 1]) {
       GSize isz = gdraw_command_image_get_bounds_size(s_list->pdc_icons[i + 1]);
-      const GRect ibox = { GPoint(cx - isz.w / 2, R5_ICON_CY - ss - isz.h / 2), isz };
+      const GRect ibox = { GPoint(cx - isz.w / 2, R5_ICON_CY - ss + bow - dsc - isz.h / 2), isz };
 #if !PBL_ROUND
       // The icon's END position: scrolled row on the DOWN press, header-shown row on the UP press.
       const int iend_cy = (s_list->header_to == R5_HEADER_TRAVEL) ? (R5_ICON_CY - R5_SECTION_TRAVEL)
@@ -2422,13 +2510,17 @@ static void prv_canvas_draw_round_5day(Layer *layer, GContext *ctx) {
   if (!haveh && !havel) return;  // every hi/lo unknown: nothing to plot
   int hrange = hmax - hmin; if (hrange < 2) hrange = 2;
   int lrange = lmax - lmin; if (lrange < 2) lrange = 2;
-  const int band   = (R5_GRAPH_BOT - R5_GRAPH_TOP) / 3;  // each line's vertical band
-  const int hi_bot = R5_GRAPH_TOP + band;                // high band = [TOP, hi_bot]
+  // Scrolled-only shift/squeeze (see R5_GRAPH_SCROLL_*_DY): 0 at rest, full when scrolled.
+  const int gtop = R5_GRAPH_TOP + R5_GRAPH_SCROLL_TOP_DY * ss / R5_SECTION_TRAVEL;
+  const int gbot = R5_GRAPH_BOT + R5_GRAPH_SCROLL_BOT_DY * ss / R5_SECTION_TRAVEL;
+  const int band   = (gbot - gtop) / R5_GRAPH_BAND_DIV;  // each line's vertical band
+  const int hi_bot = gtop + band;                        // high band = [TOP, hi_bot]
 
   int y_hi[R5_MAX_COLS], y_lo[R5_MAX_COLS];
   for (int i = 0; i < n; i++) {
-    y_hi[i] = okh[i] ? hi_bot - (fan[i].today_high - hmin) * band / hrange : 0;
-    y_lo[i] = okl[i] ? R5_GRAPH_BOT - (fan[i].today_low - lmin) * band / lrange : 0;
+    // -ss: ride the section lift so the graph rises in lockstep with the discs above.
+    y_hi[i] = okh[i] ? hi_bot - (fan[i].today_high - hmin) * band / hrange - ss : 0;
+    y_lo[i] = okl[i] ? gbot - (fan[i].today_low - lmin) * band / lrange - ss : 0;
   }
 
   graphics_context_set_antialiased(ctx, true);
@@ -2468,6 +2560,8 @@ static void prv_canvas_draw_round_5day(Layer *layer, GContext *ctx) {
           GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
     }
   }
+  // Bottom-gap banner stats, slid up into the gap the lifting section opens.
+  prv_draw_bottom_stats(ctx, fan, n, col_icon, W);
 }
 #endif
 
@@ -2478,7 +2572,6 @@ static void prv_canvas_draw(Layer *layer, GContext *ctx) {
   return;
 #endif
 #if WEATHER_ANIM_5DAY
-#if !PBL_ROUND
   if (s_list->report_fx == 4) {
     // Stage 4 — the paper's bow: white card, the paper squash-stretching off the left
     // (its own points deform — Timeline smiley exit), the caption sliding out with it.
@@ -2490,15 +2583,13 @@ static void prv_canvas_draw(Layer *layer, GContext *ctx) {
     prv_draw_report_caption(ctx, dx, true);
     return;
   }
-  if (s_list->report_fx >= 2 && !s_list->squash_mode) {
+  if (s_list->report_fx >= 2 && !PBL_IF_ROUND_ELSE(0, s_list->squash_mode)) {
     // Report scene, content cleared off-left: a pure-white title-card backdrop (matches the
     // squash memset and the report window bg — seamless at both cuts).
     graphics_context_set_fill_color(ctx, GColorWhite);
     graphics_fill_rect(ctx, layer_get_bounds(layer), 0, GCornerNone);
   } else
-#endif
   prv_canvas_draw_round_5day(layer, ctx);
-#if !PBL_ROUND
   // Pebble-Health "select" marker: a half-circle nub on the centre-right edge identifying the
   // SELECT button. Same radius-13 oval as applib action_button_draw, but pushed further off-screen
   // so it only protrudes ~5px (origin.x = W - protrusion) — shallow enough to clear the right-hand
@@ -2512,15 +2603,43 @@ static void prv_canvas_draw(Layer *layer, GContext *ctx) {
     graphics_fill_oval(ctx, GRect(mb.size.w - protrusion, (mb.size.h - 26) / 2, 26, 26),
                        GOvalScaleModeFitCircle);
   }
+
+#if PBL_ROUND
+  // Up/down nav arrows, taken from the system Health app's card view rather than redrawn:
+  // the same applib component (content_indicator_draw_arrow), the same full-width 18px bands
+  // top and bottom (health/card_view.c: PBL_IF_ROUND_ELSE(18, 11)), and the same GAlignCenter —
+  // Health leaves ContentIndicatorConfig.alignment unset and GAlignCenter is 0. Identical inputs
+  // to the identical function, so these rasterise exactly as Health's do.
+  //
+  // Gated LOOSER than the SELECT nub above, and the two arrows differ:
+  //   UP   — drawn on the resting main view AND on the scrolled precipitation view.
+  //   DOWN — resting main view only (header_shown), like the nub.
+  // Both are excluded during every transition, or they would be captured into the jelly/squash.
+  if (!s_list->fx_active && !s_list->clock_fx && !s_list->squash_mode && !s_list->report_fx) {
+    const GRect ab = layer_get_bounds(layer);
+    const int arrow_band = 18;
+    const GRect up_frame = GRect(0, 0, ab.size.w, arrow_band);
+    content_indicator_draw_arrow(ctx, &up_frame, ContentIndicatorDirectionUp,
+                                 GColorBlack, GColorWhite, GAlignCenter);
+    if (s_list->header_shown) {
+      const GRect down_frame = GRect(0, ab.size.h - arrow_band, ab.size.w, arrow_band);
+      content_indicator_draw_arrow(ctx, &down_frame, ContentIndicatorDirectionDown,
+                                   GColorBlack, GColorWhite, GAlignCenter);
+    }
+  }
+#endif
+
   if (s_list->squash_mode) prv_render_squash_in(ctx);
   if (s_list->clock_fx) {
     // Burst dot: decoupled from the content — drawn AFTER the squash so it flies to centre
     // (stage 1) / orbital-shakes (stage 2) crisply while the frame jelly-stretches off the top.
+    // Shared: it is the subject of the transition on both shapes.
     GRect mb = layer_get_bounds(layer);
     graphics_context_set_fill_color(ctx, GColorBlack);
     graphics_fill_circle(ctx, GPoint(mb.size.w / 2 + s_list->fx_shake_dx,
                                      s_list->fx_dot_y + s_list->fx_shake_dy), 6);
   }
+#if !PBL_ROUND
   // Report scene: the ball (parked on the nub's spot during stage 1, rolling in stage 2)
   // and the unfolding paper + caption (stage 3), drawn after the squash like the burst
   // dot so they ride crisply over the clearing frame.
@@ -2530,14 +2649,25 @@ static void prv_canvas_draw(Layer *layer, GContext *ctx) {
     prv_draw_unfolding_paper(ctx);
     prv_draw_report_caption(ctx, 0, false);
   }
-  // Hero icon-fly + the card's glance text ride ON TOP of the squashed screen (both excluded from
-  // the squash), landing together as the mainscreen clears. On the reverse fly (card -> forecast,
-  // riding the RISE_IN) only the icon flies — there is no incoming card text.
+#endif
+  // Hero icon-fly + the card's glance text ride ON TOP of the squashed screen (both excluded
+  // from the squash), landing together as the mainscreen clears. Shared: round plays the same
+  // card transition. On the reverse fly (card -> forecast, riding the RISE_IN) only the icon
+  // flies — there is no incoming card text.
   if (s_list->flying_icon) {
     prv_draw_flying_icon(ctx);
     if (s_list->squash_mode != SQUASH_RISE_IN) {
       prv_draw_flying_content(ctx);
     }
+  }
+#if PBL_ROUND
+  // Round's report scene. (Rect draws it inside the block above, paired with the burst
+  // dot and hero icon-fly — neither of which exists on round.)
+  if (s_list->report_fx == 1 || s_list->report_fx == 2) {
+    prv_draw_report_ball(ctx);
+  } else if (s_list->report_fx == 3) {
+    prv_draw_unfolding_paper(ctx);
+    prv_draw_report_caption(ctx, 0, false);
   }
 #endif
   return;
@@ -2806,9 +2936,7 @@ static void prv_click_up_down(ClickRecognizerRef recognizer, void *context) {
     else                      prv_start_clock_stage1();   // DOWN again when scrolled -> clock burst
   } else {
     if (!s_list->header_shown) prv_start_header_transition(false);
-#if !PBL_ROUND
     else                       prv_start_up_to_card();              // UP at top -> squash + hero icon-fly to the card
-#endif
   }
   prv_note_icon_interaction();  // wake a faded today icon so it animates during the move
   return;
@@ -2883,12 +3011,12 @@ bool forecast_list_get_today_icon_rect(GRect *out) {
 void forecast_list_start_select_exit(void (*done_cb)(void *ctx), void *ctx) {
   if (!s_list || !s_list->canvas) { if (done_cb) done_cb(ctx); return; }
   if (s_select_exit_anim) return;
-#if WEATHER_ANIM_5DAY && !PBL_ROUND
+#if WEATHER_ANIM_5DAY
   if (s_report_anim || s_list->report_fx) return;
 #endif
   s_select_exit_done = done_cb;
   s_select_exit_ctx  = ctx;
-#if WEATHER_ANIM_5DAY && !PBL_ROUND
+#if WEATHER_ANIM_5DAY
   // The full scene: whole-frame squash-left (stage 1), ball roll-in (2), unfold (3).
   if (!s_list->squash_mode) {
     if (s_list->anim) {   // capture-first, same defensive kill as prv_start_clock_stage1
@@ -2913,7 +3041,7 @@ void forecast_list_start_select_exit(void (*done_cb)(void *ctx), void *ctx) {
     }
   }
 #endif
-  // Fallback (round / scratch OOM): the legacy 115ms moook slide; done cb fires in its .stopped.
+  // Fallback (scratch OOM on either shape): the legacy 115ms moook slide; done cb fires in its .stopped.
   s_select_exit_anim = prv_start_anim(interpolate_moook_duration() / 2,  // 115ms (Timeline)
                                       AnimationCurveLinear,               // moook is the shaping
                                       &s_select_exit_impl, prv_select_exit_stopped);
@@ -3178,7 +3306,7 @@ static void prv_window_appear(Window *window) {
     s_list->sun_timer = app_timer_register(R5_SUN_PERIOD_MS, prv_sun_tick, NULL);
   }
 #endif
-#if WEATHER_ANIM_5DAY && !PBL_ROUND
+#if WEATHER_ANIM_5DAY
   // Returning from the clock via UP: jelly-rise the forecast back in. Armed before the clock
   // dismissed, so this fires on the first revealed frame — no flash of the rested screen.
   if (s_list && s_pending_squash_mode) {
@@ -3389,14 +3517,14 @@ void forecast_list_set_on_select_request(void (*cb)(void *ctx), void *ctx) {
 void forecast_list_arm_squash_in(void) {
   // Latched here (before the clock dismisses) and consumed by the forecast's appear handler,
   // so the jelly drop-in plays on the very first revealed frame. Rect-only; no-op elsewhere.
-#if WEATHER_ANIM_5DAY && !PBL_ROUND
+#if WEATHER_ANIM_5DAY
   s_pending_squash_mode = SQUASH_DROP_IN;
 #endif
 }
 
 void forecast_list_arm_return_fly(void) {
   // Card -> forecast: rise-in PLUS the card icon flying back down into the header.
-#if WEATHER_ANIM_5DAY && !PBL_ROUND
+#if WEATHER_ANIM_5DAY
   s_pending_squash_mode = SQUASH_RISE_IN;
   s_pending_return_fly = true;
 #endif
@@ -3422,10 +3550,12 @@ void forecast_list_update_data(const WeatherLocationForecast *days, size_t num_d
   }
 }
 
-void forecast_list_set_glance(const char *sunset, const char *temp, int uv, int precip) {
+void forecast_list_set_glance(const char *sunset, const char *temp, int uv, int precip,
+                              int wind) {
   if (!s_list) return;
   snprintf(s_list->fly_sunset, sizeof(s_list->fly_sunset), "%s", sunset ? sunset : "");
   snprintf(s_list->fly_temp,   sizeof(s_list->fly_temp),   "%s", temp   ? temp   : "");
   s_list->fly_uv     = uv;
   s_list->fly_precip = precip;
+  s_list->fly_wind   = wind;
 }

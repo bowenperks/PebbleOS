@@ -85,16 +85,15 @@ typedef struct {
   bool     touch_active;
   bool     touch_started_during_intro;
 #endif
-#if !PBL_ROUND
   // ---- UP → forecast: whole-screen Timeline squash-stretch exit ----
   // The clock is captured each frame and jelly-stretched down off the bottom (two moook edges:
   // the bottom leads, the top trails — the bitmap analogue of scale_segmented's per-point lag).
+  // BOTH shapes: weather_render_squash is chord-clamped, so round drives the same mode.
   AnimationProgress fwd_exit_p;     // 0 → MAX
   Animation        *fwd_exit_anim;
   bool              fwd_exit_active;
   AppTimer         *fwd_push_timer; // 0ms timer → hand off to the forecast once fully off-top
   uint8_t          *fwd_scratch;    // full-screen snapshot we re-sample while overwriting the fb
-#endif
 } ClockFaceData;
 
 static ClockFaceData *s_cf;
@@ -367,12 +366,14 @@ static int32_t prv_clock_center_scale_progress(AnimationProgress progress) {
   return min_scale + weather_scale_i32(ease_out, max - min_scale, max);
 }
 
-#if !PBL_ROUND
 // ---- UP → forecast: whole-screen Timeline squash-stretch ---------------------------------
 // The whole-screen jelly squash-stretch lives in weather_math.c (weather_render_squash),
 // shared with the forecast's squash modes. CLOCK_EXIT is the unhasted down-exit: unlike the
 // forecast's DOWN_EXIT it runs the full timeline (no me=m+m/3 compression) — hand-tuned so
 // the sunset-card staging reads right; do not switch modes.
+// BOTH shapes: the renderer clamps every write to the row's chord, so round squashes inside
+// the glass. The scratch is W*H (round 260x260 = 67,600B vs rect 200x228 = 45,600B); the
+// malloc_try fallback below degrades to an instant return if the app heap can't take it.
 static void prv_render_fwd_squash(GContext *ctx) {
   if (!s_cf || !s_cf->fwd_scratch) return;
   weather_render_squash(ctx, s_cf->fwd_scratch, s_cf->fwd_exit_p,
@@ -418,7 +419,6 @@ static void prv_start_fwd_exit_animation(void) {
   animation_set_curve(s_cf->fwd_exit_anim, AnimationCurveLinear);
   animation_schedule(s_cf->fwd_exit_anim);
 }
-#endif  // !PBL_ROUND
 
 static void prv_canvas_draw(Layer *layer, GContext *ctx) {
   if (!s_cf) return;
@@ -843,10 +843,8 @@ static void prv_canvas_draw(Layer *layer, GContext *ctx) {
         GTextOverflowModeTrailingEllipsis, label_align, NULL);
   }
 
-#if !PBL_ROUND
   // UP-to-forecast: wrap the fully-drawn clock in the whole-screen squash-stretch.
   if (s_cf->fwd_exit_active) prv_render_fwd_squash(ctx);
-#endif
 }
 
 // ---- Tick handler — redraws every minute to keep hands + time current ----
@@ -883,14 +881,10 @@ static void prv_touch_handler(const TouchEvent *event, void *context) {
       prv_toggle_temp_reveal();
     } else if (ady >= adx && dy > 0) {
       // Swipe down — return to the forecast main screen (mirrors the UP button).
-#if !PBL_ROUND
       if (!s_cf->fwd_exit_active && !s_cf->reveal_active &&
           s_cf->anim_progress >= ANIMATION_NORMALIZED_MAX) {
         prv_start_fwd_exit_animation();
       }
-#else
-      if (s_wrap_callback) s_wrap_callback(s_wrap_context);
-#endif
     }
     prv_note_clock_interaction();
   }
@@ -914,7 +908,6 @@ static void prv_click_down(ClickRecognizerRef r, void *ctx) {
 }
 static void prv_click_up(ClickRecognizerRef r, void *ctx) {
   prv_note_clock_interaction();
-#if !PBL_ROUND
   // UP returns to the forecast main screen: the clock jelly-stretches down off the bottom, then
   // the forecast jelly-drops in from above (handoff fires from prv_fwd_exit_push_callback). Ignore
   // while the intro or any other transition is still in flight.
@@ -922,9 +915,6 @@ static void prv_click_up(ClickRecognizerRef r, void *ctx) {
       !s_cf->reveal_active && s_cf->anim_progress >= ANIMATION_NORMALIZED_MAX) {
     prv_start_fwd_exit_animation();
   }
-#else
-  if (s_wrap_callback) s_wrap_callback(s_wrap_context);   // round: plain return to main
-#endif
 }
 static void prv_click_provider(void *ctx) {
   window_single_click_subscribe(BUTTON_ID_BACK,   prv_click_back);
@@ -993,7 +983,6 @@ static void prv_window_unload(Window *window) {
     animation_destroy(s_cf->reveal_anim);
     s_cf->reveal_anim = NULL;
   }
-#if !PBL_ROUND
   if (s_cf->fwd_exit_anim) {
     animation_unschedule(s_cf->fwd_exit_anim);
     animation_destroy(s_cf->fwd_exit_anim);
@@ -1007,7 +996,6 @@ static void prv_window_unload(Window *window) {
     free(s_cf->fwd_scratch);
     s_cf->fwd_scratch = NULL;
   }
-#endif
   if (s_cf->temp_text_bmp) {
     gbitmap_destroy(s_cf->temp_text_bmp);
     s_cf->temp_text_bmp = NULL;

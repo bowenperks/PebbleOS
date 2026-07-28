@@ -145,8 +145,9 @@ status_t weather_db_insert(const uint8_t *key, int key_len, const uint8_t *val, 
   // minor-0 record ends its fixed part at WEATHER_DB_V4_0_FIXED_SIZE (older phone
   // apps keep working); a minor-1+ record must also carry the appended fields.
   if (entry->version == WEATHER_DB_CURRENT_VERSION) {
-    const int fixed = (entry->minor_version >= 1) ? (int)WEATHER_DB_V4_FIXED_SIZE
-                                                  : (int)WEATHER_DB_V4_0_FIXED_SIZE;
+    // Per-MINOR, never "the newest": hardcoding the current minor's size here rejects every
+    // record from a phone that has not shipped the latest block yet.
+    const int fixed = (int)weather_db_entry_strings_offset(entry->version, entry->minor_version);
     if (val_len < fixed) {
       PBL_LOG_WRN("v4.%" PRIu8 " weather record too short: %d < %d",
                   entry->minor_version, val_len, fixed);

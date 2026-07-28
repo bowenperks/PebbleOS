@@ -39,6 +39,8 @@ static void prv_fill_from_fw(WxDsForecast *out, const WeatherLocationForecast *f
   // v4 metrics are not in weather_service's v3 forecast; prv_overlay_v4 reads
   // them from the v4 WeatherDBEntry directly (no-op for v3 records).
   out->today_uv = -1;
+  out->has_hourly_uv = false;
+  for (int i = 0; i < WX_DS_HOURLY; i++) out->hourly_uv[i] = -1;
   out->today_precip = -1;
   out->today_wind = -1;
   out->today_feels = WEATHER_SERVICE_LOCATION_FORECAST_UNKNOWN_TEMP;
@@ -136,6 +138,15 @@ static void prv_overlay_v4(WxDsForecast *out, int location_id) {
         if (m->uv_index_x10 != 255)       out->daily[i].uv = m->uv_index_x10 / 10;
       }
     }
+    // v4.4 appended block (hourly UV) — the only source of a CURRENT UV reading;
+    // today_uv_index_x10 is the day's figure, not a live one.
+    if (entry->minor_version >= 4 && len >= (int)WEATHER_DB_V4_FIXED_SIZE) {
+      for (int i = 0; i < WX_DS_HOURLY; i++) {
+        const uint8_t v = entry->today_hourly_uv_x10[i];
+        out->hourly_uv[i] = (v == 255) ? -1 : (int8_t)(v / 10);
+      }
+      out->has_hourly_uv = true;
+    }
     // v4.2 appended block (today's raw warning readings + per-day feels-like).
     if (entry->minor_version >= 2 && len >= (int)WEATHER_DB_V4_2_FIXED_SIZE) {
       if (entry->today_wmo_code != 0xFF)         out->today_wmo = entry->today_wmo_code;
@@ -149,7 +160,7 @@ static void prv_overlay_v4(WxDsForecast *out, int location_id) {
       }
     }
     // v4.3 appended block (dominant wind direction, today + per-day).
-    if (entry->minor_version >= 3 && len >= (int)WEATHER_DB_V4_FIXED_SIZE) {
+    if (entry->minor_version >= 3 && len >= (int)WEATHER_DB_V4_3_FIXED_SIZE) {
       if (entry->today_wind_dir_deg >= 0) {
         out->today_wind_dir = entry->today_wind_dir_deg;
       }
@@ -170,8 +181,18 @@ static void prv_overlay_v4(WxDsForecast *out, int location_id) {
 // on-device before v4 data exists. Applied only when the active record is NOT
 // already v4, so it vanishes automatically the moment real v4 records arrive.
 // Set to 0 (or delete this block + its call site) to disable.
+//
+// QEMU-ONLY. It fabricates placeholder COORDINATES (San Francisco) for records
+// that carry none, which on real hardware would pin a coordinate-less phone
+// location to the wrong place on the globe — and hide the fact that the phone
+// never sent coordinates for it. Locations are phone-owned now, so the watch
+// must show exactly what the phone sent and nothing it invented.
 // ===========================================================================
+#if defined(CONFIG_SOC_QEMU)
 #define WEATHER_V4_TEST_SEED 1
+#else
+#define WEATHER_V4_TEST_SEED 0
+#endif
 #if WEATHER_V4_TEST_SEED
 static void prv_seed_v4_test(WxDsForecast *out) {
   if (out->is_v4) {

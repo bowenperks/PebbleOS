@@ -4,58 +4,40 @@
 #pragma once
 
 #include "pebble_compat.h"
-#include "city_presets.h"
 #include "weather_platform.h"
 
-#define SAVED_LOCATIONS_MAX_CUSTOM 6
-#define SAVED_LOCATIONS_DEFAULT_PRESET_COUNT 5
-#define SAVED_LOCATIONS_MAX_ENTRIES (1 + SAVED_LOCATIONS_DEFAULT_PRESET_COUNT + SAVED_LOCATIONS_MAX_CUSTOM)
+//! Locations are owned by the PHONE. The watch neither adds nor removes them —
+//! it only selects between the records the phone has synced into the weather
+//! DB. Every entry here is a snapshot of one such record, and `ds_index` is its
+//! identity (the index weather_ds_read_index() takes), so a selection never has
+//! to be re-derived by matching names or coordinates.
+#define SAVED_LOCATIONS_MAX_ENTRIES 12
 #define SAVED_LOCATION_LABEL_SIZE 48
-#define SAVED_LOCATION_QUERY_SIZE 64
-
-typedef enum {
-  SavedLocationKindCurrent = 0,
-  SavedLocationKindPreset,
-  SavedLocationKindCustom,
-} SavedLocationKind;
 
 typedef struct {
-  SavedLocationKind kind;
-  int8_t preset_index;   // -1..CITY_PRESET_COUNT-1 (value-context only)
-  char label[SAVED_LOCATION_LABEL_SIZE];
-  char query[SAVED_LOCATION_QUERY_SIZE];
-  int16_t latitude_e2;
-  int16_t longitude_e2;
-  bool has_coordinates;
+  int16_t ds_index;           //!< weather-ds record index — the stable identity
+  bool    is_current_location; //!< the phone's "current location" record
+  char    label[SAVED_LOCATION_LABEL_SIZE];
+  int16_t latitude_e2;        //!< latitude * 100, INT16_MIN unknown
+  int16_t longitude_e2;       //!< longitude * 100, INT16_MIN unknown
+  bool    has_coordinates;    //!< false => cannot be pinned on the globe
+  int16_t temp;               //!< current temp for the row glance, or WX_DS_UNKNOWN_TEMP
+  uint8_t weather_type;       //!< WeatherType for the row glance icon
 } SavedLocationEntry;
 
-typedef void (*SavedLocationsSelectCallback)(SavedLocationKind kind,
-                                             int preset_index,
-                                             const char *query,
-                                             void *context);
+//! Fired when the user picks a location. `ds_index` indexes the weather-ds
+//! records directly — no matching required.
+typedef void (*SavedLocationsSelectCallback)(int ds_index, void *context);
 
 typedef struct {
-  const char *current_location_label;
-  int active_city_index;           // CityPreset index (NOT a weather-ds location index); -1 = none
-  const char *active_custom_query;
+  int active_ds_index;   //!< pre-highlight this record's row; -1 = none
   SavedLocationsSelectCallback select_callback;
   void *select_context;
 } SavedLocationsConfig;
 
 void saved_locations_push(const SavedLocationsConfig *config);
 
-//! Re-send the watch->phone "add location" request (Pebble Protocol endpoint
-//! 6100) for every dictated custom location still missing coordinates. Call
-//! at app launch: delivery is best-effort, so this recovers requests lost
-//! while the phone was disconnected. The phone treats ADD idempotently.
-void saved_locations_send_pending_queries(void);
-
-//! Free the app-heap custom-location cache at app exit (the statics survive the
-//! app; the heap doesn't — see saved_locations_reset in the .c).
-void saved_locations_reset(void);
-int saved_locations_get_entries(SavedLocationEntry *entries,
-                                int max_entries,
-                                const char *current_location_label,
-                                int16_t current_latitude_e2,
-                                int16_t current_longitude_e2,
-                                bool has_current_location);
+//! Snapshot the phone's synced locations into `entries` (current location
+//! first, then the rest in the phone's own order).
+//! @return the number of entries written (0 if the phone has synced none).
+int saved_locations_get_entries(SavedLocationEntry *entries, int max_entries);

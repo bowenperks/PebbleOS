@@ -25,7 +25,6 @@ const uint8_t weather_diurnal_curve[24] = {
    82, 92, 98, 100, 96, 88, 76, 62, 48, 36, 26, 17,
 };
 
-#if !PBL_ROUND
 // One jelly edge — leading edge delay 0, trailing edge delay 1/6 over a 5/6 point-duration, on
 // the exact interpolate_moook_soft curve Timeline feeds its scale_segmented transform.
 static int prv_jelly_edge(AnimationProgress m, int delay_num, int from, int to) {
@@ -37,9 +36,15 @@ static int prv_jelly_edge(AnimationProgress m, int delay_num, int from, int to) 
   return (int)interpolate_moook_soft(local, from, to, 3);
 }
 
-// Capture the fully-drawn screen from `ctx` and re-blit it vertically squash-stretched.
-// Reads the one-shot `scratch` snapshot so re-sampling never hits already-overwritten
-// framebuffer rows. Rect (emery/obelix) only — assumes contiguous full-width rows.
+// Capture the fully-drawn screen from `ctx` and re-blit it squash-stretched. Reads the
+// one-shot `scratch` snapshot so re-sampling never hits already-overwritten framebuffer
+// rows.
+//
+// BOTH shapes. Rows are addressed ABSOLUTELY (ri.data[x], x in screen coords) and every
+// write is clamped to that row's [min_x, max_x]. On rect the mask is the full width, so
+// this is identical to the old code; on round the mask is the circle's chord — writing
+// outside it (as `ri.data + ri.min_x` with a full-width length did) both shifts the image
+// and runs off the end of the row.
 void weather_render_squash(GContext *ctx, uint8_t *scratch, AnimationProgress m, int mode) {
   GBitmap *fb = graphics_capture_frame_buffer(ctx);
   if (!fb) return;
@@ -47,7 +52,7 @@ void weather_render_squash(GContext *ctx, uint8_t *scratch, AnimationProgress m,
   const int W = b.size.w, H = b.size.h;
   for (int y = 0; y < H; y++) {
     GBitmapDataRowInfo ri = gbitmap_get_data_row_info(fb, (uint16_t)y);
-    memcpy(scratch + (uint32_t)y * W, ri.data + ri.min_x, W);
+    memcpy(scratch + (uint32_t)y * W, ri.data, W);   // absolute-x row
   }
   const uint8_t white = GColorWhite.argb;
   if (mode == WEATHER_SQUASH_LEFT_EXIT) {
@@ -71,11 +76,10 @@ void weather_render_squash(GContext *ctx, uint8_t *scratch, AnimationProgress m,
     if (vis1 < vis0) vis1 = vis0;
     for (int y = 0; y < H; y++) {
       GBitmapDataRowInfo ri = gbitmap_get_data_row_info(fb, (uint16_t)y);
-      uint8_t *dst = ri.data + ri.min_x;
+      uint8_t *dst = ri.data;                       // absolute-x
       const uint8_t *src = scratch + (uint32_t)y * W;
-      if (vis0 > 0) memset(dst, white, (size_t)vis0);
-      if (vis1 < W) memset(dst + vis1, white, (size_t)(W - vis1));
-      for (int x = vis0; x < vis1; x++) {
+      for (int x = (int)ri.min_x; x <= (int)ri.max_x; x++) {
+        if (x < vis0 || x >= vis1) { dst[x] = white; continue; }
         int sx = (int)((((int32_t)(x - left_edge)) * sx_step) >> 16);
         if (sx < 0) sx = 0; else if (sx >= W) sx = W - 1;
         dst[x] = src[sx];
@@ -116,17 +120,23 @@ void weather_render_squash(GContext *ctx, uint8_t *scratch, AnimationProgress m,
   const int32_t sy_step = ((int32_t)H << 16) / dst_h;
   for (int ay = 0; ay < H; ay++) {
     GBitmapDataRowInfo ri = gbitmap_get_data_row_info(fb, (uint16_t)ay);
+    const int lo = (int)ri.min_x, hi = (int)ri.max_x;
     if (ay >= top_edge && ay < bot_edge) {
       int sy = (int)((((int32_t)(ay - top_edge)) * sy_step) >> 16);
       if (sy < 0) sy = 0; else if (sy >= H) sy = H - 1;
-      memcpy(ri.data + ri.min_x, scratch + (uint32_t)sy * W, W);
+      // The SOURCE row's chord differs from this row's, so anything this row exposes
+      // beyond it would read pixels that were never drawn — white those.
+      GBitmapDataRowInfo sri = gbitmap_get_data_row_info(fb, (uint16_t)sy);
+      const uint8_t *src = scratch + (uint32_t)sy * W;
+      for (int x = lo; x <= hi; x++) {
+        ri.data[x] = (x >= (int)sri.min_x && x <= (int)sri.max_x) ? src[x] : white;
+      }
     } else {
-      memset(ri.data + ri.min_x, white, W);
+      for (int x = lo; x <= hi; x++) ri.data[x] = white;
     }
   }
   graphics_release_frame_buffer(ctx, fb);
 }
-#endif  // !PBL_ROUND
 
 void weather_fill_weekday_abbrev(int day_offset, const char *fallback,
                                  char *buffer, size_t buffer_size) {

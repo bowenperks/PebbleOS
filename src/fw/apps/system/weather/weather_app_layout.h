@@ -16,6 +16,9 @@
 // sequence must be CLONED into RAM before any write (gdraw_command_sequence_set_
 // bounds_size writes sequence->size and faulted on launch). See the clone in
 // weather_app_layout_init.
+// Round uses the LARGE (80x80) PDC art so the icon fills its quadrant; rect
+// keeps the 50px raster. The 14/10 disc ratio is too fat at that size, so round
+// also takes a tighter ratio -- see WEATHER_APP_LAYOUT_DISC_RATIO_NUM.
 #define WEATHER_APP_LAYOUT_USE_PDC_WEATHER_ICONS PBL_ROUND
 
 typedef struct WeatherAppLayout {
@@ -33,6 +36,7 @@ typedef struct WeatherAppLayout {
   GBitmap *tomorrow_weather_icon;
   GDrawCommandImage *fin_pdc;  // real timeline 'fin' flag (END_OF_TIMELINE PDC)
   Layer *fin_layer;
+  Layer *city_layer;   //!< round: the crown city masthead (topmost root child)
   Animation *fin_animation;
   const WeatherLocationForecast *forecast;
   const WeatherLocationForecast *next_forecast;
@@ -76,14 +80,9 @@ typedef struct WeatherAppLayout {
     char top_label[16];
     char top_temp[15];
     char top_highlow[15];
-#if PBL_ROUND
-    char top_rain[12];     // the metric row (round-only reader)
-    char top_wind[16];
-#else
     char top_uv[12];       // UV bar numeral
     char top_phrase[20];   // condition line
     char top_desc[72];     // forecast description (warning/wind/precip)
-#endif
     char bot_label[16];
     char bot_highlow[15];
     bool bot_valid;
@@ -114,3 +113,35 @@ void weather_app_layout_animate(WeatherAppLayout *layout,
                                 const WeatherLocationForecast *new_next,
                                 bool animate_down);
 
+
+#if PBL_ROUND
+// The weather report's UV bar, as a reusable component: glass-concentric arc ends, sun glyph,
+// "UV INDEX", ten tally squares and the big value. The sunset card (expanded_view.c) draws the
+// SAME bar, so this is the single implementation — do not clone it.
+//
+// `gc` is the glass centre IN THE CALLER'S coordinate space and every element is positioned
+// relative to it, so the bar lands identically whether the caller draws into the report's inset
+// content layer or the card's full-screen canvas. `by` is the bar's top row in that same space.
+// `uv_value` drives the fill/severity colour; `uv_text` is drawn verbatim as the big number
+// (callers may pass a string the integer parse would not reproduce).
+//
+// The bar's WIDTH is the glass chord at its own rows, so it narrows as it moves down: keep the
+// content rows above ~y200 or the fixed-width contents overrun the arc ends.
+// Two sizes. Full = the weather report's bar. Compact = a narrower bar for the sunset card,
+// which hangs BELOW the card's centred content group where the glass has far less width: same
+// glass-concentric arc ends and the same large LECO value, but tighter tally squares and a
+// pulled-in value box so all ten squares still fit.
+typedef enum {
+  WeatherUvBarFull = 0,
+  WeatherUvBarCompact,
+} WeatherUvBarSize;
+
+// `label` is the caption drawn beside the sun glyph — the report says "UV INDEX", the
+// sunset card says "CURRENT UV" (its value is the current hour's, not the day's).
+void weather_app_layout_draw_uv_bar(GContext *ctx, GPoint gc, int by,
+                                    int uv_value, const char *uv_text, WeatherUvBarSize size,
+                                    const char *label);
+
+// Height in rows of each bar size, so callers can budget vertical space without guessing.
+int weather_app_layout_uv_bar_height(WeatherUvBarSize size);
+#endif

@@ -13,10 +13,8 @@
 #include "saved_locations.h"
 #include "weather_platform.h"
 
-typedef void (*GlobeLocationSelectCallback)(SavedLocationKind kind,
-                                            int preset_index,
-                                            const char *query,
-                                            bool force,
+//! `ds_index` identifies the phone's weather record directly — no matching.
+typedef void (*GlobeLocationSelectCallback)(int ds_index, bool force,
                                             void *context);
 typedef void (*GlobeSavedLocationsCallback)(void *context);
 typedef void (*GlobeMainCallback)(void *context);

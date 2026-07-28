@@ -9,8 +9,12 @@
 // (prv_start_up_to_card's fly_dest) — both draw sites use these so the flown icon and the static
 // card icon land pixel-identically. EV_ICON_Y centres the icon glyph vertically between the status
 // time and the "Sunset H:MM" title.
+// ROUND: the icon carries its share of the group shift (EV_ROUND_GROUP_DY) that centres
+// icon + "Sunset H:MM" + "high/low°" on the screen's vertical midline. Both draw sites read
+// this constant, so the hero fly's landing target moves with the static icon automatically —
+// do NOT hardcode either one.
 #define EV_ICON_SIZE 74
-#define EV_ICON_Y    26
+#define EV_ICON_Y    PBL_IF_ROUND_ELSE(42, 26)
 
 // How the card animates in when pushed.
 typedef enum {
@@ -59,7 +63,8 @@ void expanded_view_format_glance(const WeatherLocationForecast *today, int16_t l
 // ..."); NULL skips the status bar (the card draws its own during the last-updated -> time swap).
 // The card and the forecast's hero icon-fly both call this so the two are pixel-identical.
 void expanded_view_draw_glance_content(GContext *ctx, int W, int tdx, const char *status,
-                                       const char *sunset, const char *temp, int uv, int precip);
+                                       const char *sunset, const char *temp, int uv, int precip,
+                                       int wind);
 
 // Format "Last updated H:MM" from the forecast's time_updated_utc, exactly as the card shows it.
 void expanded_view_format_updated(const WeatherLocationForecast *today, char *out, size_t out_sz);

@@ -39,7 +39,7 @@
 // record length, and the trailing-strings offset is resolved per minor
 // (see weather_db_entry_get_strings).
 #define WEATHER_DB_CURRENT_VERSION (4)
-#define WEATHER_DB_CURRENT_MINOR_VERSION (3)
+#define WEATHER_DB_CURRENT_MINOR_VERSION (4)
 #define WEATHER_DB_LEGACY_VERSION (3)
 
 // Days of daily forecast a v4 record carries (today + 6).
@@ -147,6 +147,11 @@ typedef struct PACKED {
   int16_t today_wind_dir_deg;
   int16_t daily_wind_dir_deg[WEATHER_DB_MAX_FORECAST_DAYS];
 
+  // --- v4.4 appended fields (hourly UV) ---
+  // Open-Meteo: hourly uv_index. UV * 10 per hour 0-23 (UV 6.5 -> 65), 255 if unknown.
+  // Lets the watch show the CURRENT hour's UV; today_uv_index_x10 stays the day's figure.
+  uint8_t today_hourly_uv_x10[WEATHER_DB_HOURLY_COUNT];
+
   // --- variable-length trailing strings (MUST stay last) ---
   SerializedArray pstring16s;
 } WeatherDBEntry;
@@ -164,7 +169,9 @@ typedef enum WeatherDbStringIndex {
 #define WEATHER_DB_V4_1_FIXED_SIZE (offsetof(WeatherDBEntry, today_wmo_code))
 // Fixed portion of a v4.2 record — where a minor-2 record's trailing strings start.
 #define WEATHER_DB_V4_2_FIXED_SIZE (offsetof(WeatherDBEntry, today_wind_dir_deg))
-// Fixed portion of a current (v4.3) record, i.e. everything except the trailing
+// Fixed portion of a v4.3 record — where a minor-3 record's trailing strings start.
+#define WEATHER_DB_V4_3_FIXED_SIZE (offsetof(WeatherDBEntry, today_hourly_uv_x10))
+// Fixed portion of a current (v4.4) record, i.e. everything except the trailing
 // pstring16s SerializedArray header/payload.
 #define WEATHER_DB_V4_FIXED_SIZE (offsetof(WeatherDBEntry, pstring16s))
 
@@ -180,12 +187,16 @@ static inline bool weather_db_version_is_supported(uint8_t version) {
 }
 
 //! @return the byte offset of the trailing pstring16s array for a record of the
-//! given version + minor. v3, v4.0, v4.1, v4.2 and v4.3 place it differently.
+//! given version + minor. v3, v4.0, v4.1, v4.2, v4.3 and v4.4 place it differently.
+//! Each rung must name the offset of the FIRST field the NEXT minor appends — using
+//! offsetof(pstring16s) for anything but the current minor silently demands the newest
+//! record length from older records and rejects every one of them.
 static inline size_t weather_db_entry_strings_offset(uint8_t version, uint8_t minor_version) {
   if (version < WEATHER_DB_CURRENT_VERSION) {
     return offsetof(WeatherDBEntryV3, pstring16s);
   }
-  if (minor_version >= 3) return offsetof(WeatherDBEntry, pstring16s);
+  if (minor_version >= 4) return offsetof(WeatherDBEntry, pstring16s);
+  if (minor_version >= 3) return WEATHER_DB_V4_3_FIXED_SIZE;
   if (minor_version >= 2) return WEATHER_DB_V4_2_FIXED_SIZE;
   if (minor_version >= 1) return WEATHER_DB_V4_1_FIXED_SIZE;
   return WEATHER_DB_V4_0_FIXED_SIZE;
