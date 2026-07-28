@@ -497,7 +497,7 @@ static void prv_canvas_draw(Layer *layer, GContext *ctx) {
 // Slide duration + interpolation are shared with globe_view via weather_math.h
 // (WEATHER_HSLIDE_MS / weather_interpolate_moook_soft1) so the pair can't drift.
 
-#if !PBL_ROUND
+// BOTH shapes since 2026-07-28 — round used to stub the pair into hard cuts.
 static void prv_slide_out_stopped(Animation *anim, bool finished, void *context) {
   if (!s_ev) return;
   s_ev->slide_anim = NULL;   // property animation auto-destroys after a normal stop
@@ -541,12 +541,7 @@ static void prv_start_slide_in_left(void) {
   s_ev->slide_anim = a;
   animation_schedule(a);
 }
-#else
-static void prv_start_slide_out_left(void) {
-  if (s_ev && s_ev->on_select) s_ev->on_select(s_ev->on_select_ctx);
-}
-static void prv_start_slide_in_left(void) {}   // round: the card just appears in place
-#endif
+
 
 // ---- Navigation -----------------------------------------------------------
 
@@ -687,14 +682,12 @@ static void prv_window_load(Window *window) {
   window_set_background_color(window, GColorWhite);
   GRect bounds = layer_get_bounds(window_get_root_layer(window));
   GRect frame = bounds;
-#if !PBL_ROUND
-  // Globe-BACK entrance: start the whole card off-screen to the left so its first painted frame is
-  // already off-left; prv_window_appear then slides it home. (layer_create zeroes the bounds origin,
-  // so the draw proc is unaffected.)
+  // Globe-BACK entrance (BOTH shapes): start the whole card off-screen to the left so its first
+  // painted frame is already off-left; prv_window_appear then slides it home. (layer_create
+  // zeroes the bounds origin, so the draw proc is unaffected.)
   if (s_ev->entrance == ExpandedViewEntranceCardFromLeft) {
     frame.origin.x -= bounds.size.w;
   }
-#endif
   s_ev->canvas = layer_create(frame);
   layer_set_update_proc(s_ev->canvas, prv_canvas_draw);
   layer_add_child(window_get_root_layer(window), s_ev->canvas);

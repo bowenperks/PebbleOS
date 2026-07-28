@@ -3777,14 +3777,14 @@ void globe_view_start_animation(GlobeView *view) {
  */
 void globe_view_stop_animation(GlobeView *view) {
     if (!view) return;
-#if !PBL_ROUND
-    if (view->entry_drop_anim) {   // dismissed mid drop-in: cancel before the layer is torn down
+    // BOTH shapes: round drives the card<->globe hslide pair now, so a mid-slide dismissal
+    // must cancel this before the layer is torn down, exactly like rect's drop-in.
+    if (view->entry_drop_anim) {
         Animation *a = view->entry_drop_anim;
         view->entry_drop_anim = NULL;
         animation_unschedule(a);
         animation_destroy(a);
     }
-#endif
     if (!view->is_animating) return;
 
     view->is_animating = false;
@@ -3813,9 +3813,9 @@ void globe_view_stop_animation(GlobeView *view) {
     release_visual_resources(view);
 }
 
-#if !PBL_ROUND
 // Slide duration + interpolation are shared with expanded_view via weather_math.h
 // (WEATHER_HSLIDE_MS / weather_interpolate_moook_soft1) so the pair can't drift.
+// BOTH shapes since 2026-07-28 — round used to stub these into hard cuts.
 
 static void prv_drop_stopped(Animation *anim, bool finished, void *context) {
     (void)finished;
@@ -3885,12 +3885,7 @@ void globe_view_slide_out_right(GlobeView *view) {
         if (view->back_callback) view->back_callback(view->back_context);
     }
 }
-#else
-void globe_view_push_slide_in_right(GlobeView *view) { globe_view_push_animated(view, false); }
-void globe_view_slide_out_right(GlobeView *view) {
-    if (view && view->back_callback) view->back_callback(view->back_context);
-}
-#endif
+
 
 // Entry coords for the focus search — platform-neutral (the touch build's
 // saved_entry_globe_coords twin lives inside WEATHER_PLATFORM_TOUCH_COLOR).

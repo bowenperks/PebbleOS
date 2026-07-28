@@ -3,6 +3,7 @@
 
 #include "weather_report.h"
 #include "weather_math.h"
+#include "forecast_list.h"   // arm_hslide_in — the report-BACK glide pair
 #include "applib/app_timer.h"
 #include "applib/graphics/gdraw_command_transforms.h"
 #include "applib/ui/animation.h"
@@ -91,8 +92,35 @@ static void prv_click_up_down(ClickRecognizerRef r, void *ctx) {
   prv_navigate(click_recognizer_get_button_id(r) == BUTTON_ID_DOWN);
 }
 
+static Animation *s_slide_in_anim;   // entrance slide (defined below); shared exclusivity
+// BACK: the page glide pair (globe grammar): this page slides out RIGHT while the mainscreen
+// slides in from the left (forecast_list_arm_hslide_in). Same WEATHER_HSLIDE_MS + moook_soft1.
+static Animation *s_back_slide_anim;
+static void prv_back_slide_stopped(Animation *anim, bool finished, void *context) {
+  (void)anim; (void)context;
+  s_back_slide_anim = NULL;   // property animation auto-destroys after a normal stop
+  if (finished) {
+    forecast_list_arm_hslide_in();
+    window_stack_pop(false);   // un-animated: the glide already happened
+  }
+}
+static void prv_start_back_slide(void) {
+  if (!s_report || s_back_slide_anim || s_slide_in_anim) return;   // entrance/exit exclusive
+  Layer *root = s_report->layout.root_layer;
+  GRect from = layer_get_frame_by_value(root);
+  GRect to = from;
+  to.origin.x += from.size.w;                     // out to the RIGHT
+  PropertyAnimation *pa = property_animation_create_layer_frame(root, &from, &to);
+  if (!pa) { window_stack_pop(true); return; }
+  Animation *a = (Animation *)pa;
+  animation_set_duration(a, WEATHER_HSLIDE_MS);
+  animation_set_custom_interpolation(a, weather_interpolate_moook_soft1);
+  animation_set_handlers(a, (AnimationHandlers){ .stopped = prv_back_slide_stopped }, NULL);
+  s_back_slide_anim = a;
+  animation_schedule(a);
+}
 static void prv_click_back(ClickRecognizerRef r, void *ctx) {
-  window_stack_pop(true);   // back to the forecast list
+  prv_start_back_slide();   // glide out right; pops in the .stopped
 }
 
 // ---- Touch input (touch colour platforms) ----
@@ -116,7 +144,7 @@ static void prv_touch_handler(const TouchEvent *event, void *context) {
     if (ady >= adx) {
       prv_navigate(dy < 0);      // swipe up = next day (like DOWN), swipe down = previous
     } else if (dx > 0) {
-      window_stack_pop(true);    // swipe right = BACK to the forecast list
+      prv_start_back_slide();    // swipe right = BACK, same glide
     }
   }
 }
@@ -194,7 +222,6 @@ static void prv_window_load(Window *window) {
 // Restored 2026-07-28: this machinery was deleted in size campaign 2 as "unreachable",
 // which was true only while arm_static_in was rect-only. weather.c now arms it on BOTH
 // shapes, so round was landing on a hard cut. Mirrors the rect arm line for line.
-static Animation *s_slide_in_anim;
 
 static void prv_slide_in_update(Animation *anim, AnimationProgress progress) {
   (void)anim;
@@ -260,6 +287,11 @@ static void prv_window_unload(Window *window) {
   if (s_slide_in_anim) {
     Animation *a = s_slide_in_anim;
     s_slide_in_anim = NULL;
+    animation_unschedule(a);
+  }
+  if (s_back_slide_anim) {
+    Animation *a = s_back_slide_anim;
+    s_back_slide_anim = NULL;
     animation_unschedule(a);
   }
   if (s_report) {

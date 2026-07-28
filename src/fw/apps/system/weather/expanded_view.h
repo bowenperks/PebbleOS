@@ -14,7 +14,7 @@
 // this constant, so the hero fly's landing target moves with the static icon automatically —
 // do NOT hardcode either one.
 #define EV_ICON_SIZE 74
-#define EV_ICON_Y    PBL_IF_ROUND_ELSE(42, 26)
+#define EV_ICON_Y    PBL_IF_ROUND_ELSE(38, 26)
 
 // How the card animates in when pushed.
 typedef enum {

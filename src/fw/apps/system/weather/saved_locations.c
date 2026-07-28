@@ -5,6 +5,7 @@
 
 #include "weather_data_source.h"
 #include "weather_types.h"
+#include "util/math.h"   // integer_sqrt — the launcher's chord-inset math
 
 #define SAVED_LOCATIONS_ROW_HEIGHT 44
 #define SAVED_LOCATIONS_TOUCH_AXIS_THRESHOLD_PX 5
@@ -158,6 +159,35 @@ static void prv_draw_glance_row(GContext *ctx, const Layer *cell_layer,
   }
 
   GRect bounds = layer_get_bounds(cell_layer);
+#if PBL_ROUND && PBL_DISPLAY_HEIGHT >= 200
+  // Rows follow the glass EXACTLY the way the gabbro app drawer's do. Mirrored from
+  // launcher/default: menu_layer.c prv_menu_layer_draw_row measures the row's LIVE on-screen
+  // centre each frame, and app_glance_structured.c prv_draw_processed insets the content frame
+  // by base 10 + the chord shortfall (R - sqrt(R^2 - dy^2), R = PBL_DISPLAY_HEIGHT/2), both
+  // sides, leaving the highlight bar full-width. drawing_box.origin.y is this row's top in
+  // absolute screen coords — the MenuLayer adds the scroll offset AND the centre-focus bounce
+  // before calling draw_row (applib/ui/menu_layer.c:306-331), so scrolling re-derives the
+  // inset every frame with no extra plumbing, exactly like the launcher.
+  {
+    const int16_t radius = PBL_DISPLAY_HEIGHT / 2;
+    const int16_t row_center_y = ctx->draw_state.drawing_box.origin.y + bounds.size.h / 2;
+    const int16_t y_offset_from_center = row_center_y - radius;
+    const int32_t y_offset_sq = (int32_t)y_offset_from_center * y_offset_from_center;
+    const int32_t radius_sq = (int32_t)radius * radius;
+    const int32_t sqrt_arg = radius_sq - y_offset_sq;
+    const int16_t circle_inset = radius - integer_sqrt(sqrt_arg > 0 ? sqrt_arg : 0);
+    const int16_t base_inset = 10;   // the launcher's padding beyond the geometric chord
+    int16_t horizontal_inset = (int16_t)(base_inset + circle_inset);
+    // DIVERGENCE from the launcher, and it matters: the launcher's menu frame is inset so its
+    // rows never approach the glass edge, but THIS menu is full-screen — a row scrolled near
+    // the top/bottom gets a chord inset wider than the row itself, and the un-clamped result
+    // fed graphics_draw_text a negative-width rect, which reset the watch the moment the
+    // screen opened. Clamp so at least 60px of content width always survives.
+    const int16_t max_inset = (int16_t)((bounds.size.w - 60) / 2);
+    if (horizontal_inset > max_inset) horizontal_inset = max_inset;
+    bounds = grect_inset_internal(bounds, horizontal_inset, 0);
+  }
+#endif
   const bool highlighted = menu_cell_layer_is_highlighted(cell_layer);
   GFont font = fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD);
   graphics_context_set_text_color(ctx,
@@ -168,7 +198,7 @@ static void prv_draw_glance_row(GContext *ctx, const Layer *cell_layer,
   const int temp_w = 48;
   const int text_y = (bounds.size.h - 28) / 2 - 3;
   graphics_draw_text(ctx, temp_text, font,
-                     GRect(bounds.size.w - temp_w - 4, text_y, temp_w, 30),
+                     GRect(bounds.origin.x + bounds.size.w - temp_w - 4, text_y, temp_w, 30),
                      GTextOverflowModeTrailingEllipsis, GTextAlignmentRight,
                      NULL);
 
@@ -187,13 +217,14 @@ static void prv_draw_glance_row(GContext *ctx, const Layer *cell_layer,
   if (icon) {
     graphics_context_set_compositing_mode(ctx, GCompOpSet);
     graphics_draw_bitmap_in_rect(
-        ctx, icon, GRect(5, (bounds.size.h - 25) / 2, 25, 25));
+        ctx, icon, GRect(bounds.origin.x + 5, (bounds.size.h - 25) / 2, 25, 25));
     title_x = 5 + 25 + 5;
   }
 
+  const int16_t title_w = (int16_t)(bounds.size.w - title_x - temp_w - 8);
+  if (title_w <= 0) return;
   graphics_draw_text(ctx, title, font,
-                     GRect(title_x, text_y,
-                           bounds.size.w - title_x - temp_w - 8, 30),
+                     GRect(bounds.origin.x + title_x, text_y, title_w, 30),
                      GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft,
                      NULL);
 }
@@ -272,7 +303,9 @@ static void prv_touch_select_row(SavedLocationsView *view, int row) {
 }
 
 static int prv_touch_row_at_y(SavedLocationsView *view, int16_t y) {
-  int row = (prv_touch_scroll_amount(view) + y) / SAVED_LOCATIONS_ROW_HEIGHT;
+  // y is SCREEN-space; the round frame starts 20px down, so convert into frame space first.
+  const int fy = layer_get_frame(menu_layer_get_layer(view->menu_layer)).origin.y;
+  int row = (prv_touch_scroll_amount(view) + y - fy) / SAVED_LOCATIONS_ROW_HEIGHT;
   int rows = prv_num_rows();
   if (row < 0 || row >= rows) return -1;
   return row;
@@ -365,10 +398,22 @@ static void prv_touch_handler(const TouchEvent *event, void *context) {
       if (av >= SAVED_LOCATIONS_FLING_MIN_VELOCITY) {
         int dist = (v * SAVED_LOCATIONS_FLING_PROJECT_MS) / 1000;
         target = prv_touch_clamp_scroll(view, target - dist);
+      }
+#if PBL_ROUND
+      // Every touch rest lands ON the row grid, so no row ever sits half-cut at the window
+      // edge: round to the nearest 44px multiple and ease into it. (The scroll range's ends
+      // are themselves multiples of 44 — rows*44 - 220 — so the clamp can't un-align it.)
+      target = ((target + SAVED_LOCATIONS_ROW_HEIGHT / 2) / SAVED_LOCATIONS_ROW_HEIGHT)
+               * SAVED_LOCATIONS_ROW_HEIGHT;
+      target = prv_touch_clamp_scroll(view, target);
+      prv_touch_set_scroll(view, target, true);
+#else
+      if (av >= SAVED_LOCATIONS_FLING_MIN_VELOCITY) {
         prv_touch_set_scroll(view, target, true);   // animated = ease-out deceleration
       } else {
         prv_touch_set_scroll(view, prv_touch_clamp_scroll(view, target), false);
       }
+#endif
     }
   }
 }
@@ -459,6 +504,15 @@ void saved_locations_push(const SavedLocationsConfig *config) {
 
   Layer *root = window_get_root_layer(view->window);
   GRect bounds = layer_get_bounds(root);
+#if PBL_ROUND
+  // Exactly 5 full rows (the launcher's own trick: its menu frame is inset so its row stack
+  // fits precisely). 260 shows 5.9 44px rows full-screen, so rows peeked half-cut at both
+  // edges; a (260 - 5*44)/2 = 20px vertical inset makes the ScrollLayer clip to a 220px
+  // window = 5 rows exactly. Centre-focus then keeps every BUTTON rest grid-aligned for
+  // free (uniform 44px rows centred on the frame centre land on multiples of 44).
+  bounds = grect_inset_internal(bounds, 0,
+      (int16_t)((bounds.size.h - 5 * SAVED_LOCATIONS_ROW_HEIGHT) / 2));
+#endif
   view->menu_layer = menu_layer_create(bounds);
   if (!view->menu_layer) {
     window_destroy(view->window);

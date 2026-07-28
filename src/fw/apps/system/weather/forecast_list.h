@@ -33,6 +33,10 @@ void forecast_list_set_on_up_request(void (*cb)(void *ctx), void *ctx);
 // reappears. Called by weather.c right before dismissing the clock on UP (clock → forecast).
 void forecast_list_arm_squash_in(void);
 
+// Round report-BACK: mainscreen slides in from the left (the card<->globe hslide pair's
+// grammar). Armed by weather_report.c just before its slide-out pops the window.
+void forecast_list_arm_hslide_in(void);
+
 // Arm the card->forecast return: the rise-in squash PLUS the card's big icon
 // squash-stretch zooming back down into the today-header spot (reverse hero).
 void forecast_list_arm_return_fly(void);

@@ -108,7 +108,7 @@ typedef struct {
   void     *today_cond_font;               // GFont for today's condition phrase
   bool      today_header_dirty;            // recompute today_icon_x/font (set on data change)
   char      daydate_cache[24];             // "Sat, Jul 04" — refreshed at local midnight
-  char      weekday_cache[5][8];           // fan weekday labels ([R5_MAX_COLS])
+  char      weekday_cache[PBL_IF_ROUND_ELSE(6, 5)][8];   // fan weekday labels ([R5_MAX_COLS])
   time_t    date_cache_expiry;             // next local midnight (0 = caches not built yet)
   // SELECT expand: the today icon squash-stretches off-left before the condensed view is pushed.
   bool      select_exiting;
@@ -561,7 +561,17 @@ static void prv_canvas_draw_gabbro(Layer *layer, GContext *ctx) {
 // discs, and a two-line hi/lo dot graph beneath (high temp above each warm dot, low
 // below each cool dot). Renders on round (gabbro/getafix, 260x260) AND emery/obelix
 // (200x228); the geometry below branches round-circle vs emery-rectangle.
+// TODAY-IN-FAN (boss request, 2nd application 2026-07-28 — the first was demoed and reverted;
+// re-applied onto the scroll-interpolated spread): today leads the fan as a 6th, LEFTMOST
+// column so the current day anchors the week. All steps are the 5-col steps x4/5, holding
+// both the rest span AND the scrolled (precipitation view) span exactly. REVERT: flip the
+// round arm to 0 — every original value lives in an #else.
+#define R5_TODAY_IN_FAN PBL_IF_ROUND_ELSE(0, 0)   // OFF — re-applied 2026-07-28 on a misread, reverted same night
+#if R5_TODAY_IN_FAN
+#define R5_MAX_COLS     6
+#else
 #define R5_MAX_COLS     5
+#endif
 // Column tiers. Round fans them inward as they descend to inscribe the circle; emery
 // is a rectangle, so its three tiers share one uniform step (dots sit straight under
 // the icons) and pack tighter to fit the 200px width.
@@ -569,14 +579,36 @@ static void prv_canvas_draw_gabbro(Layer *layer, GContext *ctx) {
 // 50 the outer day-name ink (x=30) falls outside the glass (which starts at x=36 that far
 // up). 42 pulls the outer columns to x=46 — the widest 5-column spacing that reaches the
 // top intact. Emery's rectangle has no such limit, so it keeps 38.
-#define R5_COL_STEP_ICON PBL_IF_ROUND_ELSE(42, 38)  // icon / day-name row
-#define R5_COL_STEP_HIGH PBL_IF_ROUND_ELSE(45, 38)  // high temps
-#define R5_COL_STEP_LOW  PBL_IF_ROUND_ELSE(42, 38)  // low temps
+// Round steps re-spread 2026-07-28: each tier opens to its OWN chord's comfort, not a uniform
+// pitch — icons/day-names and highs sit near the equator where the glass is wide (26px of
+// slack was going unused), the lows stay at 42 because their row's chord is only 7px clear
+// already. The widen amplifies the existing fan-inward-as-it-descends grammar.
+// The wide values apply ONLY at the resting mainscreen; the *_SCROLLED values are the
+// originals, and the column build interpolates between them on the section scroll so the
+// precipitation view's icon row lands PIXEL-IDENTICAL to its pre-spread layout (the user
+// asked for the mainscreen spread only). On rect both pairs are equal -> the lerp is a no-op.
+#if R5_TODAY_IN_FAN
+#define R5_COL_STEP_ICON 38                         // 48*4/5 — 6 cols, rest span held
+#define R5_COL_STEP_HIGH 40                         // 50*4/5
+#define R5_COL_STEP_ICON_SCROLLED 34                // 42*4/5 — scrolled span held too
+#define R5_COL_STEP_HIGH_SCROLLED 36                // 45*4/5
+#define R5_COL_STEP_LOW  34                         // 42*4/5
+#else
+#define R5_COL_STEP_ICON PBL_IF_ROUND_ELSE(48, 38)  // icon / day-name row at REST (was 42)
+#define R5_COL_STEP_HIGH PBL_IF_ROUND_ELSE(50, 38)  // high temps at REST (was 45)
+#define R5_COL_STEP_ICON_SCROLLED PBL_IF_ROUND_ELSE(42, 38)  // precip view: original pitch
+#define R5_COL_STEP_HIGH_SCROLLED PBL_IF_ROUND_ELSE(45, 38)
+#define R5_COL_STEP_LOW  PBL_IF_ROUND_ELSE(42, 38)  // low temps — chord-bound, unchanged
+#endif
 #define R5_HEADER_Y     14    // header pinned at top; everything below is centred
 #define R5_DAYNAME_Y    PBL_IF_ROUND_ELSE(94, 84)
 #define R5_ICON_CY      PBL_IF_ROUND_ELSE(130, 120) // icon row centre-y
 #define R5_ICON_SIZE    25
+#if R5_TODAY_IN_FAN
+#define R5_DISC_R       14   // r17 discs would touch at the 6-col pitch; r14 keeps clear gaps
+#else
 #define R5_DISC_R       (R5_ICON_SIZE * 7 / 10)  // 17 — same disc as old list + mainscreen
+#endif
 #define R5_PRECIP_Y     150
 #define R5_GRAPH_TOP    PBL_IF_ROUND_ELSE(172, 166) // y of the warmest dot
 #define R5_GRAPH_BOT    PBL_IF_ROUND_ELSE(202, 202) // y of the coolest dot
@@ -738,6 +770,11 @@ static void prv_render_squash_in(GContext *ctx) {
 // Entry squash armed by weather.c (0 = none) just before the covering window dismisses; consumed
 // by prv_window_appear so the very first revealed frame is already off-screen (no rest flash).
 static int s_pending_squash_mode;
+// Report-BACK entrance (round): the mainscreen slides in from the LEFT while the report page
+// slides out to the right — the same WEATHER_HSLIDE_MS / moook_soft1 pair the card<->globe
+// glide uses. Armed by weather_report.c just before it pops.
+static bool s_pending_hslide_in;
+static Animation *s_hslide_anim;
 // Reverse hero: armed with the RISE_IN when the expanded card dismisses back to the forecast —
 // the card's big icon squash-stretch zooms back down into the today-header spot (the exact
 // forward fly played backwards), landing as the rising screen settles.
@@ -2147,17 +2184,36 @@ static void prv_canvas_draw_round_5day(Layer *layer, GContext *ctx) {
     }
   }
 #endif
+#if R5_TODAY_IN_FAN
+  int n = total;                      // today LEADS the fan (6 columns)
+  if (n > R5_MAX_COLS) n = R5_MAX_COLS;
+  const WeatherLocationForecast *fan = &s_list->days[0];  // fan = today onward
+#else
   int n = total - 1;                  // fan columns — today headlines the block above
   if (n > R5_MAX_COLS) n = R5_MAX_COLS;
   if (n < 0) n = 0;
   const WeatherLocationForecast *fan = &s_list->days[1];  // fan = tomorrow onward
+#endif
 
   // Three column tiers, each horizontally centred, fanning inward as they descend.
   int col_icon[R5_MAX_COLS], col_high[R5_MAX_COLS], col_low[R5_MAX_COLS];
-  for (int i = 0; i < n; i++) {
-    col_icon[i] = W / 2 - (n - 1) * R5_COL_STEP_ICON / 2 + i * R5_COL_STEP_ICON;
-    col_high[i] = W / 2 - (n - 1) * R5_COL_STEP_HIGH / 2 + i * R5_COL_STEP_HIGH;
-    col_low[i]  = W / 2 - (n - 1) * R5_COL_STEP_LOW  / 2 + i * R5_COL_STEP_LOW;
+  // Effective pitch eases from the wide rest values to the originals as the section scrolls
+  // up, so the scrolled (precipitation) view is untouched by the mainscreen spread. ss is
+  // CLAMPED: the clock exit drives header_scroll far past its rest range (R5_CLOCK_EXIT),
+  // and an unclamped lerp would extrapolate the pitch negative mid-transition.
+  {
+    int ssc = ss;
+    if (ssc < 0) ssc = 0;
+    if (ssc > R5_SECTION_TRAVEL) ssc = R5_SECTION_TRAVEL;
+    const int step_icon = R5_COL_STEP_ICON -
+        (R5_COL_STEP_ICON - R5_COL_STEP_ICON_SCROLLED) * ssc / R5_SECTION_TRAVEL;
+    const int step_high = R5_COL_STEP_HIGH -
+        (R5_COL_STEP_HIGH - R5_COL_STEP_HIGH_SCROLLED) * ssc / R5_SECTION_TRAVEL;
+    for (int i = 0; i < n; i++) {
+      col_icon[i] = W / 2 - (n - 1) * step_icon / 2 + i * step_icon;
+      col_high[i] = W / 2 - (n - 1) * step_high / 2 + i * step_high;
+      col_low[i]  = W / 2 - (n - 1) * R5_COL_STEP_LOW  / 2 + i * R5_COL_STEP_LOW;
+    }
   }
   const int box_w = 52;  // text box; centred short text never overlaps neighbours
   // Fan weekday row demoted to match the today header weight (so TODAY outranks the fan).
@@ -2185,7 +2241,7 @@ static void prv_canvas_draw_round_5day(Layer *layer, GContext *ctx) {
         s_list->date_cache_expiry = now + 60;   // retry shortly; localtime failed
       }
       for (int i = 0; i < n && i < R5_MAX_COLS; i++) {
-        prv_fill_weekday_label(i + 1, fan[i].label, s_list->weekday_cache[i],
+        prv_fill_weekday_label(i + (R5_TODAY_IN_FAN ? 0 : 1), fan[i].label, s_list->weekday_cache[i],
                                sizeof(s_list->weekday_cache[i]));
       }
       s_list->today_header_dirty = true;   // icon centring depends on the date width
@@ -3074,11 +3130,12 @@ static void prv_touch_handler(const TouchEvent *event, void *context) {
   } else if (event->type == TouchEvent_Liftoff && s_list->touch_active) {
     s_list->touch_active = false;
     // Same exclusive-transition guard as the buttons — see prv_click_up_down.
-    if (s_list->clock_fx || s_list->flying_icon || s_select_exit_anim || s_list->report_fx
-#if !PBL_ROUND
-        || s_list->squash_mode
-#endif
-    ) {
+    // BOTH shapes, including squash_mode: the rect-only gate dated from when round never
+    // drove a squash — round runs UP_EXIT/DROP_IN/LEFT_EXIT now, and an unguarded swipe
+    // mid-squash could double-start a transition (same class of bug as the stranded
+    // stage-1 teardown).
+    if (s_list->clock_fx || s_list->flying_icon || s_select_exit_anim || s_list->report_fx ||
+        s_list->squash_mode) {
       return;
     }
     int16_t dx = event->x - s_list->touch_start_x;
@@ -3094,9 +3151,8 @@ static void prv_touch_handler(const TouchEvent *event, void *context) {
         else                      prv_start_clock_stage1();
       } else {
         if (!s_list->header_shown) prv_start_header_transition(false);
-#if !PBL_ROUND
-        else                       prv_start_up_to_card();
-#endif
+        else                       prv_start_up_to_card();   // BOTH shapes: the hero fly +
+                                                             // card open work on round
       }
       prv_note_icon_interaction();
     } else if (dx < 0) {
@@ -3283,6 +3339,20 @@ static void prv_window_load(Window *window) {
 #endif
 }
 
+static void prv_hslide_in_stopped(Animation *anim, bool finished, void *context) {
+  (void)anim; (void)finished; (void)context;
+  s_hslide_anim = NULL;   // property animation auto-destroys after a normal stop
+  if (s_list && s_list->canvas) {
+    GRect home = layer_get_frame(s_list->canvas);
+    home.origin.x = 0;
+    layer_set_frame(s_list->canvas, home);
+  }
+}
+
+void forecast_list_arm_hslide_in(void) {
+  s_pending_hslide_in = true;
+}
+
 static void prv_window_appear(Window *window) {
   (void)window;
   // First-entry clock-slot intro: show the active location for 2s, then swap to the
@@ -3309,6 +3379,25 @@ static void prv_window_appear(Window *window) {
 #if WEATHER_ANIM_5DAY
   // Returning from the clock via UP: jelly-rise the forecast back in. Armed before the clock
   // dismissed, so this fires on the first revealed frame — no flash of the rested screen.
+  if (s_list && s_pending_hslide_in && s_list->canvas) {
+    s_pending_hslide_in = false;
+    GRect to = layer_get_frame(s_list->canvas);
+    GRect from = to;
+    from.origin.x -= to.size.w;                    // start one screen-width off-left
+    layer_set_frame(s_list->canvas, from);
+    PropertyAnimation *pa = property_animation_create_layer_frame(s_list->canvas, &from, &to);
+    if (pa) {
+      Animation *anim = (Animation *)pa;
+      animation_set_duration(anim, WEATHER_HSLIDE_MS);
+      animation_set_custom_interpolation(anim, weather_interpolate_moook_soft1);
+      animation_set_handlers(anim,
+          (AnimationHandlers){ .stopped = prv_hslide_in_stopped }, NULL);
+      s_hslide_anim = anim;
+      animation_schedule(anim);
+    } else {
+      layer_set_frame(s_list->canvas, to);         // OOM: appear in place
+    }
+  }
   if (s_list && s_pending_squash_mode) {
     int m = s_pending_squash_mode;
     s_pending_squash_mode = 0;
