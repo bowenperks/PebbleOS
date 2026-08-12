@@ -1,6 +1,13 @@
 /* SPDX-FileCopyrightText: 2024 Google LLC */
 /* SPDX-License-Identifier: Apache-2.0 */
 
+// The stock upstream weather app: built ONLY for boards that do NOT take the
+// rich weather app. This is the INVERSE of ../weather_platform.h's
+// WEATHER_PLATFORM_TOUCH_COLOR, restated raw because that header pulls in the
+// rich app's SDK-compat macro shims, which this firmware-native code must not
+// see — keep the two conditions in sync.
+#if !(defined(PBL_PLATFORM_EMERY) || defined(PBL_PLATFORM_GABBRO) || \
+      (defined(CONFIG_TOUCH) && CONFIG_TOUCH))
 #include "layout.h"
 
 #include "applib/fonts/fonts.h"
@@ -604,3 +611,4 @@ void weather_app_layout_animate(WeatherAppLayout *layout, WeatherLocationForecas
                           new_forecast->tomorrow_weather_type,
                           WEATHER_APP_LAYOUT_TOMORROW_ICON_SIZE, anim_duration);
 }
+#endif  // platform gate

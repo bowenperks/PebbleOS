@@ -1,0 +1,73 @@
+/* SPDX-FileCopyrightText: 2026 Core Devices LLC */
+/* SPDX-License-Identifier: Apache-2.0 */
+//! Weather app resource-id aliases, mapped onto the generated symbolic ids
+//! (resource_ids.auto.h, included via pebble_compat.h) rather than raw pack
+//! numbers: numeric ids drift silently when the system pack reorders, and a
+//! one-slot shift makes every bitmap draw its neighbour.
+#pragma once
+
+// ---- TINY (25x25 PNG / WX_*_TINY) ----
+#define RESOURCE_ID_IMAGE_SUNNY_DAY_TINY        RESOURCE_ID_WX_SUNNY_TINY
+#define RESOURCE_ID_IMAGE_PARTLY_CLOUDY_TINY    RESOURCE_ID_WX_PARTLY_TINY
+#define RESOURCE_ID_IMAGE_CLOUDY_DAY_TINY       RESOURCE_ID_WX_CLOUDY_TINY
+#define RESOURCE_ID_IMAGE_LIGHT_RAIN_TINY       RESOURCE_ID_WX_LIGHTRAIN_TINY
+#define RESOURCE_ID_IMAGE_HEAVY_RAIN_TINY       RESOURCE_ID_WX_HEAVYRAIN_TINY
+#define RESOURCE_ID_IMAGE_LIGHT_SNOW_TINY       RESOURCE_ID_WX_LIGHTSNOW_TINY
+#define RESOURCE_ID_IMAGE_HEAVY_SNOW_TINY       RESOURCE_ID_WX_HEAVYSNOW_TINY
+#define RESOURCE_ID_IMAGE_RAIN_AND_SNOW_TINY    RESOURCE_ID_WX_RAINSNOW_TINY
+#define RESOURCE_ID_IMAGE_GENERIC_WEATHER_TINY  RESOURCE_ID_WX_GENERIC_TINY
+
+// ---- SMALL (50x50 PNG / WX_*_SMALL) ----
+#define RESOURCE_ID_IMAGE_SUNNY_DAY_SMALL       RESOURCE_ID_WX_SUNNY_SMALL
+#define RESOURCE_ID_IMAGE_PARTLY_CLOUDY_SMALL   RESOURCE_ID_WX_PARTLY_SMALL
+#define RESOURCE_ID_IMAGE_CLOUDY_DAY_SMALL      RESOURCE_ID_WX_CLOUDY_SMALL
+#define RESOURCE_ID_IMAGE_LIGHT_RAIN_SMALL      RESOURCE_ID_WX_LIGHTRAIN_SMALL
+#define RESOURCE_ID_IMAGE_HEAVY_RAIN_SMALL      RESOURCE_ID_WX_HEAVYRAIN_SMALL
+#define RESOURCE_ID_IMAGE_LIGHT_SNOW_SMALL      RESOURCE_ID_WX_LIGHTSNOW_SMALL
+#define RESOURCE_ID_IMAGE_HEAVY_SNOW_SMALL      RESOURCE_ID_WX_HEAVYSNOW_SMALL
+#define RESOURCE_ID_IMAGE_RAIN_AND_SNOW_SMALL   RESOURCE_ID_WX_RAINSNOW_SMALL
+#define RESOURCE_ID_IMAGE_GENERIC_WEATHER_SMALL RESOURCE_ID_WX_GENERIC_SMALL
+
+// ---- LARGE (80x80 PDC) weather icons. Aliased to the generated
+//      RESOURCE_ID_* names (resource_ids.auto.h, included via pebble_compat.h)
+//      — the numeric ids are PER-PLATFORM, so raw numbers would silently drift
+//      on gabbro. Drawn via gdraw_command_image_* (PDC vectors).
+//      Four of these (sunny/cloudy/partly/generic) point at weather-scoped
+//      WX_*_LARGE copies: the shared Pebble_80x80_* art is rendered by the
+//      Timeline pin cards and peeks too, so this app's restyled versions live
+//      as separate resources instead of restyling art other UIs depend on. The
+//      remaining five were never restyled and stay on the shared ids. ----
+#define RESOURCE_ID_IMAGE_PARTLY_CLOUDY_LARGE   RESOURCE_ID_WX_PARTLY_LARGE
+#define RESOURCE_ID_IMAGE_CLOUDY_DAY_LARGE      RESOURCE_ID_WX_CLOUDY_LARGE
+#define RESOURCE_ID_IMAGE_LIGHT_SNOW_LARGE      RESOURCE_ID_LIGHT_SNOW_LARGE
+#define RESOURCE_ID_IMAGE_LIGHT_RAIN_LARGE      RESOURCE_ID_LIGHT_RAIN_LARGE
+#define RESOURCE_ID_IMAGE_HEAVY_RAIN_LARGE      RESOURCE_ID_HEAVY_RAIN_LARGE
+#define RESOURCE_ID_IMAGE_HEAVY_SNOW_LARGE      RESOURCE_ID_HEAVY_SNOW_LARGE
+#define RESOURCE_ID_IMAGE_RAIN_AND_SNOW_LARGE   RESOURCE_ID_RAINING_AND_SNOWING_LARGE
+#define RESOURCE_ID_IMAGE_GENERIC_WEATHER_LARGE RESOURCE_ID_WX_GENERIC_LARGE
+#define RESOURCE_ID_IMAGE_SUNNY_DAY_LARGE       RESOURCE_ID_WX_SUNNY_LARGE
+
+// ---- CLOCK icons: gabbro-only (compiled out on emery). Mapped to the TINY
+//      (25x25) ids: the source art must match CLOCK_ICON_SIZE (25) — the clock
+//      blits without scaling, so a larger source draws cropped to its top-left
+//      25px. ----
+#define RESOURCE_ID_IMAGE_SUNNY_DAY_CLOCK       RESOURCE_ID_WX_SUNNY_TINY
+#define RESOURCE_ID_IMAGE_PARTLY_CLOUDY_CLOCK   RESOURCE_ID_WX_PARTLY_TINY
+#define RESOURCE_ID_IMAGE_CLOUDY_DAY_CLOCK      RESOURCE_ID_WX_CLOUDY_TINY
+#define RESOURCE_ID_IMAGE_LIGHT_RAIN_CLOCK      RESOURCE_ID_WX_LIGHTRAIN_TINY
+#define RESOURCE_ID_IMAGE_HEAVY_RAIN_CLOCK      RESOURCE_ID_WX_HEAVYRAIN_TINY
+#define RESOURCE_ID_IMAGE_LIGHT_SNOW_CLOCK      RESOURCE_ID_WX_LIGHTSNOW_TINY
+#define RESOURCE_ID_IMAGE_HEAVY_SNOW_CLOCK      RESOURCE_ID_WX_HEAVYSNOW_TINY
+#define RESOURCE_ID_IMAGE_RAIN_AND_SNOW_CLOCK   RESOURCE_ID_WX_RAINSNOW_TINY
+#define RESOURCE_ID_IMAGE_GENERIC_WEATHER_CLOCK RESOURCE_ID_WX_GENERIC_TINY
+
+// RESULT_SHREDDED_LARGE intentionally NOT pinned: the animated shredder PDC is a
+// real pack entry on this family (resource_ids.auto.h, via pebble_compat.h) and
+// the saved-locations "Location Deleted" screen plays it.
+
+// ---- PDC sequences (round/gabbro only). The main weather-icons sequence ships
+//      in the pack as WX_WEATHER_ICONS_PDC; alias the app's name to the
+//      real auto id (the auto header is included via pebble_compat before this).
+//      WEATHER_CLOCK_ICONS_PDC has no asset yet (forecast_list null-checks it). ----
+#define RESOURCE_ID_WEATHER_ICONS_PDC           RESOURCE_ID_WX_WEATHER_ICONS_PDC
+#define RESOURCE_ID_WEATHER_CLOCK_ICONS_PDC     0

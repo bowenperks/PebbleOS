@@ -1,6 +1,13 @@
 /* SPDX-FileCopyrightText: 2024 Google LLC */
 /* SPDX-License-Identifier: Apache-2.0 */
 
+// The stock upstream weather app: built ONLY for boards that do NOT take the
+// rich weather app. This is the INVERSE of ../weather_platform.h's
+// WEATHER_PLATFORM_TOUCH_COLOR, restated raw because that header pulls in the
+// rich app's SDK-compat macro shims, which this firmware-native code must not
+// see — keep the two conditions in sync.
+#if !(defined(PBL_PLATFORM_EMERY) || defined(PBL_PLATFORM_GABBRO) || \
+      (defined(CONFIG_TOUCH) && CONFIG_TOUCH))
 #include "warning_dialog.h"
 
 #include "applib/ui/app_window_stack.h"
@@ -48,3 +55,4 @@ WeatherAppWarningDialog *weather_app_warning_dialog_push(const char *localized_s
 
   return expandable_dialog;
 }
+#endif  // platform gate

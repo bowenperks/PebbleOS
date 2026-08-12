@@ -39,12 +39,23 @@ static bool prv_entry_update_time_too_old_to_be_valid(const time_t update_time_u
 static bool prv_fill_forecast_from_entry(WeatherDBEntry *entry,
                                          WeatherLocationForecast *forecast_out) {
   PascalString16List pstring16_list;
-  pstring_project_list_on_serialized_array(&pstring16_list, &entry->pstring16s);
+  // v3 and v4 records place the trailing strings at different offsets; locate
+  // them by the record's version (see weather_db.h).
+  pstring_project_list_on_serialized_array(&pstring16_list, weather_db_entry_get_strings(entry));
   PascalString16 *location_pstring =
       pstring_get_pstring16_from_list(&pstring16_list, WeatherDbStringIndex_LocationName);
 
   PascalString16 *phrase_pstring =
       pstring_get_pstring16_from_list(&pstring16_list, WeatherDbStringIndex_ShortPhrase);
+
+  // A record whose strings blob resolves to fewer entries than expected
+  // (empty, truncated, or absent) yields NULL pstrings — skip it like every
+  // other invalid entry rather than dereferencing.
+  if (!location_pstring || !phrase_pstring) {
+    PBL_LOG_ERR("Weather entry has malformed trailing strings (count: %" PRIu16 ")",
+                pstring16_list.count);
+    return false;
+  }
 
   const bool is_valid_entry_update_time =
       (entry->last_update_time_utc != WEATHER_SERVICE_INVALID_DATA_LAST_UPDATE_TIME);
@@ -293,10 +304,18 @@ void weather_service_locations_list_destroy(WeatherDataListNode *head) {
 }
 
 bool weather_service_supported_by_phone(void) {
+#if defined(CONFIG_SOC_QEMU)
+  // The emulator has no phone to advertise the capability, which would hide
+  // the weather app from the launcher and reject every record insert —
+  // leaving the whole weather stack untestable there. Treat weather as
+  // always supported in QEMU.
+  return true;
+#else
   PebbleProtocolCapabilities capabilities;
   bt_persistent_storage_get_cached_system_capabilities(&capabilities);
   if (!capabilities.weather_app_support) {
     PBL_LOG_WRN("No weather support on phone");
   }
   return capabilities.weather_app_support;
+#endif
 }
